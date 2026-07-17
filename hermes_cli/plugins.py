@@ -1040,6 +1040,31 @@ class PluginContext:
             action_id,
         )
 
+    def register_telegram_callback_handler(
+        self,
+        prefix: str,
+        callback: Callable,
+    ) -> None:
+        """Register an async handler for Telegram callback data by prefix."""
+        if not isinstance(prefix, str) or not prefix:
+            raise ValueError(
+                f"Plugin '{self.manifest.name}' tried to register a Telegram "
+                "callback handler with an empty prefix."
+            )
+        if not callable(callback):
+            raise ValueError(
+                f"Plugin '{self.manifest.name}' tried to register a Telegram "
+                "callback handler with a non-callable callback."
+            )
+        self._manager._telegram_callback_handlers.append(
+            (prefix, callback, self.manifest.name)
+        )
+        logger.debug(
+            "Plugin %s registered Telegram callback handler: %s",
+            self.manifest.name,
+            prefix,
+        )
+
     # -- hook registration --------------------------------------------------
 
     # -- auxiliary task registration ---------------------------------------
@@ -1271,6 +1296,9 @@ class PluginManager:
         # ``re.Pattern``, or a constraint dict); ``callback`` is an async
         # function with the slack_bolt signature ``(ack, body, action)``.
         self._slack_action_handlers: List[tuple] = []
+        # Telegram inline-button handlers registered by plugins. Each entry is
+        # (callback_data prefix, async callback, plugin_name).
+        self._telegram_callback_handlers: List[tuple] = []
 
     # -----------------------------------------------------------------------
     # Public
@@ -1300,6 +1328,7 @@ class PluginManager:
             self._plugin_skills.clear()
             self._aux_tasks.clear()
             self._slack_action_handlers.clear()
+            self._telegram_callback_handlers.clear()
             self._context_engine = None
         # Set the flag up front as a re-entrancy guard (a plugin's register()
         # can transitively trigger discovery again), but reset it if the sweep
@@ -1972,6 +2001,10 @@ class PluginManager:
         :meth:`PluginContext.register_slack_action_handler`.
         """
         return list(self._slack_action_handlers)
+
+    def get_telegram_callback_handlers(self) -> List[tuple]:
+        """Return plugin handlers for Telegram inline-button callbacks."""
+        return list(self._telegram_callback_handlers)
 
     # -----------------------------------------------------------------------
     # Introspection

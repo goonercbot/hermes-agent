@@ -5825,6 +5825,47 @@ class TelegramAdapter(BasePlatformAdapter):
         query_thread_id = getattr(query_message, "message_thread_id", None)
         query_user_name = getattr(query.from_user, "first_name", None)
 
+        # --- Plugin callback handlers ---
+        # The Hermes gateway remains the sole getUpdates consumer. Plugins can
+        # claim callback_data prefixes without starting competing pollers.
+        try:
+            from hermes_cli.plugins import get_plugin_manager
+
+            plugin_handlers = get_plugin_manager().get_telegram_callback_handlers()
+        except Exception:
+            logger.debug("[Telegram] Could not load plugin callback handlers", exc_info=True)
+            plugin_handlers = []
+
+        for prefix, callback, plugin_name in plugin_handlers:
+            if not data.startswith(prefix):
+                continue
+            caller_id = str(getattr(query.from_user, "id", ""))
+            if not self._is_callback_user_authorized(
+                caller_id,
+                chat_id=query_chat_id,
+                chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                user_name=query_user_name,
+            ):
+                await query.answer(
+                    text="You are not authorized to use this button.",
+                    show_alert=True,
+                )
+                return
+            try:
+                await callback(update=update, query=query, adapter=self)
+            except Exception:
+                logger.exception(
+                    "[Telegram] Plugin %s callback handler failed for prefix %s",
+                    plugin_name,
+                    prefix,
+                )
+                await query.answer(
+                    text="Could not process this button. Please try again.",
+                    show_alert=True,
+                )
+            return
+
         # --- Model picker callbacks ---
         if data.startswith(("mp:", "mpg:", "mpv:", "mm:", "mc:", "mb", "mx", "mg:")):
             chat_id = str(query.message.chat_id) if query.message else None

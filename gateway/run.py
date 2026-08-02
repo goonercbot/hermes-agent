@@ -4189,6 +4189,9 @@ class TurnRunner:
                             if ctx.progress_queue is not None
                             else None
                         ),
+                        on_commentary_sent=(
+                            ctx._track_cleanup_result if ctx._cleanup_progress else None
+                        ),
                         on_before_finalize=_pause_typing_before_finalize,
                         initial_reply_to_id=ctx.event_message_id,
                         run_still_current=ctx._run_still_current,
@@ -4224,7 +4227,7 @@ class TurnRunner:
                 return
             if already_streamed or not ctx._status_adapter or not str(display_text or "").strip():
                 return
-            safe_schedule_threadsafe(
+            _commentary_future = safe_schedule_threadsafe(
                 ctx._status_adapter.send(
                     ctx._status_chat_id,
                     display_text,
@@ -4234,6 +4237,17 @@ class TurnRunner:
                 logger=logger,
                 log_message="interim_assistant_callback scheduling error",
             )
+            if _commentary_future is not None and ctx._cleanup_progress:
+                ctx._direct_commentary_futures.append(_commentary_future)
+
+                def _track_direct_commentary(future) -> None:
+                    try:
+                        if ctx._track_cleanup_result is not None:
+                            ctx._track_cleanup_result(future.result())
+                    except Exception:
+                        pass
+
+                _commentary_future.add_done_callback(_track_direct_commentary)
 
         turn_route = self._runner._resolve_turn_agent_config(ctx.message, model, runtime_kwargs)
 
@@ -23348,8 +23362,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Auto-cleanup of temporary progress bubbles (Telegram + any adapter
         # that implements ``delete_message``). When enabled via
         # ``display.platforms.<platform>.cleanup_progress: true``, message IDs
-        # from the tool-progress / "⏳ Working — N min" / status-callback bubbles
-        # are collected here and deleted after the final response lands.
+        # from tool-progress / "⏳ Working — N min" / status-callback bubbles and
+        # interim assistant commentary are collected here and deleted after the
+        # final response lands.
         # Failed runs skip cleanup so the bubbles remain as breadcrumbs.
         _cleanup_progress = bool(
             resolve_display_setting(user_config, platform_key, "cleanup_progress")
@@ -23367,6 +23382,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _cleanup_progress = False
             _cleanup_adapter = None
         _cleanup_msg_ids: List[str] = []
+        _direct_commentary_futures = []
+
+        def _track_cleanup_result(result) -> None:
+            """Track every deletable message ID exposed by a successful send."""
+            if not _cleanup_progress or not getattr(result, "success", False):
+                return
+            _candidate_ids = []
+            _primary_id = getattr(result, "message_id", None)
+            if _primary_id:
+                _candidate_ids.append(_primary_id)
+            _candidate_ids.extend(
+                getattr(result, "continuation_message_ids", None) or ()
+            )
+            _raw_response = getattr(result, "raw_response", None) or {}
+            if isinstance(_raw_response, dict):
+                _candidate_ids.extend(_raw_response.get("message_ids") or ())
+            for _message_id in _candidate_ids:
+                _message_id = str(_message_id)
+                if _message_id and _message_id not in _cleanup_msg_ids:
+                    _cleanup_msg_ids.append(_message_id)
         # First-touch onboarding latch: fires at most once per run, even if
         # several tools exceed the threshold.
         long_tool_hint_fired = [False]
@@ -23391,6 +23426,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _LONG_TOOL_THRESHOLD_S=_LONG_TOOL_THRESHOLD_S,
             _cleanup_progress=_cleanup_progress,
             _cleanup_msg_ids=_cleanup_msg_ids,
+            _direct_commentary_futures=_direct_commentary_futures,
+            _track_cleanup_result=_track_cleanup_result,
             message=message,
             AIAgent=AIAgent,
             resolve_display_setting=resolve_display_setting,
@@ -24524,6 +24561,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             await stream_task
                         except asyncio.CancelledError:
                             pass
+
+            # The normal commentary path runs through the awaited stream
+            # consumer. If consumer setup failed, commentary uses scheduled
+            # direct sends instead; every send must finish before the cleanup
+            # callback snapshots IDs or a late successful send can escape it.
+            if _direct_commentary_futures:
+                await asyncio.gather(
+                    *(
+                        asyncio.wrap_future(_future)
+                        for _future in _direct_commentary_futures
+                    ),
+                    return_exceptions=True,
+                )
             
             # Unconditional abort + bounded wait for the streaming-TTS
             # consumer (#60671 hardening).  Covers cancellation / exception
@@ -24599,6 +24649,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 previewed=_previewed,
             )
             if not _is_empty_sentinel and not _transformed and (_streamed or _content_delivered):
+                # An interim callback can deliver the exact final answer. Those
+                # IDs were initially classified as temporary commentary; remove
+                # them so cleanup never deletes the retained final response.
+                if _previewed and not getattr(_sc, "final_response_sent", False):
+                    _commentary_ids_for_final = getattr(
+                        _sc,
+                        "delivered_commentary_message_ids_for_text",
+                        lambda _text: (),
+                    )(_final)
+                    if _commentary_ids_for_final:
+                        _final_id_set = {
+                            str(_mid) for _mid in _commentary_ids_for_final
+                        }
+                        _cleanup_msg_ids[:] = [
+                            _mid for _mid in _cleanup_msg_ids
+                            if str(_mid) not in _final_id_set
+                        ]
                 logger.info(
                     "Suppressing normal final send for session %s: final delivery already confirmed (streamed=%s previewed=%s content_delivered=%s).",
                     session_key or "?",
@@ -24607,23 +24674,47 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _content_delivered,
                 )
                 response["already_sent"] = True
+                _delivery_event = getattr(
+                    _cleanup_adapter, "_active_sessions", {}
+                ).get(session_key) if _cleanup_adapter is not None else None
+                if _delivery_event is not None:
+                    setattr(
+                        _delivery_event,
+                        "_hermes_final_delivery_preconfirmed",
+                        True,
+                    )
             elif not _is_empty_sentinel and _transformed and _sc is not None:
                 # Plugin hooks transformed the response after streaming — edit the
                 # existing streamed message instead of sending a duplicate.
                 _sc_msg_id = _sc.message_id
                 if _sc_msg_id:
                     try:
-                        await _sc.adapter.edit_message(
+                        _edit_result = await _sc.adapter.edit_message(
                             chat_id=source.chat_id,
                             message_id=_sc_msg_id,
                             content=response["final_response"],
                             finalize=True,
                         )
-                        response["already_sent"] = True
-                        logger.info(
-                            "Edited streamed message %s for session %s to include plugin-transformed content.",
-                            _sc_msg_id, session_key or "?",
-                        )
+                        if getattr(_edit_result, "success", False):
+                            response["already_sent"] = True
+                            _delivery_event = getattr(
+                                _cleanup_adapter, "_active_sessions", {}
+                            ).get(session_key) if _cleanup_adapter is not None else None
+                            if _delivery_event is not None:
+                                setattr(
+                                    _delivery_event,
+                                    "_hermes_final_delivery_preconfirmed",
+                                    True,
+                                )
+                            logger.info(
+                                "Edited streamed message %s for session %s to include plugin-transformed content.",
+                                _sc_msg_id, session_key or "?",
+                            )
+                        else:
+                            logger.warning(
+                                "Streamed message edit was not delivered for session %s; falling back to normal final send.",
+                                session_key or "?",
+                            )
                     except Exception as _edit_err:
                         logger.warning(
                             "Failed to edit streamed message for session %s: %s",
@@ -24647,9 +24738,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _ids_snapshot = list(_cleanup_msg_ids)
             _chat_id_snapshot = source.chat_id
             _adapter_snapshot = _cleanup_adapter
+            _delivery_event_snapshot = getattr(
+                _adapter_snapshot, "_active_sessions", {}
+            ).get(session_key)
             _loop_snapshot = asyncio.get_running_loop()
 
             def _cleanup_temp_bubbles() -> None:
+                # A successful model run is insufficient: preserve commentary
+                # unless the final answer was confirmed delivered to the user.
+                if not bool(
+                    getattr(
+                        _delivery_event_snapshot,
+                        "_hermes_final_delivery_succeeded",
+                        False,
+                    )
+                ):
+                    return
                 async def _delete_all() -> None:
                     for _mid in _ids_snapshot:
                         try:

@@ -5778,6 +5778,10 @@ class BasePlatformAdapter(ABC):
         # Fall back to a new Event only if the entry was removed externally.
         interrupt_event = self._active_sessions.get(session_key) or asyncio.Event()
         self._active_sessions[session_key] = interrupt_event
+        # This Event can be reused for queued turns. Reset the per-turn final
+        # delivery flags before the handler starts.
+        setattr(interrupt_event, "_hermes_final_delivery_preconfirmed", False)
+        setattr(interrupt_event, "_hermes_final_delivery_succeeded", False)
         
         # Start continuous typing indicator (refreshes every 2 seconds).
         # Gated per-platform: when typing_indicator=False the refresh loop is
@@ -5806,6 +5810,11 @@ class BasePlatformAdapter(ABC):
                 typing_task,
                 metadata=_thread_metadata,
             )
+
+        # A queued turn must not start until this turn has popped and run its
+        # post-delivery callback. Otherwise the queued turn can overwrite the
+        # shared callback slot before this frame reaches its finally block.
+        pending_handoff_event: Optional[MessageEvent] = None
         
         try:
             await self._run_processing_hook("on_processing_start", event)
@@ -6294,27 +6303,12 @@ class BasePlatformAdapter(ABC):
                 if _active is not None:
                     _active.clear()
                 await _stop_typing_task()
-                # Spawn a fresh task for the pending message instead of
-                # recursing.  Issue #17758: `await
-                # self._process_message_background(...)` here grew the
-                # call stack one frame per chained follow-up, and under
-                # sustained pending-queue activity the C stack would
-                # exhaust at ~2000 frames and SIGSEGV the process.
-                # Mirror the late-arrival drain pattern below: hand off
-                # to a new task and return so this frame can unwind.
-                drain_task = asyncio.create_task(
-                    self._process_message_background(pending_event, session_key)
-                )
-                # Hand ownership of the session to the drain task so
-                # stale-lock detection keeps working while it runs.
-                self._session_tasks[session_key] = drain_task
-                try:
-                    self._background_tasks.add(drain_task)
-                    drain_task.add_done_callback(self._background_tasks.discard)
-                except TypeError:
-                    # Tests stub create_task() with non-hashable sentinels; tolerate.
-                    pass
-                return  # Drain task owns the session now.
+                # Defer the fresh-task handoff until this frame's finally block
+                # has consumed its own post-delivery callback. Starting the next
+                # turn here lets it replace the shared session callback slot and
+                # delivery flags while this turn is still unwinding.
+                pending_handoff_event = pending_event
+                return
                 
         except asyncio.CancelledError:
             current_task = asyncio.current_task()
@@ -6366,6 +6360,21 @@ class BasePlatformAdapter(ABC):
                 "_hermes_run_generation",
                 None,
             )
+            # Normal final sends are confirmed by _record_delivery. Streaming
+            # and interim-as-final paths return no response here, so the gateway
+            # preconfirms those on the active Event.
+            setattr(
+                interrupt_event,
+                "_hermes_final_delivery_succeeded",
+                bool(
+                    delivery_succeeded
+                    or getattr(
+                        interrupt_event,
+                        "_hermes_final_delivery_preconfirmed",
+                        False,
+                    )
+                ),
+            )
             if hasattr(self, "pop_post_delivery_callback"):
                 _post_cb = self.pop_post_delivery_callback(
                     session_key,
@@ -6403,21 +6412,37 @@ class BasePlatformAdapter(ABC):
             # active-session entry and the queued message would be silently
             # dropped (user never gets a reply).
             late_pending = self._pending_messages.pop(session_key, None)
-            if late_pending is not None:
+            if pending_handoff_event is not None:
+                # Callback cleanup for this turn is now complete. Hand ownership
+                # to the queued turn, preserving any later arrival for that new
+                # owner to drain after its own response.
+                if late_pending is not None:
+                    self._pending_messages[session_key] = late_pending
+                _active = self._active_sessions.get(session_key)
+                if _active is not None:
+                    _active.clear()
+                drain_task = asyncio.create_task(
+                    self._process_message_background(
+                        pending_handoff_event, session_key
+                    )
+                )
+                self._session_tasks[session_key] = drain_task
+                try:
+                    self._background_tasks.add(drain_task)
+                    drain_task.add_done_callback(self._background_tasks.discard)
+                except TypeError:
+                    pass
+                # Leave _active_sessions populated for the new owner task.
+            elif late_pending is not None:
                 current_task = asyncio.current_task()
                 existing_task = self._session_tasks.get(session_key)
                 if (
                     existing_task is not None
                     and existing_task is not current_task
                 ):
-                    # The in-band drain (or an earlier late-arrival drain)
-                    # already spawned a follow-up task that owns this
-                    # session.  Re-queue the late-arrival event so that
-                    # task picks it up — avoids spawning two concurrent
-                    # _process_message_background tasks for the same key
-                    # (#17758 follow-up: prevents the create_task path
-                    # from racing with itself across the in-band/finally
-                    # boundary).
+                    # An earlier late-arrival drain already owns this session.
+                    # Re-queue this event so that task picks it up instead of
+                    # spawning two handlers for the same key.
                     self._pending_messages[session_key] = late_pending
                 else:
                     logger.debug(

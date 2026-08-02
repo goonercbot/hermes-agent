@@ -42,7 +42,13 @@ class _MinAdapter(BasePlatformAdapter):
 
 @pytest.fixture
 def adapter():
-    return _MinAdapter(PlatformConfig(enabled=True), Platform.TELEGRAM)
+    # These tests exercise callback and queued-turn ownership, not typing.
+    # Keeping typing enabled while replacing ``_stop_typing_refresh`` below
+    # leaves the real refresh task alive after all assertions pass on Linux.
+    return _MinAdapter(
+        PlatformConfig(enabled=True, typing_indicator=False),
+        Platform.TELEGRAM,
+    )
 
 
 def _invoke(cb):
@@ -249,6 +255,18 @@ class TestFinalDeliveryState:
             if len(observed) == 2 and session_key not in adapter._active_sessions:
                 break
             await asyncio.sleep(0.01)
+
+        # The queued handoff runs in a real background task.  Await any task
+        # still completing its final bookkeeping so the test owns its teardown
+        # instead of relying on pytest's event-loop shutdown behavior.
+        pending_tasks = [
+            task for task in adapter._background_tasks if not task.done()
+        ]
+        if pending_tasks:
+            await asyncio.wait_for(
+                asyncio.gather(*pending_tasks),
+                timeout=1.0,
+            )
 
         assert observed == [("first", True), ("second", False)]
         assert adapter._post_delivery_callbacks == {}

@@ -199,6 +199,7 @@ class GatewayStreamConsumer:
         on_before_finalize: Optional[Callable[[], Any]] = None,
         initial_reply_to_id: Optional[str] = None,
         run_still_current: Optional[Callable[[], bool]] = None,
+        on_commentary_sent: Optional[Callable[[Any], Any]] = None,
     ):
         self.adapter = adapter
         self.chat_id = chat_id
@@ -212,6 +213,10 @@ class GatewayStreamConsumer:
         # the content, not edit the old bubble above it.
         # Called with no arguments. Exceptions are swallowed.
         self._on_new_message = on_new_message
+        # Fired after a completed interim commentary message is delivered.
+        # Gateway callers use the SendResult to register that temporary bubble
+        # for post-final cleanup. Callback errors must not affect delivery.
+        self._on_commentary_sent = on_commentary_sent
         # Fired once when the stream transitions into its finalization path.
         # Gateway callers use this to pause typing refreshes before a slow
         # final rich-text edit (Telegram MarkdownV2 finalize, etc.).
@@ -262,6 +267,7 @@ class GatewayStreamConsumer:
         # subsequently failed.
         self._final_content_delivered = False
         self._delivered_commentary_texts: list[str] = []
+        self._delivered_commentary_message_ids: list[tuple[str, tuple[str, ...]]] = []
         # Retains the finalized visible text of each streaming segment so
         # ``has_delivered_text`` can still match after ``_reset_segment_state``
         # clears ``_last_sent_text``. Without this, a segment break (triggered
@@ -405,6 +411,20 @@ class GatewayStreamConsumer:
             for sent in (*self._delivered_commentary_texts, *self._delivered_segment_texts)
         )
 
+    def delivered_commentary_message_ids_for_text(self, text: str) -> tuple[str, ...]:
+        """Return message IDs for commentary that exactly delivered *text*."""
+        target = self._clean_for_display(text or "").strip()
+        if not target:
+            return ()
+        ids: list[str] = []
+        for delivered_text, delivered_ids in self._delivered_commentary_message_ids:
+            if delivered_text.strip() != target:
+                continue
+            for message_id in delivered_ids:
+                if message_id not in ids:
+                    ids.append(message_id)
+        return tuple(ids)
+
     def on_segment_break(self) -> None:
         """Finalize the current stream segment and start a fresh message."""
         self._queue.put(_NEW_SEGMENT)
@@ -446,6 +466,16 @@ class GatewayStreamConsumer:
             cb()
         except Exception:
             logger.debug("on_new_message callback error", exc_info=True)
+
+    def _notify_commentary_sent(self, result: Any) -> None:
+        """Report a successful commentary send, swallowing callback errors."""
+        cb = self._on_commentary_sent
+        if cb is None:
+            return
+        try:
+            cb(result)
+        except Exception:
+            logger.debug("on_commentary_sent callback error", exc_info=True)
 
     @staticmethod
     def _signal_flush(flush_event) -> None:
@@ -1683,6 +1713,26 @@ class GatewayStreamConsumer:
             # the final response to be incorrectly suppressed when there are
             # multiple tool calls. See: https://github.com/NousResearch/hermes-agent/issues/10454
             if result.success:
+                commentary_ids: list[str] = []
+                primary_id = getattr(result, "message_id", None)
+                if primary_id:
+                    commentary_ids.append(str(primary_id))
+                for message_id in (
+                    getattr(result, "continuation_message_ids", None) or ()
+                ):
+                    message_id = str(message_id)
+                    if message_id and message_id not in commentary_ids:
+                        commentary_ids.append(message_id)
+                raw_response = getattr(result, "raw_response", None) or {}
+                if isinstance(raw_response, dict):
+                    for message_id in raw_response.get("message_ids") or ():
+                        message_id = str(message_id)
+                        if message_id and message_id not in commentary_ids:
+                            commentary_ids.append(message_id)
+                self._delivered_commentary_message_ids.append(
+                    (text, tuple(commentary_ids))
+                )
+                self._notify_commentary_sent(result)
                 # Commentary counts as fresh content — close off any
                 # stale tool bubble above it so the next tool starts a
                 # new bubble below.

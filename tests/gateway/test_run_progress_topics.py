@@ -1318,3 +1318,47 @@ class TestSlackReplyInThreadProgressRouting:
         ) is None
 
 
+class FailedMetadataEditProgressCaptureAdapter(MetadataEditProgressCaptureAdapter):
+    async def edit_message(
+        self, chat_id, message_id, content, *, finalize: bool = False, metadata=None
+    ) -> SendResult:
+        self.edits.append(
+            {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "content": content,
+                "metadata": metadata,
+            }
+        )
+        return SendResult(success=False, error="simulated edit failure")
+
+
+@pytest.mark.asyncio
+async def test_failed_transformed_stream_edit_falls_back_to_normal_final_send(
+    monkeypatch, tmp_path,
+):
+    """A non-throwing failed edit is not confirmation of final delivery."""
+    _adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        TransformedStreamAgent,
+        session_id="sess-transformed-stream-edit-failed",
+        config_data={
+            "display": {"tool_progress": "off", "interim_assistant_messages": False},
+            "streaming": {
+                "enabled": True,
+                "edit_interval": 0.01,
+                "buffer_threshold": 1,
+            },
+        },
+        platform=Platform.MATRIX,
+        chat_id="!room:matrix.example.org",
+        chat_type="group",
+        thread_id="$thread",
+        adapter_cls=FailedMetadataEditProgressCaptureAdapter,
+    )
+
+    assert result.get("already_sent") is not True
+    assert "[plugin appended this]" in result["final_response"]
+
+

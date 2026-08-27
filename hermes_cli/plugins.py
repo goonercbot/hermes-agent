@@ -3195,6 +3195,92 @@ class PluginContext:
         # for the Telegram-specific docs above.
         self.register_platform_handler("telegram", factory)
 
+    def register_telegram_callback_handler(
+        self,
+        prefix: str,
+        callback: Callable,
+    ) -> None:
+        """Register an authorized Telegram inline-button callback by prefix.
+
+        This preserves the callback contract used by existing Hermes plugins:
+        ``callback(update=update, query=query, adapter=adapter)``.  It is
+        implemented on top of the native Telegram handler-factory surface so
+        plugins remain isolated from the core adapter's catch-all dispatcher.
+        """
+        if not isinstance(prefix, str) or not prefix:
+            raise ValueError(
+                f"Plugin '{self.manifest.name}' tried to register a Telegram "
+                "callback handler with an empty prefix."
+            )
+        if not callable(callback):
+            raise ValueError(
+                f"Plugin '{self.manifest.name}' tried to register a Telegram "
+                "callback handler with a non-callable callback."
+            )
+
+        def _wire(application: Any, adapter: Any) -> None:
+            import re
+
+            from telegram.ext import CallbackQueryHandler
+
+            async def _dispatch(update: Any, context: Any) -> None:
+                query = getattr(update, "callback_query", None)
+                data = getattr(query, "data", None)
+                if query is None or not isinstance(data, str):
+                    return
+
+                message = getattr(query, "message", None)
+                chat_id = getattr(message, "chat_id", None)
+                chat = getattr(message, "chat", None)
+                chat_type = getattr(chat, "type", None)
+                thread_id = getattr(message, "message_thread_id", None)
+                from_user = getattr(query, "from_user", None)
+                user_id = str(getattr(from_user, "id", ""))
+                user_name = getattr(from_user, "first_name", None)
+
+                if not adapter._is_callback_user_authorized(
+                    user_id,
+                    chat_id=chat_id,
+                    chat_type=str(chat_type) if chat_type is not None else None,
+                    thread_id=str(thread_id) if thread_id is not None else None,
+                    user_name=user_name,
+                ):
+                    await query.answer(
+                        text="⛔ You are not authorized to use this button.",
+                        show_alert=True,
+                    )
+                    return
+
+                try:
+                    result = callback(
+                        update=update,
+                        query=query,
+                        adapter=adapter,
+                    )
+                    if inspect.isawaitable(result):
+                        await result
+                except Exception as exc:
+                    logger.error(
+                        "Plugin %s Telegram callback handler failed for prefix %s: %s",
+                        self.manifest.name,
+                        prefix,
+                        exc,
+                        exc_info=True,
+                    )
+                    try:
+                        await query.answer(
+                            text="This action failed. Please try again.",
+                            show_alert=True,
+                        )
+                    except Exception:
+                        pass
+
+            application.add_handler(
+                CallbackQueryHandler(_dispatch, pattern=rf"^{re.escape(prefix)}")
+            )
+
+        self.register_telegram_handler(_wire)
+
     # -- hook registration --------------------------------------------------
 
     # -- auxiliary task registration ---------------------------------------

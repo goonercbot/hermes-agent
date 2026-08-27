@@ -24,7 +24,7 @@ import sys
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
@@ -726,7 +726,12 @@ class TestRegisterHandlers:
             "gateway.status.acquire_scoped_lock",
             lambda scope, identity, metadata=None: (True, None),
         )
-        a._register_handlers = MagicMock()
+        a._wire_plugin_handlers = MagicMock(
+            side_effect=lambda app: app.add_handler("plugin")
+        )
+        a._register_handlers = MagicMock(
+            side_effect=lambda app: app.add_handler("core")
+        )
 
         result = asyncio.run(a.connect())
 
@@ -734,6 +739,14 @@ class TestRegisterHandlers:
         assert a._register_handlers.call_args_list == [
             ((first_app,), {}),
             ((rebuilt_app,), {}),
+        ]
+        assert a._wire_plugin_handlers.call_args_list == [
+            ((first_app,), {}),
+            ((rebuilt_app,), {}),
+        ]
+        assert rebuilt_app.add_handler.call_args_list == [
+            call("plugin"),
+            call("core"),
         ]
 
 

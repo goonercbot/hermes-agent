@@ -3199,13 +3199,14 @@ class PluginContext:
         self,
         prefix: str,
         callback: Callable,
-    ) -> None:
+    ) -> PluginRegistration:
         """Register an authorized Telegram inline-button callback by prefix.
 
-        This preserves the callback contract used by existing Hermes plugins:
-        ``callback(update=update, query=query, adapter=adapter)``.  It is
-        implemented on top of the native Telegram handler-factory surface so
-        plugins remain isolated from the core adapter's catch-all dispatcher.
+        A single host-owned PTB dispatcher reads manager-owned registrations at
+        event time. Targeted unload therefore revokes a plugin immediately, and
+        reload replaces the callback without rebuilding the Telegram client.
+        Existing plugins retain the keyword contract
+        ``callback(update=update, query=query, adapter=adapter)``.
         """
         if not isinstance(prefix, str) or not prefix:
             raise ValueError(
@@ -3218,68 +3219,111 @@ class PluginContext:
                 "callback handler with a non-callable callback."
             )
 
-        def _wire(application: Any, adapter: Any) -> None:
-            import re
+        manager = self._manager
+        entry = (prefix, callback, self.manifest.name)
+        manager._telegram_callback_handlers.append(entry)
 
-            from telegram.ext import CallbackQueryHandler
+        def _release() -> None:
+            manager._remove_identity(manager._telegram_callback_handlers, entry)
 
-            async def _dispatch(update: Any, context: Any) -> None:
-                query = getattr(update, "callback_query", None)
-                data = getattr(query, "data", None)
-                if query is None or not isinstance(data, str):
-                    return
+        registration = self._track(
+            "telegram_callback_handler",
+            prefix,
+            _release,
+        )
 
-                message = getattr(query, "message", None)
-                chat_id = getattr(message, "chat_id", None)
-                chat = getattr(message, "chat", None)
-                chat_type = getattr(chat, "type", None)
-                thread_id = getattr(message, "message_thread_id", None)
-                from_user = getattr(query, "from_user", None)
-                user_id = str(getattr(from_user, "id", ""))
-                user_name = getattr(from_user, "first_name", None)
+        factory = manager._telegram_callback_dispatch_factory
+        if factory is None:
 
-                if not adapter._is_callback_user_authorized(
-                    user_id,
-                    chat_id=chat_id,
-                    chat_type=str(chat_type) if chat_type is not None else None,
-                    thread_id=str(thread_id) if thread_id is not None else None,
-                    user_name=user_name,
-                ):
-                    await query.answer(
-                        text="⛔ You are not authorized to use this button.",
-                        show_alert=True,
+            def _wire(application: Any, adapter: Any) -> None:
+                from telegram.ext import CallbackQueryHandler
+
+                def _matches(data: object) -> bool:
+                    return isinstance(data, str) and any(
+                        data.startswith(registered_prefix)
+                        for registered_prefix, _, _
+                        in manager.get_telegram_callback_handlers()
                     )
-                    return
 
-                try:
-                    result = callback(
-                        update=update,
-                        query=query,
-                        adapter=adapter,
+                async def _dispatch(update: Any, context: Any) -> None:
+                    query = getattr(update, "callback_query", None)
+                    data = getattr(query, "data", None)
+                    if query is None or not isinstance(data, str):
+                        return
+
+                    selected = next(
+                        (
+                            registered
+                            for registered in manager.get_telegram_callback_handlers()
+                            if data.startswith(registered[0])
+                        ),
+                        None,
                     )
-                    if inspect.isawaitable(result):
-                        await result
-                except Exception as exc:
-                    logger.error(
-                        "Plugin %s Telegram callback handler failed for prefix %s: %s",
-                        self.manifest.name,
-                        prefix,
-                        exc,
-                        exc_info=True,
-                    )
-                    try:
+                    if selected is None:
+                        return
+                    registered_prefix, registered_callback, plugin_name = selected
+
+                    message = getattr(query, "message", None)
+                    chat_id = getattr(message, "chat_id", None)
+                    chat = getattr(message, "chat", None)
+                    chat_type = getattr(chat, "type", None)
+                    thread_id = getattr(message, "message_thread_id", None)
+                    from_user = getattr(query, "from_user", None)
+                    user_id = str(getattr(from_user, "id", ""))
+                    user_name = getattr(from_user, "first_name", None)
+
+                    if not adapter._is_callback_user_authorized(
+                        user_id,
+                        chat_id=chat_id,
+                        chat_type=str(chat_type) if chat_type is not None else None,
+                        thread_id=str(thread_id) if thread_id is not None else None,
+                        user_name=user_name,
+                    ):
                         await query.answer(
-                            text="This action failed. Please try again.",
+                            text="⛔ You are not authorized to use this button.",
                             show_alert=True,
                         )
-                    except Exception:
-                        pass
+                        return
 
-            application.add_handler(
-                CallbackQueryHandler(_dispatch, pattern=rf"^{re.escape(prefix)}")
-            )
+                    try:
+                        result = registered_callback(
+                            update=update,
+                            query=query,
+                            adapter=adapter,
+                        )
+                        if inspect.isawaitable(result):
+                            await result
+                    except Exception as exc:
+                        logger.error(
+                            "Plugin %s Telegram callback handler failed for "
+                            "prefix %s: %s",
+                            plugin_name,
+                            registered_prefix,
+                            exc,
+                            exc_info=True,
+                        )
+                        try:
+                            await query.answer(
+                                text="This action failed. Please try again.",
+                                show_alert=True,
+                            )
+                        except Exception:
+                            pass
 
-        self.register_telegram_handler(_wire)
+                application.add_handler(
+                    CallbackQueryHandler(_dispatch, pattern=_matches)
+                )
+
+            manager._telegram_callback_dispatch_factory = _wire
+            factory = _wire
+
+        telegram_factories = manager._platform_handler_factories.setdefault(
+            "telegram", []
+        )
+        if not any(registered is factory for registered, _ in telegram_factories):
+            telegram_factories.append((factory, "hermes.callback-dispatch"))
+
+        return registration
 
     # -- hook registration --------------------------------------------------
 
@@ -3911,6 +3955,12 @@ class PluginManager:
         # ``register_telegram_handler`` is a thin alias writing into the
         # "telegram" bucket.
         self._platform_handler_factories: Dict[str, List[tuple]] = {}
+        # Authorized Telegram callback-prefix registrations stay manager-owned
+        # so live dispatch sees unload/reload changes immediately. A single
+        # host dispatcher is wired into each PTB Application and consults this
+        # list at event time instead of capturing plugin callbacks at connect.
+        self._telegram_callback_handlers: List[tuple[str, Callable, str]] = []
+        self._telegram_callback_dispatch_factory: Optional[Callable] = None
 
     # -----------------------------------------------------------------------
     # Registration ledger internals
@@ -4258,6 +4308,7 @@ class PluginManager:
             self._predeclared_modules.clear()
             self._predeclared_tools.clear()
             self._platform_handler_factories.clear()
+            self._telegram_callback_handlers.clear()
             self._context_engine = None
             with self._hook_timeout_lock:
                 self._hook_running_callbacks.clear()
@@ -6135,6 +6186,10 @@ class PluginManager:
     def get_telegram_handler_factories(self) -> List[tuple]:
         """Back-compat alias for ``get_platform_handler_factories("telegram")``."""
         return self.get_platform_handler_factories("telegram")
+
+    def get_telegram_callback_handlers(self) -> List[tuple[str, Callable, str]]:
+        """Return current authorized callback registrations in dispatch order."""
+        return list(self._telegram_callback_handlers)
 
     # -----------------------------------------------------------------------
     # Introspection

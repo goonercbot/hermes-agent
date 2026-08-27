@@ -1,7 +1,6 @@
 """Backward-compatible authorized Telegram callback-prefix registration."""
 
 import asyncio
-import re
 import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -14,12 +13,12 @@ from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
 class _FakeCallbackQueryHandler:
     def __init__(self, callback, pattern):
         self.callback = callback
-        self.pattern = re.compile(pattern)
+        self.pattern = pattern
 
 
-def _context():
-    manager = PluginManager()
-    context = PluginContext(PluginManifest(name="callback-fixture"), manager)
+def _context(name="callback-fixture", manager=None):
+    manager = manager or PluginManager()
+    context = PluginContext(PluginManifest(name=name), manager)
     return manager, context
 
 
@@ -34,7 +33,7 @@ def _wired_handler(manager, adapter, monkeypatch):
     factories = manager.get_platform_handler_factories("telegram")
     assert len(factories) == 1
     factory, plugin_name = factories[0]
-    assert plugin_name == "callback-fixture"
+    assert plugin_name == "hermes.callback-dispatch"
     factory(application, adapter)
     assert len(application.handlers) == 1
     handler = application.handlers[0]
@@ -64,6 +63,8 @@ def test_register_callback_prefix_wires_authorized_handler(monkeypatch):
 
     handler = _wired_handler(manager, adapter, monkeypatch)
     update, query = _update()
+    assert handler.pattern(query.data) is True
+    assert handler.pattern("other:approve") is False
     asyncio.run(handler.callback(update, None))
 
     callback.assert_awaited_once_with(
@@ -89,14 +90,73 @@ def test_callback_prefix_denies_unauthorized_user(monkeypatch):
     assert query.answer.await_args.kwargs["show_alert"] is True
 
 
-def test_callback_prefix_is_regex_escaped(monkeypatch):
+def test_callback_prefix_is_literal(monkeypatch):
     manager, context = _context()
     context.register_telegram_callback_handler("tx.+:", AsyncMock())
     adapter = SimpleNamespace(_is_callback_user_authorized=lambda *_a, **_kw: True)
 
     handler = _wired_handler(manager, adapter, monkeypatch)
 
-    assert handler.pattern.pattern == r"^tx\.\+:"
+    assert handler.pattern("tx.+:approve") is True
+    assert handler.pattern("txABC:approve") is False
+
+
+def test_targeted_unload_revokes_live_dispatch(monkeypatch):
+    manager, context = _context()
+    callback = AsyncMock()
+    context.register_telegram_callback_handler("tx:", callback)
+    adapter = SimpleNamespace(_is_callback_user_authorized=lambda *_a, **_kw: True)
+    handler = _wired_handler(manager, adapter, monkeypatch)
+
+    assert manager.unload("callback-fixture") is True
+    assert manager.get_telegram_callback_handlers() == []
+    assert handler.pattern("tx:approve") is False
+
+    update, _ = _update()
+    asyncio.run(handler.callback(update, None))
+    callback.assert_not_awaited()
+
+
+def test_reload_replaces_callback_without_rebuilding_application(monkeypatch):
+    manager, context = _context()
+    old_callback = AsyncMock()
+    context.register_telegram_callback_handler("tx:", old_callback)
+    adapter = SimpleNamespace(_is_callback_user_authorized=lambda *_a, **_kw: True)
+    handler = _wired_handler(manager, adapter, monkeypatch)
+
+    assert manager.unload("callback-fixture") is True
+    _, reloaded_context = _context(manager=manager)
+    new_callback = AsyncMock()
+    reloaded_context.register_telegram_callback_handler("tx:", new_callback)
+
+    assert len(manager.get_platform_handler_factories("telegram")) == 1
+    update, query = _update()
+    assert handler.pattern(query.data) is True
+    asyncio.run(handler.callback(update, None))
+
+    old_callback.assert_not_awaited()
+    new_callback.assert_awaited_once_with(
+        update=update,
+        query=query,
+        adapter=adapter,
+    )
+
+
+def test_multiple_plugins_share_one_dispatch_factory(monkeypatch):
+    manager, first = _context("first")
+    _, second = _context("second", manager)
+    first_callback = AsyncMock()
+    second_callback = AsyncMock()
+    first.register_telegram_callback_handler("first:", first_callback)
+    second.register_telegram_callback_handler("second:", second_callback)
+    adapter = SimpleNamespace(_is_callback_user_authorized=lambda *_a, **_kw: True)
+
+    handler = _wired_handler(manager, adapter, monkeypatch)
+    update, _ = _update("second:approve")
+    asyncio.run(handler.callback(update, None))
+
+    first_callback.assert_not_awaited()
+    second_callback.assert_awaited_once()
 
 
 @pytest.mark.parametrize("prefix", ["", None, 123])

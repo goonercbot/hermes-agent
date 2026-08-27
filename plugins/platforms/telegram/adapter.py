@@ -4729,6 +4729,9 @@ class TelegramAdapter(BasePlatformAdapter):
                         old_app = self._app
                         self._app = builder.build()
                         self._bot = self._app.bot
+                        # Preserve plugin-before-core ordering on every rebuilt
+                        # PTB Application, not only the first connect attempt.
+                        self._wire_plugin_handlers(self._app)
                         # Keep core and observer handlers in lockstep after a
                         # transient-init rebuild (#64176).
                         self._register_handlers(self._app)

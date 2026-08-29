@@ -239,6 +239,31 @@ def _flush_session_db_after_tool_progress(
         return False
 
 
+def _attach_evidence_context(
+    tool_message: dict,
+    *,
+    tool_name: str,
+    tool_call_id: str,
+    effective_task_id: str,
+    status: str | None = None,
+) -> None:
+    """Attach persistence-only identity without exposing it to the model wire."""
+    try:
+        from agent.evidence_ledger import runtime_context
+
+        env = get_active_env(effective_task_id)
+        cwd = str(env.cwd) if env is not None and env.cwd else None
+        tool_message["_evidence_context"] = runtime_context(
+            tool_name, tool_call_id, cwd=cwd
+        )
+        if status:
+            tool_message["_evidence_context"]["status"] = status
+    except Exception:
+        # Without context the event is uniquely keyed to its tool call and
+        # remains fail-closed rather than being promoted to another candidate.
+        logger.debug("Could not attach evidence context", exc_info=True)
+
+
 def _image_generate_parallel_limit() -> int:
     """Return the configured image-generation parallelism cap.
 
@@ -1121,12 +1146,20 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 "due to user interrupt]"
             )
             tool_call_id = _pairing_tool_call_id(tc)
-            messages.append(make_tool_result_message(
+            tool_message = make_tool_result_message(
                 tc.function.name,
                 cancelled_result,
                 tool_call_id,
                 effect_disposition="none",
-            ))
+            )
+            _attach_evidence_context(
+                tool_message,
+                tool_name=tc.function.name,
+                tool_call_id=tool_call_id,
+                effective_task_id=effective_task_id,
+                status="cancelled",
+            )
+            messages.append(tool_message)
             _emit_terminal_post_tool_call(
                 agent,
                 function_name=tc.function.name,
@@ -1731,6 +1764,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             tool_duration = float(timeout_s or 0.0)
         elif r is None:
             # Tool was cancelled (interrupt) or thread didn't return
+            effect_disposition = "unknown"
             if agent._interrupt_requested:
                 function_result = f"[Tool execution cancelled — {name} was skipped due to user interrupt]"
                 _emit_terminal_post_tool_call(
@@ -1780,6 +1814,8 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 )
             if blocked:
                 effect_disposition = "none"
+            elif is_error:
+                effect_disposition = "none" if _parse_error is not None else "unknown"
 
             if not blocked:
                 function_result = agent._append_guardrail_observation(
@@ -1847,6 +1883,20 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             _tool_content,
             tool_call_id,
             effect_disposition=effect_disposition,
+        )
+        _attach_evidence_context(
+            tool_message,
+            tool_name=name,
+            tool_call_id=tool_call_id,
+            effective_task_id=effective_task_id,
+            status=(
+                "timed_out" if i in timed_out_indices and r is None
+                else (
+                    "cancelled"
+                    if r is None and agent._interrupt_requested
+                    else ("error" if is_error and not blocked else None)
+                )
+            ),
         )
         messages.append(tool_message)
         risk_metadata = tool_message.get("_tool_output_risk")
@@ -1929,24 +1979,49 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
 
 
 
-def _append_cancelled_tool_results(messages: list, tool_calls, *, reason: str) -> None:
-    """Append a cancelled ``tool`` result for each call in ``tool_calls``.
-
-    Used when a hard interrupt (KeyboardInterrupt / BaseException) aborts the
-    sequential executor mid-batch. Without this, the loop re-raises leaving the
-    assistant tool-call turn with no matching tool results — a message-role
-    alternation violation that malforms the next provider request. Mirrors the
-    cooperative-interrupt skip block and the concurrent path, both of which
-    already emit a result for every call_id.
-    """
-    for tc in tool_calls:
+def _append_cancelled_tool_results(
+    agent,
+    messages: list,
+    tool_calls,
+    *,
+    effective_task_id: str,
+    reason: str,
+) -> None:
+    """Append and persist authenticated cancellation results for hard interrupts."""
+    existing_call_ids = {
+        str(message.get("tool_call_id"))
+        for message in messages
+        if isinstance(message, dict)
+        and message.get("role") == "tool"
+        and message.get("tool_call_id")
+    }
+    appended = False
+    for index, tc in enumerate(tool_calls):
         name = getattr(getattr(tc, "function", None), "name", "") or "tool"
-        messages.append(make_tool_result_message(
+        tool_call_id = _pairing_tool_call_id(tc)
+        if tool_call_id in existing_call_ids:
+            continue
+        tool_message = make_tool_result_message(
             name,
             f"[Tool execution cancelled — {name} was skipped due to {reason}]",
-            _pairing_tool_call_id(tc),
-            effect_disposition="none",
-        ))
+            tool_call_id,
+            effect_disposition="unknown" if index == 0 else "none",
+        )
+        _attach_evidence_context(
+            tool_message,
+            tool_name=name,
+            tool_call_id=tool_call_id,
+            effective_task_id=effective_task_id,
+            status="cancelled",
+        )
+        messages.append(tool_message)
+        appended = True
+    if appended:
+        _flush_session_db_after_tool_progress(
+            agent,
+            messages,
+            stage="hard-interrupt cancelled tool results",
+        )
 
 
 def execute_tool_calls_sequential(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *, finalize: bool = True) -> None:
@@ -1962,7 +2037,21 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
     # Keep every runtime-tool branch on one bounded execution funnel without
     # duplicating timeout policy across the branch-specific callbacks below.
     def _run_agent_tool_execution_middleware(agent, **kwargs):
-        return _run_sequential_tool_execution_middleware(agent, **kwargs)
+        try:
+            return _run_sequential_tool_execution_middleware(agent, **kwargs)
+        except KeyboardInterrupt:
+            try:
+                agent.interrupt("keyboard interrupt")
+            except Exception:
+                pass
+            _append_cancelled_tool_results(
+                agent,
+                messages,
+                assistant_message.tool_calls[i - 1:],
+                effective_task_id=effective_task_id,
+                reason="keyboard interrupt",
+            )
+            raise
 
     for i, tool_call in enumerate(assistant_message.tool_calls, 1):
         tool_call_id = _pairing_tool_call_id(tool_call)
@@ -1981,12 +2070,21 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     f"[Tool execution cancelled — {skipped_name} was skipped "
                     "due to user interrupt]"
                 )
-                messages.append(make_tool_result_message(
+                skipped_call_id = _pairing_tool_call_id(skipped_tc)
+                tool_message = make_tool_result_message(
                     skipped_name,
                     cancelled_result,
-                    _pairing_tool_call_id(skipped_tc),
+                    skipped_call_id,
                     effect_disposition="none",
-                ))
+                )
+                _attach_evidence_context(
+                    tool_message,
+                    tool_name=skipped_name,
+                    tool_call_id=skipped_call_id,
+                    effective_task_id=effective_task_id,
+                    status="cancelled",
+                )
+                messages.append(tool_message)
                 _emit_terminal_post_tool_call(
                     agent,
                     function_name=skipped_name,
@@ -2023,13 +2121,20 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 error_type="invalid_tool_arguments",
                 error_message="Tool arguments must be a valid JSON object",
             )
-            messages.append(
-                make_tool_result_message(
-                    function_name,
-                    malformed_args_result,
-                    tool_call_id,
-                )
+            tool_message = make_tool_result_message(
+                function_name,
+                malformed_args_result,
+                tool_call_id,
+                effect_disposition="none",
             )
+            _attach_evidence_context(
+                tool_message,
+                tool_name=function_name,
+                tool_call_id=tool_call_id,
+                effective_task_id=effective_task_id,
+                status="error",
+            )
+            messages.append(tool_message)
             if not _flush_session_db_after_tool_progress(
                 agent,
                 messages,
@@ -2572,8 +2677,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 # the batch before re-raising, so the assistant tool-call turn
                 # is never left without matching tool results (alternation).
                 _append_cancelled_tool_results(
+                    agent,
                     messages,
                     assistant_message.tool_calls[i - 1:],
+                    effective_task_id=effective_task_id,
                     reason="keyboard interrupt",
                 )
                 raise
@@ -2651,8 +2758,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 # Emit a tool result for THIS call and every remaining call in
                 # the batch before re-raising (see interactive branch above).
                 _append_cancelled_tool_results(
+                    agent,
                     messages,
                     assistant_message.tool_calls[i - 1:],
+                    effective_task_id=effective_task_id,
                     reason="keyboard interrupt",
                 )
                 raise
@@ -2661,9 +2770,11 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 logger.error("handle_function_call raised for %s: %s", function_name, tool_error, exc_info=True)
             tool_duration = time.time() - tool_start_time
 
-        _execution_timed_out = isinstance(
-            function_result, (_ToolTimeoutResult, _ToolCancelledResult)
+        _evidence_execution_status = (
+            "cancelled" if isinstance(function_result, _ToolCancelledResult)
+            else ("timed_out" if isinstance(function_result, _ToolTimeoutResult) else None)
         )
+        _execution_timed_out = _evidence_execution_status is not None
         if isinstance(function_result, str):
             result_preview = function_result if agent.verbose_logging else (
                 function_result[:200] if len(function_result) > 200 else function_result
@@ -2761,7 +2872,19 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             function_name,
             _tool_content,
             tool_call_id,
-            effect_disposition="unknown" if _execution_timed_out else None,
+            effect_disposition=(
+                "none" if _execution_blocked or not _execution_dispatched
+                else ("unknown" if _execution_timed_out or _is_error_result else None)
+            ),
+        )
+        _attach_evidence_context(
+            tool_message,
+            tool_name=function_name,
+            tool_call_id=tool_call_id,
+            effective_task_id=effective_task_id,
+            status=_evidence_execution_status or (
+                "error" if _is_error_result else None
+            ),
         )
         messages.append(tool_message)
         risk_metadata = tool_message.get("_tool_output_risk")
@@ -2830,12 +2953,21 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             agent._vprint(f"{agent.log_prefix}⚡ Interrupt: skipping {remaining} remaining tool call(s)", force=True)
             for skipped_tc in assistant_message.tool_calls[i:]:
                 skipped_name = skipped_tc.function.name
-                messages.append(make_tool_result_message(
+                skipped_call_id = _pairing_tool_call_id(skipped_tc)
+                tool_message = make_tool_result_message(
                     skipped_name,
                     f"[Tool execution skipped — {skipped_name} was not started. User sent a new message]",
-                    _pairing_tool_call_id(skipped_tc),
+                    skipped_call_id,
                     effect_disposition="none",
-                ))
+                )
+                _attach_evidence_context(
+                    tool_message,
+                    tool_name=skipped_name,
+                    tool_call_id=skipped_call_id,
+                    effective_task_id=effective_task_id,
+                    status="cancelled",
+                )
+                messages.append(tool_message)
                 if not _flush_session_db_after_tool_progress(
                     agent,
                     messages,

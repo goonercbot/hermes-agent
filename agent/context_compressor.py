@@ -26,7 +26,7 @@ import sqlite3
 import re
 import time
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 from agent.auxiliary_client import (
     AuxiliaryExplicitCancellation,
@@ -296,6 +296,7 @@ def _fresh_compaction_message_copy(msg: Dict[str, Any]) -> Dict[str, Any]:
     """
     fresh = msg.copy()
     fresh.pop(_DB_PERSISTED_MARKER, None)
+    fresh.pop("_evidence_context", None)
     return fresh
 
 
@@ -959,6 +960,9 @@ _LEAN_USER_MESSAGES_BUDGET_CHARS = 24_000  # ~6K tokens
 _LEAN_USER_MESSAGE_MAX_CHARS = 4_000
 _LEAN_USER_MESSAGES_HEADING = "## User Messages (verbatim, newest first)"
 _LEAN_RECOVERY_HEADING = "## Context Recovery"
+_EVIDENCE_LEDGER_HEADING = "## Deterministic Evidence Ledger"
+_EVIDENCE_RECEIPT_PREFIX = "[Hermes evidence v1] "
+_EVIDENCE_UNRESOLVED_PREFIX = "[Hermes evidence unresolved v1] "
 # Tail-side tool demotion: inside the lean tail, tool results older than the
 # newest N tool rounds are demoted to a one-line stub with a recovery
 # pointer. This is what lets the tail budget actually bind — without it the
@@ -2509,6 +2513,105 @@ class ContextCompressor(ContextEngine):
         self._load_ineffective_compression_count()
         self._load_proactive_prune_rearm_tokens()
 
+    def _load_evidence_receipts(
+        self,
+        messages: List[Dict[str, Any]],
+    ) -> tuple[bool, Optional[Dict[str, List[str]]]]:
+        """Load verified receipts for the exact tool calls about to be folded."""
+        session_db = getattr(self, "_session_db", None)
+        if not bool(getattr(session_db, "evidence_enabled", False)):
+            return False, {}
+        session_id = getattr(self, "_session_id", "")
+        getter = getattr(session_db, "get_compact_evidence_receipts", None)
+        if not session_id or not callable(getter):
+            logger.warning(
+                "Evidence-enabled compression cannot load verified receipts; "
+                "preserving the uncompressed transcript"
+            )
+            return True, None
+        try:
+            # Load the complete verified session ledger. This preserves genuine
+            # receipts across repeated compression without trusting receipt-like
+            # strings from prior summaries or transcript content.
+            loaded = getter(session_id, None)
+        except Exception as exc:
+            logger.warning(
+                "Evidence integrity/read check failed before compression; "
+                "preserving the uncompressed transcript: %s",
+                exc,
+            )
+            return True, None
+        if not isinstance(loaded, dict):
+            return True, None
+        return True, loaded
+
+    @staticmethod
+    def _receipt_lines_for_call(
+        call_id: str,
+        receipts: Mapping[str, List[str]],
+    ) -> List[str]:
+        lines = receipts.get(call_id) or []
+        verified = [
+            line
+            for line in lines
+            if isinstance(line, str) and line.startswith(_EVIDENCE_RECEIPT_PREFIX)
+        ]
+        if verified:
+            return verified
+        return [
+            _EVIDENCE_UNRESOLVED_PREFIX
+            + json.dumps(
+                {"reason": "no_verified_receipt", "tool_call_id": call_id},
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        ]
+
+    def _with_evidence_ledger(
+        self,
+        summary: str,
+        turns: List[Dict[str, Any]],
+        receipts: Mapping[str, List[str]],
+        *,
+        required: bool,
+    ) -> str:
+        if not required:
+            return summary
+        # Replace, never semantically rewrite, a prior deterministic section.
+        # Receipt-looking text in summaries or transcript rows is untrusted;
+        # only values returned by the integrity-checking DB getter are emitted.
+        marker = "\n\n" + _EVIDENCE_LEDGER_HEADING + "\n"
+        summary = summary.split(marker, 1)[0]
+        summary = "\n".join(
+            line
+            for line in summary.splitlines()
+            if _EVIDENCE_RECEIPT_PREFIX not in line
+            and _EVIDENCE_UNRESOLVED_PREFIX not in line
+        ).rstrip()
+        lines = [
+            line
+            for call_id in sorted(receipts)
+            for line in (receipts.get(call_id) or [])
+            if isinstance(line, str) and line.startswith(_EVIDENCE_RECEIPT_PREFIX)
+        ]
+        for turn in turns:
+            if turn.get("role") == "tool" and turn.get("tool_call_id"):
+                lines.extend(
+                    self._receipt_lines_for_call(
+                        str(turn["tool_call_id"]), receipts
+                    )
+                )
+        deduped = list(dict.fromkeys(lines))
+        if not deduped:
+            return summary
+        return (
+            summary
+            + marker
+            + "Append-only receipts below reference authoritative transcript rows. "
+              "They do not prove current/live state without a fresh check.\n"
+            + "\n".join(deduped)
+        )
+
     def on_session_start(self, session_id: str, **kwargs) -> None:
         """Bind session-scoped compression state for a new or resumed session."""
         super().on_session_start(session_id, **kwargs)
@@ -3816,6 +3919,8 @@ class ContextCompressor(ContextEngine):
         self, messages: List[Dict[str, Any]], protect_tail_count: int,
         protect_tail_tokens: int | None = None,
         min_prune_chars: int = _PRUNE_MIN_CHARS,
+        evidence_required: bool = False,
+        evidence_receipts: Optional[Mapping[str, List[str]]] = None,
     ) -> tuple[List[Dict[str, Any]], int]:
         """Replace old tool result contents with informative 1-line summaries.
 
@@ -4108,6 +4213,30 @@ class ContextCompressor(ContextEngine):
                         f"{soft_ceiling:,}",
                     )
 
+        if evidence_required:
+            receipt_map = evidence_receipts or {}
+            for idx, original in enumerate(messages):
+                current = result[idx]
+                if (
+                    original.get("role") != "tool"
+                    or original.get("content") == current.get("content")
+                    or not current.get("tool_call_id")
+                    or not isinstance(current.get("content"), str)
+                ):
+                    continue
+                receipt_lines = self._receipt_lines_for_call(
+                    str(current["tool_call_id"]), receipt_map
+                )
+                content = str(current["content"])
+                missing = [line for line in receipt_lines if line not in content]
+                if missing:
+                    result[idx] = {
+                        **current,
+                        "content": content.rstrip() + "\n" + "\n".join(missing),
+                    }
+
+        for message in result:
+            message.pop("_evidence_context", None)
         return result, pruned
 
     def prune_tool_results_only(
@@ -4176,11 +4305,16 @@ class ContextCompressor(ContextEngine):
             and not callable(getattr(session_db, "archive_and_compact", None))
         ):
             return messages, 0
+        evidence_required, evidence_receipts = self._load_evidence_receipts(messages)
+        if evidence_required and evidence_receipts is None:
+            return messages, 0
         pruned_msgs, pruned_count = self._prune_old_tool_results(
             messages,
             protect_tail_count=self.protect_last_n,
             protect_tail_tokens=None,
             min_prune_chars=self.proactive_prune_min_result_chars,
+            evidence_required=evidence_required,
+            evidence_receipts=evidence_receipts,
         )
         if not pruned_count:
             # Standard no-op contract: hand back the INPUT object so callers
@@ -7478,10 +7612,19 @@ This compaction should PRIORITISE preserving all information related to the focu
         else:
             self._lean_pristine_tools = {}
 
-        # Phase 1: Prune old tool results (cheap, no LLM call)
+        # Phase 1: Prune old tool results (cheap, no LLM call). Evidence-enabled
+        # sessions fail closed before any semantic summary if the compact ledger
+        # cannot be integrity-verified.
+        evidence_required, evidence_receipts = self._load_evidence_receipts(messages)
+        if evidence_required and evidence_receipts is None:
+            telemetry["failure_class"] = "evidence_integrity_unavailable"
+            self._last_compress_aborted = True
+            return messages
         messages, pruned_count = self._prune_old_tool_results(
             messages, protect_tail_count=self.protect_last_n,
             protect_tail_tokens=self.tail_token_budget,
+            evidence_required=evidence_required,
+            evidence_receipts=evidence_receipts,
         )
         if pruned_count and not self.quiet_mode:
             logger.info("Pre-compression: pruned %d old tool result(s)", pruned_count)
@@ -7903,6 +8046,13 @@ This compaction should PRIORITISE preserving all information related to the focu
                 # embedded into a deliberate feasibility skip's fallback.
                 reason=None if feasibility_skip else self._last_summary_error,
             )
+
+        summary = self._with_evidence_ledger(
+            summary,
+            turns_to_summarize,
+            evidence_receipts or {},
+            required=evidence_required,
+        )
 
         tail_messages: List[Dict[str, Any]] = []
         # Start at tail_start (not compress_end): the restart-decay scan may

@@ -326,7 +326,7 @@ def _sql_session_last_active_by_id(session_id_expr: str) -> str:
     )
 
 
-SCHEMA_VERSION = 26
+SCHEMA_VERSION = 27
 
 
 # FTS storage-layout version, tracked INDEPENDENTLY of SCHEMA_VERSION in the
@@ -454,6 +454,67 @@ CREATE TABLE IF NOT EXISTS messages (
     display_metadata TEXT
 );
 
+-- Compact, prospective evidence recorded with the authoritative tool result.
+-- Raw tool output remains only in messages; this table stores a source pointer,
+-- its digest, bounded typed metadata, and a per-session integrity chain.
+CREATE TABLE IF NOT EXISTS evidence_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL REFERENCES sessions(id),
+    source_message_id INTEGER NOT NULL REFERENCES messages(id),
+    source_sha256 TEXT NOT NULL CHECK(length(source_sha256) = 64),
+    source_call_message_id INTEGER REFERENCES messages(id),
+    source_call_sha256 TEXT CHECK(
+        source_call_sha256 IS NULL OR length(source_call_sha256) = 64
+    ),
+    tool_call_id TEXT,
+    tool_name TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    lifecycle_dimension TEXT NOT NULL,
+    lifecycle_state TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    issuer TEXT NOT NULL,
+    adapter TEXT NOT NULL,
+    adapter_version TEXT NOT NULL,
+    subject_type TEXT NOT NULL,
+    subject_id TEXT NOT NULL,
+    candidate_id TEXT,
+    parent_candidate_id TEXT,
+    artifact_id TEXT,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    occurred_at REAL NOT NULL,
+    supersedes_event_id INTEGER,
+    previous_event_hash TEXT,
+    event_hash TEXT NOT NULL UNIQUE CHECK(length(event_hash) = 64),
+    trusted INTEGER NOT NULL DEFAULT 0 CHECK(trusted IN (0, 1)),
+    freshness_scope TEXT NOT NULL DEFAULT 'historical',
+    UNIQUE(session_id, source_message_id, event_type, issuer),
+    FOREIGN KEY (supersedes_event_id) REFERENCES evidence_events(id)
+);
+
+-- A retained evidence ledger is immutable.  Whole-session retention deletion
+-- is the sole exception and must be authorized in the same transaction by the
+-- SessionDB deletion path; a crash rolls both the authorization and deletion
+-- back together.
+CREATE TABLE IF NOT EXISTS evidence_retention_deletions (
+    session_id TEXT PRIMARY KEY
+);
+
+CREATE TRIGGER IF NOT EXISTS evidence_events_no_update
+BEFORE UPDATE ON evidence_events
+BEGIN
+    SELECT RAISE(ABORT, 'evidence_events are append-only');
+END;
+
+CREATE TRIGGER IF NOT EXISTS evidence_events_no_delete
+BEFORE DELETE ON evidence_events
+WHEN NOT EXISTS (
+    SELECT 1 FROM evidence_retention_deletions
+    WHERE session_id = OLD.session_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'evidence_events are append-only');
+END;
+
 CREATE TABLE IF NOT EXISTS session_model_usage (
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
     model TEXT NOT NULL,
@@ -560,6 +621,12 @@ CREATE INDEX IF NOT EXISTS idx_messages_session_id ON messages(session_id, id);
 CREATE INDEX IF NOT EXISTS idx_messages_assistant_calls_by_session
     ON messages(session_id)
     WHERE role = 'assistant' AND tool_calls IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_evidence_events_session_order
+    ON evidence_events(session_id, id);
+CREATE INDEX IF NOT EXISTS idx_evidence_events_source
+    ON evidence_events(source_message_id);
+CREATE INDEX IF NOT EXISTS idx_evidence_events_candidate
+    ON evidence_events(session_id, candidate_id, lifecycle_dimension, id);
 CREATE INDEX IF NOT EXISTS idx_compression_locks_expires ON compression_locks(expires_at);
 CREATE INDEX IF NOT EXISTS idx_session_turn_leases_expires ON session_turn_leases(expires_at);
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_session ON session_model_usage(session_id);

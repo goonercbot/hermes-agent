@@ -96,6 +96,7 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
 from hermes_state_portability import SessionPortabilityMixin
 from hermes_state_schema import SessionSchemaMixin
 from hermes_state_search import SessionSearchMixin
+from hermes_state_evidence import SessionEvidenceMixin
 
 try:  # Hard dependency, but tolerate scaffold-phase imports before pip install.
     import psutil
@@ -139,10 +140,23 @@ def resolved_max_resume_messages() -> int:
 
 
 def resolved_max_export_messages() -> int:
-    """Config-resolved in-memory export guard limit (0 disables the guard)."""
+    """Config-resolved export guard limit (0 disables the guard)."""
     return _configured_transcript_limit(
         "max_export_messages", MAX_SAFE_EXPORT_MESSAGES
     )
+
+
+def _configured_evidence_enabled() -> bool:
+    """Resolve the opt-in prospective evidence ledger setting at open time."""
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        raw = (load_config_readonly().get("evidence") or {}).get("enabled", False)
+    except Exception:
+        return False
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
 
 class SessionResumeTooLargeError(ValueError):
@@ -343,10 +357,31 @@ def _collect_delegate_child_ids(conn, parent_ids: List[str]) -> List[str]:
     return [sid for sid in found if sid not in seeds]
 
 
+def _delete_retained_evidence(conn, session_ids: List[str]) -> None:
+    """Delete ledgers only as part of an intentional transcript retention delete."""
+    ids = [sid for sid in dict.fromkeys(session_ids) if sid]
+    if not ids:
+        return
+    conn.executemany(
+        "INSERT OR IGNORE INTO evidence_retention_deletions(session_id) VALUES (?)",
+        [(sid,) for sid in ids],
+    )
+    placeholders = ",".join("?" * len(ids))
+    conn.execute(
+        f"DELETE FROM evidence_events WHERE session_id IN ({placeholders})",
+        ids,
+    )
+    conn.execute(
+        f"DELETE FROM evidence_retention_deletions WHERE session_id IN ({placeholders})",
+        ids,
+    )
+
+
 def _delete_delegate_children(conn, parent_ids: List[str]) -> List[str]:
     ids = _collect_delegate_child_ids(conn, parent_ids)
     if ids:
         ph = ",".join("?" * len(ids))
+        _delete_retained_evidence(conn, ids)
         conn.execute(f"DELETE FROM messages WHERE session_id IN ({ph})", ids)
         # FK safety: orphan any untagged stragglers pointing at a doomed row.
         conn.execute(
@@ -4382,7 +4417,12 @@ def classify_session_status(
     return SESSION_STATUS_COMPLETE
 
 
-class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin):
+class SessionDB(
+    SessionSearchMixin,
+    SessionSchemaMixin,
+    SessionPortabilityMixin,
+    SessionEvidenceMixin,
+):
     """
     SQLite-backed session storage with FTS5 search.
 
@@ -4511,8 +4551,18 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         except Exception:
             logger.debug("Could not close a SessionDB connection", exc_info=True)
 
-    def __init__(self, db_path: Path = None, read_only: bool = False):
+    def __init__(
+        self,
+        db_path: Optional[Path] = None,
+        read_only: bool = False,
+        evidence_enabled: Optional[bool] = None,
+    ):
         self.db_path = db_path or _default_db_path()
+        self.evidence_enabled = (
+            _configured_evidence_enabled()
+            if evidence_enabled is None
+            else bool(evidence_enabled)
+        )
         # Fail hard (before any connection/pragma/mkdir) if a pytest-context
         # process resolved the developer's production state.db — see the
         # live-DB test-isolation guard block near _default_db_path().
@@ -11181,6 +11231,19 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             msg_id = cursor.lastrowid
 
+            self._insert_evidence_events(
+                conn,
+                session_id,
+                [{
+                    "_row_id": msg_id,
+                    "role": role,
+                    "content": content,
+                    "tool_call_id": tool_call_id,
+                    "tool_name": tool_name,
+                    "effect_disposition": effect_disposition,
+                }],
+            )
+
             # Update counters
             if num_tool_calls > 0:
                 conn.execute(
@@ -11266,6 +11329,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             inserted, tool_calls_total = self._insert_message_rows(
                 conn, session_id, messages
             )
+            self._insert_evidence_events(conn, session_id, messages)
             # One aggregated counter update for the whole batch.
             if tool_calls_total > 0:
                 conn.execute(
@@ -11663,6 +11727,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         is identical either way; only the durability of the dropped turns
         differs.
 
+        When prospective evidence is enabled, source rows are always preserved
+        with the same soft-archive behavior.  Evidence events bind to the exact
+        authoritative message row and a destructive rewrite would otherwise
+        create an unverifiable orphan.
+
         Pass ``reject_active_turn_lease=True`` for user-initiated rewrites that
         do not already own the cross-process turn lease. The lease check and
         transcript mutation then share one write transaction, so a second
@@ -11691,7 +11760,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     and session["end_reason"] == "compression"
                 ):
                     raise CompressionSessionClosedError(session_id)
-            if archive_dropped:
+            if archive_dropped or self.evidence_enabled:
                 # Content-preserving UPDATE: the rows keep their FTS entries
                 # (the messages_fts triggers fire on INSERT / DELETE / UPDATE
                 # of content columns, not on `active`), so the replaced turns
@@ -13430,6 +13499,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     def clear_messages(self, session_id: str) -> None:
         """Delete all messages for a session and reset its counters."""
         def _do(conn):
+            _delete_retained_evidence(conn, [session_id])
             conn.execute(
                 "DELETE FROM messages WHERE session_id = ?", (session_id,)
             )
@@ -13530,6 +13600,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 "WHERE parent_session_id = ?",
                 (session_id,),
             )
+            _delete_retained_evidence(conn, [session_id])
             conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
             conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
             self._delete_unreferenced_system_prompts(conn)
@@ -13651,6 +13722,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 f"WHERE parent_session_id IN ({existing_placeholders})",
                 existing,
             )
+            _delete_retained_evidence(conn, existing)
             conn.execute(
                 f"DELETE FROM messages WHERE session_id IN ({existing_placeholders})",
                 existing,
@@ -13768,6 +13840,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # message rows — but a row inserted between the SELECT and
                 # this statement would otherwise be left dangling, so we
                 # still leave a clean FK state.
+                _delete_retained_evidence(conn, [sid])
                 conn.execute(
                     "DELETE FROM messages WHERE session_id = ?", (sid,)
                 )
@@ -14159,6 +14232,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
 
             for sid in session_ids:
+                _delete_retained_evidence(conn, [sid])
                 conn.execute("DELETE FROM messages WHERE session_id = ?", (sid,))
                 conn.execute("DELETE FROM sessions WHERE id = ?", (sid,))
                 removed_ids.append(sid)

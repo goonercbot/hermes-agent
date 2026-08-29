@@ -2394,6 +2394,11 @@ class AIAgent:
                         else msg.get("display_kind")
                     ),
                     "display_metadata": msg.get("display_metadata"),
+                    # Private persistence-only context for deterministic evidence
+                    # adapters. It is never replayed to the model or copied into
+                    # the evidence row; only bounded identities derived from it
+                    # are retained.
+                    "_evidence_context": msg.get("_evidence_context"),
                 })
                 _batch_msgs.append(msg)
             # One transaction for the whole turn's new rows (typically 3-8
@@ -2420,6 +2425,10 @@ class AIAgent:
                 )
                 for _written in _batch_msgs:
                     _written[_DB_PERSISTED_MARKER] = True
+                    # One-shot persistence metadata must not survive into a
+                    # later compaction rewrite, which would otherwise create a
+                    # second evidence event for the folded copy.
+                    _written.pop("_evidence_context", None)
             # The intrinsic markers are now the sole source of truth. Reset the
             # one-shot seed so no id() outlives this flush to alias a message
             # allocated next turn at a recycled address.

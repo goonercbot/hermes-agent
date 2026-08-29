@@ -20,6 +20,12 @@ DEFAULT_CONFIG = {
         "wal_autocheckpoint": None,
         "journal_size_limit": None,
     },
+    # Prospective typed evidence is opt-in while its adapters and storage
+    # contract are being validated. When enabled, tool-result events are written
+    # atomically with transcript rows; raw output is never duplicated.
+    "evidence": {
+        "enabled": False,
+    },
     # Soft file-descriptor limit for long-running Hermes server processes.
     # Clamped to the OS hard limit; 0/false/null disables the adjustment.
     "runtime": {

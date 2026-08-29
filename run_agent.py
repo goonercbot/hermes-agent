@@ -2414,6 +2414,11 @@ class AIAgent:
                         else msg.get("display_kind")
                     ),
                     "display_metadata": msg.get("display_metadata"),
+                    # Private persistence-only context for deterministic evidence
+                    # adapters. It is never replayed to the model or copied into
+                    # the evidence row; only bounded identities derived from it
+                    # are retained.
+                    "_evidence_context": msg.get("_evidence_context"),
                 }
                 if isinstance(msg.get("_row_id"), int):
                     _row["_row_id"] = msg["_row_id"]
@@ -2444,6 +2449,11 @@ class AIAgent:
                 from agent.transcript_repair import sync_flushed_message_markers
 
                 sync_flushed_message_markers(_batch_msgs, _batch_rows)
+                for _written in _batch_msgs:
+                    # One-shot persistence metadata must not survive into a
+                    # later compaction rewrite, which would otherwise create a
+                    # second evidence event for the folded copy.
+                    _written.pop("_evidence_context", None)
             # The intrinsic markers are now the sole source of truth. Reset the
             # one-shot seed so no id() outlives this flush to alias a message
             # allocated next turn at a recycled address.

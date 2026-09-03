@@ -486,6 +486,7 @@ def _chat_messages_to_responses_input(
     replay_encrypted_reasoning: bool = True,
     current_issuer_kind: Optional[str] = None,
     native_compaction_eligible: bool = False,
+    native_continuity_source_messages: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """Convert internal chat-style messages to Responses input items.
 
@@ -531,23 +532,14 @@ def _chat_messages_to_responses_input(
     (drops ALL replay); ``current_issuer_kind`` is the per-item filter
     that runs only when replay is still enabled.
 
-    ``native_compaction_eligible`` mirrors, for THIS request, the decision
-    made by ``native_compaction.native_compaction_context_management`` — it
-    is True only when that gate returned a payload, i.e. when the request
-    actually carries ``context_management``. It controls two things that
-    must never outlive the gate: replaying ``type: "compaction"`` checkpoint
-    items, and restructuring the wire around them
-    (``prune_pre_checkpoint_items``). Checkpoints are persisted in the
-    ``codex_reasoning_items`` sidecar and survive a mid-session model swap,
-    a ``compression.enabled: false`` flip, the rejection kill switch and a
-    resumed session; without this flag a single captured checkpoint would
-    keep deleting every pre-checkpoint item from every later request, on a
-    model that cannot decrypt the blob (#85914). Default False = pre-feature
-    wire, which is also correct for every caller that never sends
-    ``context_management`` (auxiliary/compression client, ad-hoc
-    ``convert_messages``). Dropping the checkpoint costs nothing: Hermes'
-    local history is never truncated by native compaction, so the full
-    conversation is still on the wire.
+    ``native_compaction_eligible`` means this request is on a compatible direct
+    OpenAI route with native continuity enabled. It is intentionally independent
+    of whether this particular request emits ``context_management``: only a new
+    threshold-crossing request emits the field, while later compatible requests
+    must still replay a validated persisted checkpoint and handoff. On an
+    incompatible route, checkpoints are omitted and the ordinary durable history
+    remains intact. Protected checkpoints are validated against their immutable
+    prefix and triggering-user fences before any wire pruning occurs.
     """
     items: List[Dict[str, Any]] = []
     # Parallel to `items`: the raw chat message each converted item came
@@ -591,7 +583,30 @@ def _chat_messages_to_responses_input(
                 has_codex_reasoning = False
                 has_protected_compaction_handoff = False
                 if isinstance(codex_reasoning, list):
+                    from agent.native_compaction import (
+                        NATIVE_CONTINUITY_METADATA_KEY,
+                        PROTECTED_HANDOFF_METADATA_KEY,
+                        native_continuity_handoff_from_checkpoint,
+                        protected_handoff_from_checkpoint,
+                    )
+
                     for ri in codex_reasoning:
+                        if (
+                            isinstance(ri, dict)
+                            and NATIVE_CONTINUITY_METADATA_KEY in ri
+                            and (
+                                not isinstance(
+                                    ri.get(NATIVE_CONTINUITY_METADATA_KEY), dict
+                                )
+                                or ri.get("type") != "compaction"
+                                or not isinstance(ri.get("encrypted_content"), str)
+                                or not ri["encrypted_content"]
+                            )
+                        ):
+                            raise ValueError(
+                                "protected native compaction checkpoint "
+                                "failed boundary validation"
+                            )
                         if isinstance(ri, dict) and ri.get("encrypted_content"):
                             item_id = ri.get("id")
                             if item_id and item_id in seen_item_ids:
@@ -652,29 +667,89 @@ def _chat_messages_to_responses_input(
                                     "type": "compaction",
                                     "encrypted_content": ri["encrypted_content"],
                                 }
-                                from agent.native_compaction import (
-                                    PROTECTED_HANDOFF_METADATA_KEY,
-                                )
-
                                 metadata = ri.get(PROTECTED_HANDOFF_METADATA_KEY)
+                                native_metadata = ri.get(NATIVE_CONTINUITY_METADATA_KEY)
                                 if isinstance(metadata, dict):
                                     replay_item[PROTECTED_HANDOFF_METADATA_KEY] = metadata
-                                    from agent.native_compaction import (
-                                        protected_handoff_from_checkpoint,
-                                    )
-
-                                    has_protected_compaction_handoff = bool(
-                                        protected_handoff_from_checkpoint(
-                                            ri,
-                                            preceding_messages=messages[:message_index],
+                                if isinstance(native_metadata, dict):
+                                    replay_item[NATIVE_CONTINUITY_METADATA_KEY] = native_metadata
+                                if isinstance(metadata, dict) or isinstance(native_metadata, dict):
+                                    if isinstance(native_metadata, dict):
+                                        validation_messages = messages
+                                        validation_index = message_index
+                                        if native_continuity_source_messages is not None:
+                                            source_matches = []
+                                            for source_index, source_message in enumerate(
+                                                native_continuity_source_messages
+                                            ):
+                                                if not isinstance(source_message, dict):
+                                                    continue
+                                                for source_item in (
+                                                    source_message.get(
+                                                        "codex_reasoning_items"
+                                                    )
+                                                    or []
+                                                ):
+                                                    if (
+                                                        isinstance(source_item, dict)
+                                                        and source_item.get("type")
+                                                        == "compaction"
+                                                        and source_item.get(
+                                                            "encrypted_content"
+                                                        )
+                                                        == ri.get("encrypted_content")
+                                                        and source_item.get(
+                                                            NATIVE_CONTINUITY_METADATA_KEY
+                                                        )
+                                                        == native_metadata
+                                                    ):
+                                                        source_matches.append(source_index)
+                                            if len(source_matches) != 1:
+                                                raise ValueError(
+                                                    "protected native compaction checkpoint "
+                                                    "source boundary mismatch"
+                                                )
+                                            validation_messages = (
+                                                native_continuity_source_messages
+                                            )
+                                            validation_index = source_matches[0]
+                                        _validated_handoff = (
+                                            native_continuity_handoff_from_checkpoint(
+                                                ri,
+                                                preceding_messages=validation_messages[
+                                                    :validation_index
+                                                ],
+                                                following_message=(
+                                                    validation_messages[
+                                                        validation_index + 1
+                                                    ]
+                                                    if validation_index + 1
+                                                    < len(validation_messages)
+                                                    else None
+                                                ),
+                                            )
                                         )
+                                    else:
+                                        _validated_handoff = (
+                                            protected_handoff_from_checkpoint(
+                                                ri,
+                                                preceding_messages=messages[:message_index],
+                                            )
+                                        )
+                                    has_protected_compaction_handoff = bool(
+                                        _validated_handoff
                                     )
                                     if not has_protected_compaction_handoff:
-                                        # Prefix drift invalidates checkpoint and
-                                        # handoff atomically. Continue with full
-                                        # local history rather than prune around
-                                        # a stale provider checkpoint.
-                                        continue
+                                        # A persisted protected boundary cannot
+                                        # be silently discarded while an
+                                        # ordinary request continues.
+                                        raise ValueError(
+                                            "protected native compaction checkpoint "
+                                            "failed boundary validation"
+                                        )
+                                    replay_item["_hermes_validated_handoff"] = (
+                                        _validated_handoff
+                                    )
                             else:
                                 replay_item = {
                                     k: v for k, v in ri.items()
@@ -950,15 +1025,14 @@ def estimate_native_responses_preflight_tokens(
 
     is_codex_backend, is_xai_responses, is_github_responses = classify_responses_route(agent)
 
-    from agent.native_compaction import native_compaction_context_management
+    from agent.native_compaction import native_continuity_capable
 
-    context_management = native_compaction_context_management(
+    if not native_continuity_capable(
         agent,
         is_codex_backend=is_codex_backend,
         is_xai_responses=is_xai_responses,
         is_github_responses=is_github_responses,
-    )
-    if not context_management:
+    ):
         return None
 
     try:
@@ -977,6 +1051,14 @@ def estimate_native_responses_preflight_tokens(
             ),
             native_compaction_eligible=True,
         )
+    except ValueError as exc:
+        if "protected native compaction checkpoint failed boundary validation" in str(exc):
+            raise
+        logger.debug(
+            "native Responses preflight conversion failed; falling back to generic estimate",
+            exc_info=True,
+        )
+        return None
     except Exception:
         logger.debug(
             "native Responses preflight conversion failed; falling back to generic estimate",

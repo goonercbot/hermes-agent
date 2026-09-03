@@ -1000,13 +1000,12 @@ DEFAULT_CONFIG = {
                                       # on the Responses API. Engages ONLY for
                                       # gpt-5.6-family models on api.openai.com or
                                       # the ChatGPT Codex backend; every other
-                                      # route/model is unaffected. Hermes' local
-                                      # compression stays armed as the fallback.
-        "codex_responses_compact_threshold": None,  # Optional absolute server compaction
-                                      # trigger in input tokens. None follows the
-                                      # resolved local compression trigger with a
-                                      # safety margin. Explicit values only clamp
-                                      # downward so the server compacts first.
+                                      # route/model is unaffected and continues
+                                      # through Hermes' local compressor.
+        "codex_responses_compact_threshold": None,  # Legacy compatibility input only.
+                                      # Native continuity always uses the live
+                                      # ContextCompressor.threshold_tokens value;
+                                      # explicit legacy values are ignored.
         "in_place": True,             # When True, compaction rewrites the message
                                       # list and rebuilds the system prompt WITHOUT
                                       # rotating the session id — the conversation

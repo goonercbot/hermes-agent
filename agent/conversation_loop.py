@@ -173,83 +173,6 @@ def _midturn_request_pressure_tokens(
     )
 
 
-def run_native_protected_handoff_request(
-    agent: Any,
-    snapshot: List[Dict[str, Any]],
-    handoff_prompt: str,
-) -> Optional[tuple[str, List[Dict[str, Any]]]]:
-    """Run one silent, no-tools Responses handoff request through normal plumbing.
-
-    This deliberately shares the normal ``_build_api_kwargs`` → transport
-    preflight → interruptible request → response normalization route.  It does
-    not stream, emit status, execute tools, touch retry/display state, or reach
-    through a provider client's private/raw implementation.  Any failure is a
-    non-committing ``None`` so turn-context can use its existing local
-    compression path unchanged.
-    """
-    if (
-        getattr(agent, "api_mode", None) != "codex_responses"
-        or not bool(getattr(agent, "_codex_reasoning_replay_enabled", True))
-    ):
-        return None
-    try:
-        system_prompt = getattr(agent, "_cached_system_prompt", None)
-        request_messages: List[Dict[str, Any]] = []
-        if isinstance(system_prompt, str) and system_prompt:
-            request_messages.append({"role": "system", "content": system_prompt})
-        # The isolated preparation path must not be able to mutate the durable
-        # transcript before its checkpoint/handoff pair is accepted.
-        request_messages.extend(deepcopy(snapshot))
-        request_messages.append({"role": "user", "content": handoff_prompt})
-
-        api_kwargs = agent._build_api_kwargs(request_messages, tools_for_api=[])
-        # No tool declarations means a handoff can neither ask for nor execute
-        # a tool.  The Responses transport already omits this field for [];
-        # pop is a defensive contract for custom transport doubles.
-        api_kwargs.pop("tools", None)
-        api_kwargs.pop("tool_choice", None)
-        api_kwargs.pop("parallel_tool_calls", None)
-        if not api_kwargs.get("context_management"):
-            return None
-        # Copied-state acceptance froze this isolated preparation request on
-        # Luna with reasoning disabled. Keep the main Sol route and the Sol
-        # local-compression fallback untouched; only this no-tools request uses
-        # the faster accepted tuple.
-        api_kwargs["model"] = "gpt-5.6-luna"
-        api_kwargs["reasoning"] = {"effort": "none", "summary": "auto"}
-        transport = agent._get_transport()
-        api_kwargs = transport.preflight_kwargs(
-            api_kwargs,
-            allow_stream=False,
-            is_github_responses=agent._is_copilot_url(),
-            sanitize_harmony_tokens=agent._is_codex_backend(),
-        )
-        response = agent._interruptible_api_call(api_kwargs)
-        normalized = transport.normalize_response(response)
-        provider_data = getattr(normalized, "provider_data", None)
-        items = (
-            provider_data.get("codex_reasoning_items")
-            if isinstance(provider_data, dict)
-            else None
-        )
-        if not isinstance(items, list):
-            return None
-        content = getattr(normalized, "content", None)
-        if not isinstance(content, str) or not content.strip():
-            return None
-        return content.strip(), [dict(item) for item in items if isinstance(item, dict)]
-    except Exception as exc:  # Any isolated-request error must retain history.
-        try:
-            from agent.native_compaction import is_native_compaction_rejection
-
-            if is_native_compaction_rejection(exc, getattr(exc, "status_code", None)):
-                agent.codex_responses_native_compaction = False
-        except Exception:
-            pass
-        logger.debug("protected native handoff request declined; using local compression", exc_info=True)
-        return None
-
-
 def _review_input_budget_exhausted(agent: Any) -> bool:
     """True when a detached review fork has replayed its aggregate input budget.
 
@@ -1974,6 +1897,36 @@ def _notify_context_engine_turn_complete(
         )
 
 
+def _terminal_native_continuity_failure(
+    agent,
+    messages,
+    api_call_count,
+    *,
+    fallback_messages=None,
+):
+    """Restore one failed protected request and clear all turn-local signals."""
+    from agent.native_compaction import fail_native_continuity
+
+    had_pending_boundary = (
+        getattr(agent, "_native_continuity_pending", None) is not None
+        or getattr(agent, "_native_continuity_candidate", None) is not None
+    )
+    restored = fail_native_continuity(agent)
+    if not had_pending_boundary and fallback_messages is not None:
+        restored = deepcopy(fallback_messages)
+    messages[:] = restored
+    agent.clear_interrupt()
+    agent._session_messages = messages
+    return {
+        "final_response": "native_compaction_checkpoint_missing",
+        "messages": messages,
+        "api_calls": api_call_count,
+        "completed": False,
+        "failed": True,
+        "error": "native_compaction_checkpoint_missing",
+    }
+
+
 def run_conversation(
     agent,
     user_message: Any,
@@ -2321,6 +2274,36 @@ def run_conversation(
         # However, providers like Moonshot AI require a separate 'reasoning_content' field
         # on assistant messages with tool_calls. We handle both cases here.
         request_logger = getattr(agent, "logger", None) or logging.getLogger(__name__)
+        _native_continuity_source_messages = None
+        _native_replay_request = False
+        if agent.api_mode == "codex_responses":
+            from agent.native_compaction import NATIVE_CONTINUITY_METADATA_KEY
+
+            # Preserve the exact durable transcript before any request-only
+            # sanitizer can repair, merge, or drop rows. Persisted continuity
+            # replay has no pending in-memory boundary, so detect its protected
+            # checkpoint directly from the untouched history.
+            _native_continuity_source_messages = messages
+            _native_replay_request = any(
+                isinstance(item, dict)
+                and NATIVE_CONTINUITY_METADATA_KEY in item
+                for msg in messages
+                if isinstance(msg, dict)
+                for items in [msg.get("codex_reasoning_items")]
+                if isinstance(items, list)
+                for item in items
+            )
+        _native_boundary_request = (
+            getattr(agent, "_native_continuity_candidate", None) is not None
+            or getattr(agent, "_native_continuity_pending", None) is not None
+            or _native_replay_request
+        )
+        _request_current_turn_user_idx = current_turn_user_idx
+        if _native_boundary_request:
+            # Every request-side sanitizer receives a disposable deep copy.
+            # The durable prefix/user objects captured by the boundary must
+            # never be merged, dropped, or rewritten during wire repair.
+            messages = deepcopy(messages)
         # Per-agent validation cursor: skips re-json.loads-ing tool_call
         # arguments on history messages already validated in a previous
         # iteration. Identity-keyed (strong refs) — compression/undo/repair
@@ -2352,23 +2335,45 @@ def run_conversation(
         # an assistant message makes the model echo it and self-replicate
         # (#81841). Dropping before repair lets repair_message_sequence fix
         # any user→user adjacency the filter creates.
-        messages = [
-            msg for msg in messages
-            if not (
-                msg.get("display_kind") == "hidden"
-                and msg.get("role") == "assistant"
-                and (
-                    (
-                        isinstance(msg.get("content"), str)
-                        and msg["content"].strip() == _INTERRUPT_SCAFFOLD_MARKER
-                    )
-                    or (
-                        isinstance(msg.get("api_content"), str)
-                        and msg["api_content"].strip() == _INTERRUPT_SCAFFOLD_MARKER
+        if _native_boundary_request:
+            _prefix = [
+                msg
+                for msg in messages[:_request_current_turn_user_idx]
+                if not (
+                    msg.get("display_kind") == "hidden"
+                    and msg.get("role") == "assistant"
+                    and (
+                        (
+                            isinstance(msg.get("content"), str)
+                            and msg["content"].strip() == _INTERRUPT_SCAFFOLD_MARKER
+                        )
+                        or (
+                            isinstance(msg.get("api_content"), str)
+                            and msg["api_content"].strip() == _INTERRUPT_SCAFFOLD_MARKER
+                        )
                     )
                 )
-            )
-        ]
+            ]
+            messages = _prefix + messages[_request_current_turn_user_idx:]
+            _request_current_turn_user_idx = len(_prefix)
+        else:
+            messages = [
+                msg for msg in messages
+                if not (
+                    msg.get("display_kind") == "hidden"
+                    and msg.get("role") == "assistant"
+                    and (
+                        (
+                            isinstance(msg.get("content"), str)
+                            and msg["content"].strip() == _INTERRUPT_SCAFFOLD_MARKER
+                        )
+                        or (
+                            isinstance(msg.get("api_content"), str)
+                            and msg["api_content"].strip() == _INTERRUPT_SCAFFOLD_MARKER
+                        )
+                    )
+                )
+            ]
 
         # Defensive: repair malformed role-alternation before API call.
         # Catches cases where the history got wedged into a
@@ -2380,8 +2385,17 @@ def run_conversation(
         # repair_message_sequence_with_cursor also recomputes the SessionDB
         # flush cursor (_last_flushed_db_idx) when repair compacts the list,
         # so the turn-end flush doesn't skip the assistant/tool chain (#44837).
-        from agent.agent_runtime_helpers import repair_message_sequence_with_cursor
-        repaired_seq = repair_message_sequence_with_cursor(agent, messages)
+        if _native_boundary_request:
+            from agent.agent_runtime_helpers import repair_message_sequence
+
+            _prefix = messages[:_request_current_turn_user_idx]
+            repaired_seq = repair_message_sequence(agent, _prefix)
+            messages = _prefix + messages[_request_current_turn_user_idx:]
+            _request_current_turn_user_idx = len(_prefix)
+        else:
+            from agent.agent_runtime_helpers import repair_message_sequence_with_cursor
+
+            repaired_seq = repair_message_sequence_with_cursor(agent, messages)
         if repaired_seq > 0:
             request_logger.info(
                 "Repaired %s message-alternation violations before request (session=%s)",
@@ -2451,7 +2465,7 @@ def run_conversation(
             # API-call-time only — the original message in `messages` is
             # never mutated beyond the api_content stamp, so nothing leaks
             # into the clean transcript content.
-            if idx == current_turn_user_idx and msg.get("role") == "user":
+            if idx == _request_current_turn_user_idx and msg.get("role") == "user":
                 if isinstance(_api_content, str) and _api_content:
                     # Stamped by the prologue from the same composition —
                     # reuse it so the persisted sidecar and the wire cannot
@@ -2622,8 +2636,8 @@ def run_conversation(
         # caching/sanitization below operate on whatever the engine selected.
         # Fail-open (see _apply_context_engine_selection).
         _sel_incoming = (
-            messages[current_turn_user_idx]
-            if 0 <= current_turn_user_idx < len(messages)
+            messages[_request_current_turn_user_idx]
+            if 0 <= _request_current_turn_user_idx < len(messages)
             else None
         )
         api_messages = _apply_context_engine_selection(
@@ -2648,10 +2662,11 @@ def run_conversation(
         # a thinking-only turn. Runs on the per-call copy only — the
         # stored conversation history keeps the reasoning block for the
         # UI transcript and session persistence.
-        api_messages = agent._drop_thinking_only_and_merge_users(
-            api_messages,
-            drop_codex_reasoning_items=agent.api_mode != "codex_responses",
-        )
+        if not _native_boundary_request:
+            api_messages = agent._drop_thinking_only_and_merge_users(
+                api_messages,
+                drop_codex_reasoning_items=agent.api_mode != "codex_responses",
+            )
 
         # Normalize message whitespace and tool-call JSON for consistent
         # prefix matching.  Ensures bit-perfect prefixes across turns,
@@ -2881,6 +2896,7 @@ def run_conversation(
             and not _preflight_compression_blocked
             and not _defer_preflight(request_pressure_tokens)
             and not _compression_cooldown
+            and getattr(agent, "_native_continuity_candidate", None) is None
             and _compressor.should_compress(request_pressure_tokens)
         ):
             if _moa_prepared_request is not None:
@@ -3165,13 +3181,14 @@ def run_conversation(
                         tools_for_api=tools_for_api,
                     )
                 )
-                if tools_for_api == agent.tools:
-                    api_kwargs = agent._build_api_kwargs(api_messages)
-                else:
-                    api_kwargs = agent._build_api_kwargs(
-                        api_messages,
-                        tools_for_api=tools_for_api,
+                _build_kwargs = {}
+                if tools_for_api != agent.tools:
+                    _build_kwargs["tools_for_api"] = tools_for_api
+                if agent.api_mode == "codex_responses":
+                    _build_kwargs["native_continuity_source_messages"] = (
+                        _native_continuity_source_messages
                     )
+                api_kwargs = agent._build_api_kwargs(api_messages, **_build_kwargs)
                 # Outbound-request surrogate chokepoint (#50959): the messages
                 # were scrubbed above, but the rest of the request body —
                 # tool/function descriptions (session_search's ±-heavy text is
@@ -3296,6 +3313,42 @@ def run_conversation(
                 except Exception:
                     pass
 
+                # Native continuity is prepared only after ordinary request
+                # repair and plugin mutation. The immutable seed was captured
+                # before those operations could merge or re-anchor the durable
+                # triggering row.
+                if agent.api_mode == "codex_responses" and retry_count == 0:
+                    try:
+                        from agent.native_compaction import prepare_native_continuity_request
+
+                        _native_prepared = prepare_native_continuity_request(
+                            agent,
+                            api_kwargs=api_kwargs,
+                        )
+                    except Exception:
+                        return _terminal_native_continuity_failure(
+                            agent, messages, api_call_count
+                        )
+                    if (
+                        not _native_prepared
+                        and getattr(
+                            agent,
+                            "_native_continuity_defer_user_persistence",
+                            False,
+                        )
+                    ):
+                        # The final complete request stayed below the live
+                        # threshold (or the route changed). Restore ordinary
+                        # crash-resilient persistence before making the call.
+                        agent._native_continuity_candidate = None
+                        agent._native_continuity_defer_user_persistence = False
+                        agent._persist_session(messages, conversation_history)
+                    elif _native_prepared:
+                        # Execution middleware's "original request" must be
+                        # the protected complete payload, never the earlier
+                        # handoff-free request it could otherwise restore.
+                        _original_api_kwargs = deepcopy(api_kwargs)
+
                 if env_var_enabled("HERMES_DUMP_REQUESTS"):
                     agent._dump_api_request_debug(api_kwargs, reason="preflight")
 
@@ -3377,7 +3430,18 @@ def run_conversation(
                     if isinstance(getattr(agent, "client", None), Mock):
                         _use_streaming = False
 
+                _native_physical_attempted = False
+
                 def _perform_api_call(next_api_kwargs):
+                    nonlocal _native_physical_attempted
+                    _protected_request = (
+                        getattr(agent, "_native_continuity_pending", None)
+                        is not None
+                    )
+                    if _protected_request and next_api_kwargs != _original_api_kwargs:
+                        raise RuntimeError(
+                            "protected native compaction request mutated after preflight"
+                        )
                     if agent.api_mode == "codex_responses":
                         next_api_kwargs = agent._get_transport().preflight_kwargs(
                             next_api_kwargs,
@@ -3385,7 +3449,37 @@ def run_conversation(
                             is_github_responses=agent._is_copilot_url(),
                             sanitize_harmony_tokens=agent._is_codex_backend(),
                         )
+                    _expected_transport_request = deepcopy(next_api_kwargs)
+
+                    def _physical_call(final_api_kwargs):
+                        nonlocal _native_physical_attempted
+                        if _protected_request:
+                            if _native_physical_attempted:
+                                raise RuntimeError(
+                                    "protected native compaction request attempted twice"
+                                )
+                            for _key in (
+                                "input",
+                                "instructions",
+                                "tools",
+                                "context_management",
+                            ):
+                                if final_api_kwargs.get(_key) != _expected_transport_request.get(
+                                    _key
+                                ):
+                                    raise RuntimeError(
+                                        "protected native compaction transport payload drifted"
+                                    )
+                            _native_physical_attempted = True
+                        return agent._interruptible_api_call(final_api_kwargs)
+
                     if _use_streaming:
+                        if _protected_request:
+                            if _native_physical_attempted:
+                                raise RuntimeError(
+                                    "protected native compaction request attempted twice"
+                                )
+                            _native_physical_attempted = True
                         return agent._interruptible_streaming_api_call(
                             next_api_kwargs, on_first_delta=_stop_spinner
                         )
@@ -3393,7 +3487,7 @@ def run_conversation(
 
                     return relay_llm.execute(
                         next_api_kwargs,
-                        agent._interruptible_api_call,
+                        _physical_call,
                         session_id=str(agent.session_id or ""),
                         name=str(agent.provider or "provider"),
                         model_name=str(agent.model or ""),
@@ -3453,6 +3547,13 @@ def run_conversation(
                             _model_request_active.clear()
                         _redirect_crossed_response = agent._has_pending_redirect()
                 if _redirect_crossed_response:
+                    # A prepared native-compaction request is single-use. Once
+                    # it reaches the provider, a crossing redirect cannot turn
+                    # that physical attempt into a rebuilt follow-up request.
+                    if getattr(agent, "_native_continuity_pending", None) is not None:
+                        return _terminal_native_continuity_failure(
+                            agent, messages, api_call_count
+                        )
                     # The response and redirect can cross on different threads:
                     # redirect() observed the request as active just before this
                     # call returned. Discard that now-stale response and rebuild
@@ -3567,6 +3668,10 @@ def run_conversation(
                             error_details.append("response.choices is empty")
 
                 if response_invalid:
+                    if getattr(agent, "_native_continuity_pending", None) is not None:
+                        return _terminal_native_continuity_failure(
+                            agent, messages, api_call_count
+                        )
                     agent._invoke_api_request_error_hook(
                         task_id=effective_task_id,
                         turn_id=turn_id,
@@ -4646,6 +4751,10 @@ def run_conversation(
                 break  # Success, exit retry loop
 
             except InterruptedError:
+                if getattr(agent, "_native_continuity_pending", None) is not None:
+                    return _terminal_native_continuity_failure(
+                        agent, messages, api_call_count
+                    )
                 if thinking_spinner:
                     thinking_spinner.stop("")
                     thinking_spinner = None
@@ -4680,6 +4789,34 @@ def run_conversation(
                 break
 
             except Exception as api_error:
+                # A threshold-crossing native request is exactly-once. Any
+                # exception must preserve the pre-trigger durable history and
+                # must not enter retry, fallback, downgrade or ordinary-error
+                # persistence paths. Invalid persisted protected continuity is
+                # also terminal even before a new boundary has been prepared.
+                _invalid_persisted_continuity = (
+                    _native_replay_request
+                    and "protected native compaction checkpoint" in str(api_error)
+                )
+                if (
+                    getattr(agent, "_native_continuity_pending", None) is not None
+                    or (
+                        getattr(agent, "_native_continuity_candidate", None) is not None
+                        and "protected native compaction checkpoint failed boundary validation"
+                        in str(api_error)
+                    )
+                    or _invalid_persisted_continuity
+                ):
+                    return _terminal_native_continuity_failure(
+                        agent,
+                        messages,
+                        api_call_count,
+                        fallback_messages=(
+                            _native_continuity_source_messages
+                            if _invalid_persisted_continuity
+                            else None
+                        ),
+                    )
                 # Stop spinner silently — retry status is buffered and
                 # only flushed when every retry+fallback is exhausted.
                 if thinking_spinner:
@@ -7032,6 +7169,40 @@ def run_conversation(
             normalized = _transport.normalize_response(response, **_normalize_kwargs)
             assistant_message = normalized
             finish_reason = normalized.finish_reason
+
+            # The provider response is the only commit authority for a pending
+            # boundary. Validate and install its checkpoint carrier before any
+            # normal assistant/tool/retry path can persist a turn fragment.
+            if getattr(agent, "_native_continuity_pending", None) is not None:
+                try:
+                    if finish_reason != "stop":
+                        raise ValueError("native checkpoint response was not complete")
+                    _native_candidate = agent._build_assistant_message(
+                        assistant_message, finish_reason
+                    )
+                    from agent.native_compaction import commit_native_continuity
+
+                    _committed = commit_native_continuity(agent, _native_candidate)
+                    if _committed is None:
+                        raise ValueError("native checkpoint missing or invalid")
+                    # The normal response path below owns delivery/ordinary
+                    # assistant construction.  It receives only non-checkpoint
+                    # reasoning; the opaque checkpoint now exists once in the
+                    # hidden carrier immediately before the triggering user.
+                    messages[:] = _committed[:-1]
+                    _ordinary = _committed[-1].get("codex_reasoning_items")
+                    _provider_data = dict(
+                        getattr(assistant_message, "provider_data", None) or {}
+                    )
+                    if isinstance(_ordinary, list) and _ordinary:
+                        _provider_data["codex_reasoning_items"] = _ordinary
+                    else:
+                        _provider_data.pop("codex_reasoning_items", None)
+                    assistant_message.provider_data = _provider_data
+                except Exception:
+                    return _terminal_native_continuity_failure(
+                        agent, messages, api_call_count
+                    )
             
             # Normalize content to string — some OpenAI-compatible servers
             # (llama-server, etc.) return content as a dict or list instead

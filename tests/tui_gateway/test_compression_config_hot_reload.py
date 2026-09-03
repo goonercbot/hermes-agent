@@ -28,7 +28,7 @@ def _session_with_compressor(**compression_ctor):
         compression_enabled=True,
         compression_idle_compact_after_seconds=0,
         codex_responses_native_compaction=False,
-        codex_responses_compact_threshold=200_000,
+        codex_responses_compact_threshold=None,
     )
     return {
         "agent": agent,
@@ -83,7 +83,7 @@ def test_live_codex_native_compaction_applies_on_next_turn(monkeypatch):
     assert session["agent"].codex_responses_native_compaction is True
 
 
-def test_live_codex_native_threshold_applies_on_next_turn(monkeypatch):
+def test_live_legacy_codex_native_threshold_is_ignored(monkeypatch):
     session, _ = _session_with_compressor()
 
     monkeypatch.setattr(
@@ -96,7 +96,7 @@ def test_live_codex_native_threshold_applies_on_next_turn(monkeypatch):
 
     server._sync_agent_compression_with_config("sid-95151", session)
 
-    assert session["agent"].codex_responses_compact_threshold == 120_000
+    assert session["agent"].codex_responses_compact_threshold is None
 
 
 def test_unchanged_compression_config_is_noop(monkeypatch):
@@ -166,7 +166,7 @@ def _neutral_session(**compression_ctor):
         compression_enabled=True,
         compression_idle_compact_after_seconds=0,
         codex_responses_native_compaction=False,
-        codex_responses_compact_threshold=200_000,
+        codex_responses_compact_threshold=None,
     )
     return {"agent": agent, "session_key": "session-unset"}, compressor
 
@@ -276,8 +276,8 @@ def test_removing_codex_native_compaction_restores_false(monkeypatch):
     assert session["agent"].codex_responses_native_compaction is False
 
 
-def test_removing_codex_native_threshold_restores_default(monkeypatch):
+def test_legacy_codex_native_threshold_is_ignored(monkeypatch):
     session, _ = _neutral_session()
     session["agent"].codex_responses_compact_threshold = 120_000
     _sync_with_cfg(monkeypatch, session, {"compression": {}})
-    assert session["agent"].codex_responses_compact_threshold == 200_000
+    assert session["agent"].codex_responses_compact_threshold is None

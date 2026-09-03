@@ -361,36 +361,34 @@ def test_compressed_summary_column_is_added_to_legacy_databases(tmp_path):
     assert model_history[-1].get("_compressed_summary") is True
 
 
-def test_native_responses_compaction_is_suppressed_when_checkpoint_required():
-    """checkpoint_required must keep ``context_management`` off the wire.
-
-    Server-side native compaction is a lossy boundary the provider owns; no
-    pre-compress checkpoint can run before it, so the gate suppresses the
-    payload while ordinary checkpoint-aware Hermes compression stays
-    available.
-    """
+def test_native_responses_compaction_uses_pending_boundary_not_checkpoint_gate():
+    """The protected native boundary owns checkpoint safety itself."""
     from types import SimpleNamespace
 
     from agent.native_compaction import native_compaction_context_management
 
     def agent(checkpoint_required):
         return SimpleNamespace(
+            api_mode="codex_responses",
             model="gpt-5.6",
             base_url="https://api.openai.com/v1",
             codex_responses_native_compaction=True,
             compression_enabled=True,
             compression_checkpoint_required=checkpoint_required,
-            codex_responses_compact_threshold=0.8,
-            context_compressor=None,
+            _codex_reasoning_replay_enabled=True,
+            runtime_capabilities={"native_compaction": True},
+            capabilities={"native_compaction": True},
+            context_compressor=SimpleNamespace(threshold_tokens=204_000),
+            _native_continuity_pending=object(),
+            _native_continuity_emit_context_management=True,
         )
 
-    assert native_compaction_context_management(
-        agent(False), is_codex_backend=True
-    )
-    assert (
-        native_compaction_context_management(agent(True), is_codex_backend=True)
-        is None
-    )
+    assert native_compaction_context_management(agent(False), is_codex_backend=True) == [
+        {"type": "compaction", "compact_threshold": 204_000}
+    ]
+    assert native_compaction_context_management(agent(True), is_codex_backend=True) == [
+        {"type": "compaction", "compact_threshold": 204_000}
+    ]
 
 
 def test_codex_app_server_turn_fails_closed_before_codex_can_compact():

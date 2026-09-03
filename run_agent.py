@@ -2052,6 +2052,19 @@ class AIAgent:
         never mutating the live message list used by the API call (#48677 is
         thus closed for every persist caller, not just this one).
         """
+        # A threshold-crossing user is not durable until its validated native
+        # checkpoint/handoff carrier can be inserted immediately before it.
+        if (
+            getattr(self, "_native_continuity_pending", None) is not None
+            or (
+                getattr(self, "_native_continuity_candidate", None) is not None
+                and bool(
+                    getattr(self, "_native_continuity_defer_user_persistence", False)
+                )
+            )
+        ):
+            return
+
         # Scaffolding removal mutates the live list (desired — ephemeral
         # retry/failure sentinels must not survive into the real transcript).
         # Close and turn-start persistence can run on separate CLI threads; the
@@ -7668,10 +7681,20 @@ class AIAgent:
                     content[-1]["cache_control"] = {"type": "ephemeral"}
                 break
 
-    def _build_api_kwargs(self, api_messages: list, tools_for_api: Optional[list] = None) -> dict:
+    def _build_api_kwargs(
+        self,
+        api_messages: list,
+        tools_for_api: Optional[list] = None,
+        native_continuity_source_messages: Optional[list] = None,
+    ) -> dict:
         """Forwarder — see ``agent.chat_completion_helpers.build_api_kwargs``."""
         from agent.chat_completion_helpers import build_api_kwargs
-        return build_api_kwargs(self, api_messages, tools_for_api=tools_for_api)
+        return build_api_kwargs(
+            self,
+            api_messages,
+            tools_for_api=tools_for_api,
+            native_continuity_source_messages=native_continuity_source_messages,
+        )
 
     def _supports_reasoning_extra_body(self) -> bool:
         """Return True when reasoning extra_body is safe to send for this route/model.

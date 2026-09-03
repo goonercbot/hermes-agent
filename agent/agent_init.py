@@ -2342,22 +2342,9 @@ def init_agent(
     codex_responses_native_compaction = _is_truthy(
         _compression_cfg.get("codex_responses_native", False)
     )
-    _native_threshold_raw = _compression_cfg.get("codex_responses_compact_threshold")
+    # Legacy compatibility input only. Native continuity has one trigger:
+    # ContextCompressor.threshold_tokens. Explicit old values are inert.
     codex_responses_compact_threshold = None
-    if _native_threshold_raw is not None:
-        try:
-            if isinstance(_native_threshold_raw, (bool, float)):
-                raise ValueError
-            codex_responses_compact_threshold = int(_native_threshold_raw)
-            if codex_responses_compact_threshold <= 0:
-                raise ValueError
-        except (TypeError, ValueError):
-            _ra().logger.warning(
-                "Invalid compression.codex_responses_compact_threshold=%r; "
-                "using the automatic threshold derived from local compression.",
-                _native_threshold_raw,
-            )
-            codex_responses_compact_threshold = None
     # Opt-in idle compaction: compact a session up front when it resumes after
     # this many seconds of inactivity (0 = disabled). Time-based, so it
     # complements the size-based threshold above. Consumed by build_turn_context().
@@ -2863,6 +2850,10 @@ def init_agent(
     agent.codex_app_server_auto_compaction = codex_app_server_auto_compaction
     agent.codex_responses_native_compaction = codex_responses_native_compaction
     agent.codex_responses_compact_threshold = codex_responses_compact_threshold
+    agent._native_continuity_candidate = None
+    agent._native_continuity_pending = None
+    agent._native_continuity_emit_context_management = False
+    agent._native_continuity_defer_user_persistence = False
     from agent.native_compaction import resolve_native_compaction_capabilities
     agent.runtime_capabilities = resolve_native_compaction_capabilities(
         model=agent.model,

@@ -1826,7 +1826,12 @@ def interruptible_api_call(agent, api_kwargs: dict):
 
 
 
-def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = None) -> dict:
+def build_api_kwargs(
+    agent,
+    api_messages: list,
+    tools_for_api: list | None = None,
+    native_continuity_source_messages: list | None = None,
+) -> dict:
     """Build the keyword arguments dict for the active API mode."""
     if tools_for_api is None:
         tools_for_api = agent.tools
@@ -1892,8 +1897,17 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
         # Native server-side compaction (gpt-5.6 on direct OpenAI API /
         # ChatGPT Codex routes only) — None on every other route/model, in
         # which case the request is unchanged from pre-feature behavior.
-        from agent.native_compaction import native_compaction_context_management
+        from agent.native_compaction import (
+            native_compaction_context_management,
+            native_continuity_capable,
+        )
         _context_management = native_compaction_context_management(
+            agent,
+            is_codex_backend=is_codex_backend,
+            is_xai_responses=is_xai_responses,
+            is_github_responses=is_github_responses,
+        )
+        _native_continuity_replay = native_continuity_capable(
             agent,
             is_codex_backend=is_codex_backend,
             is_xai_responses=is_xai_responses,
@@ -1952,6 +1966,8 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
                 getattr(agent, "_codex_reasoning_replay_enabled", True)
             ),
             context_management=_context_management,
+            native_continuity_replay=_native_continuity_replay,
+            native_continuity_source_messages=native_continuity_source_messages,
         )
 
     # ── chat_completions (default) ─────────────────────────────────────

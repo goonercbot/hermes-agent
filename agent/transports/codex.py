@@ -583,6 +583,7 @@ class ResponsesApiTransport(ProviderTransport):
         # them derived from one expression is what stops a persisted
         # checkpoint from restructuring the wire after the gate closes.
         native_compaction_active = _native_compaction_active(context_management)
+        native_continuity_replay = bool(params.get("native_continuity_replay", False))
 
         # Resolve the issuing endpoint for this call. Stashed on the
         # transport so normalize_response can stamp it onto reasoning
@@ -738,7 +739,12 @@ class ResponsesApiTransport(ProviderTransport):
                 is_github_responses=is_github_responses,
                 replay_encrypted_reasoning=replay_encrypted_reasoning,
                 current_issuer_kind=issuer_kind,
-                native_compaction_eligible=native_compaction_active,
+                native_compaction_eligible=(
+                    native_compaction_active or native_continuity_replay
+                ),
+                native_continuity_source_messages=params.get(
+                    "native_continuity_source_messages"
+                ),
             ),
             "store": False,
         }

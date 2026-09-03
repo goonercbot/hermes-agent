@@ -546,98 +546,6 @@ class TurnContext:
     preflight_compression_blocked: bool = False
 
 
-def _attempt_native_protected_handoff(
-    agent: Any,
-    messages: List[Dict[str, Any]],
-    current_turn_user_idx: int,
-) -> Optional[tuple[List[Dict[str, Any]], int]]:
-    """Atomically prepare a native checkpoint + host handoff or return ``None``.
-
-    The current user message is intentionally outside the frozen snapshot.  No
-    live transcript object is changed until the isolated request yielded both a
-    checkpoint and a schema-valid/redaction-clean handoff, then the synthetic
-    sidecar carrier is inserted immediately before that current user message.
-    """
-    if (
-        getattr(agent, "api_mode", None) != "codex_responses"
-        or not bool(getattr(agent, "_codex_reasoning_replay_enabled", True))
-        or not (0 <= current_turn_user_idx < len(messages))
-    ):
-        return None
-    current_user = messages[current_turn_user_idx]
-    if not isinstance(current_user, dict) or current_user.get("role") != "user":
-        return None
-    try:
-        from agent.codex_responses_adapter import classify_responses_route
-        from agent.native_compaction import (
-            attach_protected_handoff,
-            native_compaction_context_management,
-            parse_protected_handoff,
-            protected_handoff_boundary_fence,
-            protected_handoff_evidence,
-            protected_handoff_prompt,
-        )
-
-        route = classify_responses_route(agent)
-        if not native_compaction_context_management(
-            agent,
-            is_codex_backend=route.is_codex_backend,
-            is_xai_responses=route.is_xai_responses,
-            is_github_responses=route.is_github_responses,
-        ):
-            return None
-        snapshot = list(messages[:current_turn_user_idx])
-        fence = protected_handoff_boundary_fence(snapshot)
-        prompt = protected_handoff_prompt(fence, protected_handoff_evidence(snapshot))
-        # Deferred import avoids the static turn_context ↔ conversation_loop
-        # dependency while keeping invocation on the normal Responses path.
-        from agent.conversation_loop import run_native_protected_handoff_request
-
-        result = run_native_protected_handoff_request(agent, snapshot, prompt)
-        if result is None:
-            return None
-        handoff_text, reasoning_items = result
-        _, canonical_handoff = parse_protected_handoff(handoff_text, fence)
-        checkpoints = [
-            item for item in reasoning_items
-            if isinstance(item, dict)
-            and item.get("type") == "compaction"
-            and isinstance(item.get("encrypted_content"), str)
-            and item.get("encrypted_content")
-        ]
-        if not checkpoints:
-            return None
-        # Commit fence: a redirect/repair that changed the current turn while
-        # the isolated request ran must fall through to local compression.
-        if (
-            len(messages) != current_turn_user_idx + 1
-            or messages[current_turn_user_idx] is not current_user
-            or protected_handoff_boundary_fence(messages[:current_turn_user_idx]) != fence
-        ):
-            return None
-        carrier = {
-            "role": "assistant",
-            "content": "",
-            # Gateway/display projections must not render a blank assistant
-            # bubble for this host-only continuity carrier.
-            "display_kind": "hidden",
-            # The sidecar is display-internal and persistence-compatible; the
-            # adapter later reconstructs only checkpoint → handoff on the wire.
-            "codex_reasoning_items": [
-                attach_protected_handoff(
-                    checkpoints[-1],
-                    canonical_handoff=canonical_handoff,
-                    boundary_fence=fence,
-                )
-            ],
-        }
-        committed = snapshot + [carrier] + messages[current_turn_user_idx:]
-        return committed, current_turn_user_idx + 1
-    except Exception:
-        logger.debug("protected native handoff declined; preserving local compression", exc_info=True)
-        return None
-
-
 def build_turn_context(
     agent,
     user_message: Any,
@@ -1201,26 +1109,25 @@ def build_turn_context(
                         _compress_block_reason = _info(_preflight_tokens)[1]
                     except Exception:
                         _compress_block_reason = None
-        # Native compaction owns this threshold only after its checkpoint AND
-        # protected handoff validate and commit together.  Every declined
-        # outcome leaves `messages` untouched and falls into the existing local
-        # compressor below without changing its trigger, ceiling, or timeout.
-        _native_handoff_committed = False
+        # Direct compatible Responses turns defer the threshold decision to the
+        # final wire boundary, after plugin/API transforms.  Do not let this
+        # earlier history-only estimate run Hermes' local compressor first.
         if _should_compress_now:
-            _native_handoff = _attempt_native_protected_handoff(
-                agent, messages, current_turn_user_idx
-            )
-            if _native_handoff is not None:
-                messages, current_turn_user_idx = _native_handoff
-                agent._persist_user_message_idx = current_turn_user_idx
-                _native_handoff_committed = True
-        if _native_handoff_committed:
-            logger.info(
-                "Native compaction checkpoint and protected handoff committed "
-                "before current user message (session %s)",
-                agent.session_id or "none",
-            )
-        elif _should_compress_now:
+            try:
+                from agent.codex_responses_adapter import classify_responses_route
+                from agent.native_compaction import native_continuity_capable
+
+                _route = classify_responses_route(agent)
+                if native_continuity_capable(
+                    agent,
+                    is_codex_backend=_route.is_codex_backend,
+                    is_xai_responses=_route.is_xai_responses,
+                    is_github_responses=_route.is_github_responses,
+                ):
+                    _should_compress_now = False
+            except Exception:
+                pass
+        if _should_compress_now:
             _preflight_compressed = True
             # Compression is actually running (block cleared / was never
             # blocked) — reset the dedup so a future blocked-over-threshold
@@ -1675,6 +1582,16 @@ def build_turn_context(
                             exc_info=True,
                         )
 
+    # Freeze a native-capable turn before request repair can merge/re-anchor
+    # its user row. The final complete request decides whether this seed becomes
+    # a real threshold-crossing boundary.
+    try:
+        from agent.native_compaction import capture_native_continuity_seed
+
+        capture_native_continuity_seed(agent, messages, current_turn_user_idx)
+    except Exception:
+        logger.debug("native continuity seed capture failed", exc_info=True)
+
     # Crash-resilience: persist the inbound user turn before the first LLM
     # call. Runs after preflight compression (which rewrites history anyway)
     # and after prefetch/pre_llm_call, so the user row is written once with
@@ -1684,6 +1601,8 @@ def build_turn_context(
     # the pre-compression attempt above failed transiently.
     def _ensure_and_persist() -> None:
         agent._ensure_db_session()
+        if getattr(agent, "_native_continuity_defer_user_persistence", False):
+            return
         agent._persist_session(messages, conversation_history)
 
     try:

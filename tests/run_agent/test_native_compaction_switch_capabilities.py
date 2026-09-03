@@ -12,7 +12,7 @@ def _agent(capabilities):
         base_url="https://proxy.example/v1",
         codex_responses_native_compaction=True,
         compression_enabled=True,
-        codex_responses_compact_threshold=200_000,
+        codex_responses_compact_threshold=None,
         context_compressor=None,
         capabilities=capabilities,
     )

@@ -23,14 +23,16 @@ Hermes' support is deliberately narrow (live verification, Aug 2026):
   most would 400 on the unknown parameter, and none can mint or decrypt
   the compaction blob.
 
-Ownership model: Hermes' local compression stays fully armed as the
-fallback owner. The native threshold is clamped safely below the local
-compressor's trigger so the server compacts first; if it doesn't (native
-disabled mid-session, provider hiccup, non-eligible route), the local
-summarizer fires exactly as before. There is no new custody state — the
-captured compaction items ride the existing ``codex_reasoning_items``
-sidecar, which already handles persistence (state.db), gateway session
-replay, cross-issuer stamping, and the encrypted-replay kill switch.
+Ownership model: Hermes' existing ``ContextCompressor.threshold_tokens`` is the
+only trigger. On that crossing, Hermes adds one deterministic, validated,
+source-verbatim handoff immediately before the triggering user and sends the
+same complete request once with native compaction enabled. A valid encrypted
+checkpoint, handoff, and triggering user are then committed as one hidden
+continuity boundary. Compatible later requests replay that boundary without
+emitting ``context_management`` again. Any preparation, transport, checkpoint,
+commit, or replay failure restores the original durable prefix and fails closed;
+there is no threshold margin, local-summary fallback, model-authored handoff,
+or second protected request.
 
 This module stays free of transport/adapter dependencies so the transport,
 adapter, and conversation loop can share the gate without import cycles. The
@@ -46,6 +48,8 @@ import hashlib
 import json
 import logging
 import re
+from copy import deepcopy
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit
 
@@ -54,13 +58,6 @@ from agent.message_content import flatten_message_text
 from agent.redact import redact_sensitive_text
 
 logger = logging.getLogger(__name__)
-
-# Native compaction fires this many tokens below the local compressor's
-# trigger so the server always gets the first shot at compaction.
-LOCAL_TRIGGER_SAFETY_MARGIN = 8_192
-
-# Deterministic fallback when automatic mode cannot inspect a local trigger.
-DEFAULT_COMPACT_THRESHOLD = 200_000
 
 # Model-family gate. Substring match on the lowercased model id so dated
 # snapshots (gpt-5.6-2026-07-xx) and variants (gpt-5.6-mini) stay eligible.
@@ -108,65 +105,37 @@ def is_direct_openai_route(
     return hostname == "api.openai.com"
 
 
-def resolve_compact_threshold(
-    configured_threshold: Any,
-    local_trigger_tokens: Any = None,
-) -> int:
-    """Resolve automatic mode or clamp an explicit native threshold.
+def native_continuity_capable(
+    agent: Any,
+    *,
+    is_codex_backend: bool,
+    is_xai_responses: bool = False,
+    is_github_responses: bool = False,
+) -> bool:
+    """Whether this route can use native continuity when a live request crosses.
 
-    An omitted or invalid setting follows the resolved local compressor trigger.
-    An explicit positive integer remains absolute unless it must be clamped so
-    native compaction fires first. ``local_trigger_tokens`` is
-    ``ContextCompressor.threshold_tokens`` when a compressor is attached.
+    This intentionally does *not* decide whether a request carries
+    ``context_management``.  That is decided once, at the final wire boundary,
+    from the complete prepared request and the live local-compressor threshold.
     """
-    local = None
-    try:
-        if local_trigger_tokens is not None and not isinstance(local_trigger_tokens, bool):
-            local = int(local_trigger_tokens)
-    except (TypeError, ValueError):
-        local = None
-    if local is not None and local <= 0:
-        local = None
-
-    upper = None
-    if local is not None:
-        if local > LOCAL_TRIGGER_SAFETY_MARGIN:
-            upper = max(1_024, local - LOCAL_TRIGGER_SAFETY_MARGIN)
-        else:
-            upper = max(1_024, int(local * 0.8))
-
-    try:
-        configured = (
-            None
-            if isinstance(configured_threshold, (bool, float))
-            else int(configured_threshold)
-        )
-    except (TypeError, ValueError):
-        configured = None
-    if isinstance(configured_threshold, bool) or configured is None or configured <= 0:
-        return upper if upper is not None else DEFAULT_COMPACT_THRESHOLD
-    if upper is None:
-        return configured
-    return max(1_024, min(configured, upper))
-
-
-_checkpoint_suppression_logged = False
-
-
-def _warn_native_compaction_suppressed_by_checkpoint_gate() -> None:
-    """Log once per process that the checkpoint gate suppresses native compaction.
-
-    The suppression itself is re-evaluated per request; only the log line is
-    deduplicated so a long session does not repeat it on every API call.
-    """
-    global _checkpoint_suppression_logged
-    if _checkpoint_suppression_logged:
-        return
-    _checkpoint_suppression_logged = True
-    logger.warning(
-        "compression.checkpoint_required is enabled: server-side native "
-        "compaction (context_management) is disabled for this agent so the "
-        "checkpoint-aware Hermes compressor stays authoritative."
+    if getattr(agent, "api_mode", None) != "codex_responses":
+        return False
+    if not bool(getattr(agent, "codex_responses_native_compaction", False)):
+        return False
+    if not bool(getattr(agent, "compression_enabled", True)):
+        return False
+    if not bool(getattr(agent, "_codex_reasoning_replay_enabled", True)):
+        return False
+    if is_xai_responses or is_github_responses:
+        return False
+    if not is_native_compaction_model(getattr(agent, "model", None)):
+        return False
+    capabilities = getattr(agent, "runtime_capabilities", None)
+    if isinstance(capabilities, dict) and not bool(capabilities.get("native_compaction", False)):
+        return False
+    trusted_proxy = bool(getattr(agent, "capabilities", {}).get("openai_native_compaction", False))
+    return trusted_proxy or is_direct_openai_route(
+        getattr(agent, "base_url", None), is_codex_backend=is_codex_backend
     )
 
 
@@ -185,41 +154,19 @@ def native_compaction_context_management(
     (``agent.codex_responses_native_compaction = False``, set by the
     conversation loop's rejection recovery) takes effect on the next call.
     """
-    capabilities = getattr(agent, "runtime_capabilities", None)
-    if isinstance(capabilities, dict):
-        if not bool(capabilities.get("native_compaction", False)):
-            return None
-    if not bool(getattr(agent, "codex_responses_native_compaction", False)):
-        return None
-    # compression.enabled: false disables ALL automatic compaction, native
-    # included — mirrors the codex_app_server_auto contract.
-    if not bool(getattr(agent, "compression_enabled", True)):
-        return None
-    # compression.checkpoint_required: server-side compaction is a lossy
-    # boundary the provider owns — no pre-compress checkpoint can run before
-    # the server replaces older context. Keep the checkpoint-aware Hermes
-    # compressor authoritative instead of silently letting the server
-    # compact. Explicit-True check matches the compress_context() gate.
-    if getattr(agent, "compression_checkpoint_required", False) is True:
-        _warn_native_compaction_suppressed_by_checkpoint_gate()
-        return None
-    if is_xai_responses or is_github_responses:
-        return None
-    if not is_native_compaction_model(getattr(agent, "model", None)):
-        return None
-    trusted_proxy = bool(
-        getattr(agent, "capabilities", {}).get("openai_native_compaction", False)
-    )
-    if not trusted_proxy and not is_direct_openai_route(
-        getattr(agent, "base_url", None), is_codex_backend=is_codex_backend
+    if not native_continuity_capable(
+        agent,
+        is_codex_backend=is_codex_backend,
+        is_xai_responses=is_xai_responses,
+        is_github_responses=is_github_responses,
     ):
         return None
-
-    compressor = getattr(agent, "context_compressor", None)
-    threshold = resolve_compact_threshold(
-        getattr(agent, "codex_responses_compact_threshold", None),
-        getattr(compressor, "threshold_tokens", None) if compressor is not None else None,
-    )
+    pending = getattr(agent, "_native_continuity_pending", None)
+    if pending is None or not bool(getattr(agent, "_native_continuity_emit_context_management", False)):
+        return None
+    threshold = getattr(getattr(agent, "context_compressor", None), "threshold_tokens", None)
+    if not isinstance(threshold, int) or isinstance(threshold, bool) or threshold <= 0:
+        return None
     return [{"type": "compaction", "compact_threshold": threshold}]
 
 
@@ -308,6 +255,38 @@ def protected_handoff_boundary_fence(messages: List[Dict[str, Any]]) -> str:
     )
     digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
     return f"v2:{len(messages)}:{digest}"
+
+
+def native_continuity_boundary_fence(messages: List[Dict[str, Any]]) -> str:
+    """Hash stable provider-visible transcript semantics for native custody."""
+    provider_rows: List[Dict[str, Any]] = []
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") == "system":
+            continue
+        row: Dict[str, Any] = {}
+        for key in (
+            "role",
+            "content",
+            "tool_calls",
+            "tool_call_id",
+            "name",
+            "codex_reasoning_items",
+            "codex_message_items",
+        ):
+            if key in message:
+                row[key] = deepcopy(message[key])
+        api_content = message.get("api_content")
+        if isinstance(api_content, str) and api_content:
+            row["content"] = api_content
+        provider_rows.append(row)
+    canonical = json.dumps(
+        _stable_fence_value(provider_rows),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return f"nv1:{len(provider_rows)}:{digest}"
 
 
 def _render_protected_handoff_evidence_lane(
@@ -531,6 +510,444 @@ def protected_handoff_wire_item(canonical_handoff: str) -> Dict[str, Any]:
             "still override it.\n\n" + canonical_handoff
         ),
     }
+
+
+# This metadata is intentionally separate from the abandoned model-authored
+# handoff shape below. Native continuity owns one immutable boundary from
+# preflight through commit/replay and never asks a second model to describe it.
+NATIVE_CONTINUITY_METADATA_KEY = "_hermes_native_continuity"
+NATIVE_CONTINUITY_VERSION = 1
+NATIVE_CONTINUITY_MAX_CHARS = 24_000
+
+
+@dataclass(frozen=True)
+class NativeContinuitySeed:
+    """Immutable pre-request boundary captured before API repair may mutate it."""
+
+    snapshot: List[Dict[str, Any]]
+    triggering_user: Dict[str, Any]
+
+
+@dataclass(frozen=True)
+class NativeContinuityBoundary:
+    """Immutable custody record for one threshold-crossing request."""
+
+    snapshot: List[Dict[str, Any]]
+    triggering_user: Dict[str, Any]
+    canonical_handoff: str
+    boundary_fence: str
+    threshold_tokens: int
+    wire_triggering_user: Dict[str, Any]
+
+
+def _bounded_source_verbatim(snapshot: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Select whole, safe source rows across decisions and operational state."""
+    candidates: List[tuple[int, Dict[str, Any], str]] = []
+    salient = re.compile(
+        r"\b(?:must|do not|don't|never|only|approved|decision|blocked|failed|"
+        r"failure|next|pending|live|merged|deployed|restart|stop|resume|exact)\b",
+        re.IGNORECASE,
+    )
+    for index, message in enumerate(snapshot):
+        if not isinstance(message, dict) or is_compaction_summary_message(message):
+            continue
+        role = message.get("role")
+        content = message.get("api_content") or message.get("content")
+        if role not in {"user", "assistant", "tool"} or not isinstance(content, str):
+            continue
+        # A source-verbatim carrier cannot safely redact. Skip unsafe rows
+        # rather than persisting a transformed or credential-shaped copy.
+        if redact_sensitive_text(content) != content:
+            continue
+        excerpt = {
+            "index": index + 1,
+            "role": role,
+            "content": content,
+            "row_fence": native_continuity_boundary_fence([message]),
+        }
+        if role in {"user", "assistant"} and not message.get("tool_calls"):
+            lane = "direct"
+        elif salient.search(content):
+            lane = "salient"
+        else:
+            lane = "operational"
+        candidates.append((index, excerpt, lane))
+
+    selected: Dict[int, Dict[str, Any]] = {}
+    # Reserve independent lanes so a long tool tail cannot erase direct
+    # decisions and a long conversation cannot erase current operational state.
+    lane_limits = {"direct": 12_000, "operational": 6_000, "salient": 4_000}
+    for lane, lane_limit in lane_limits.items():
+        used = 0
+        for index, excerpt, candidate_lane in reversed(candidates):
+            if candidate_lane != lane or index in selected:
+                continue
+            cost = len(
+                json.dumps(
+                    excerpt,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+            if cost <= lane_limit - used:
+                selected[index] = excerpt
+                used += cost
+
+    # Fill any unused capacity newest-first without changing source ordering.
+    for index, excerpt, _lane in reversed(candidates):
+        if index in selected:
+            continue
+        candidate_selection = dict(selected)
+        candidate_selection[index] = excerpt
+        candidate = [candidate_selection[key] for key in sorted(candidate_selection)]
+        probe = json.dumps(
+            {
+                "version": NATIVE_CONTINUITY_VERSION,
+                "boundary_fence": "v2:0:" + "0" * 64,
+                "excerpts": candidate,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        if len(probe) <= NATIVE_CONTINUITY_MAX_CHARS:
+            selected[index] = excerpt
+
+    retained = [selected[index] for index in sorted(selected)]
+    while retained:
+        probe = json.dumps(
+            {
+                "version": NATIVE_CONTINUITY_VERSION,
+                "boundary_fence": "v2:0:" + "0" * 64,
+                "excerpts": retained,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        if len(probe) <= NATIVE_CONTINUITY_MAX_CHARS:
+            break
+        retained.pop(0)
+    return retained
+
+
+def canonical_native_continuity_handoff(snapshot: List[Dict[str, Any]], fence: str) -> str:
+    """Build a bounded canonical source-verbatim handoff for *snapshot*."""
+    value = {
+        "version": NATIVE_CONTINUITY_VERSION,
+        "boundary_fence": fence,
+        "excerpts": _bounded_source_verbatim(snapshot),
+    }
+    canonical = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    if len(canonical) > NATIVE_CONTINUITY_MAX_CHARS:
+        raise ValueError("native continuity handoff exceeds its fixed bound")
+    return canonical
+
+
+def parse_native_continuity_handoff(
+    canonical: Any,
+    fence: str,
+    *,
+    expected_snapshot: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    if not isinstance(canonical, str):
+        raise ValueError("native continuity handoff must be text")
+    value = json.loads(canonical)
+    if not isinstance(value, dict) or set(value) != {"version", "boundary_fence", "excerpts"}:
+        raise ValueError("native continuity handoff shape mismatch")
+    if value.get("version") != NATIVE_CONTINUITY_VERSION or value.get("boundary_fence") != fence:
+        raise ValueError("native continuity handoff fence mismatch")
+    excerpts = value.get("excerpts")
+    if not isinstance(excerpts, list):
+        raise ValueError("native continuity handoff source mismatch")
+    previous = 0
+    for excerpt in excerpts:
+        if not isinstance(excerpt, dict) or set(excerpt) != {
+            "index", "role", "content", "row_fence"
+        }:
+            raise ValueError("native continuity excerpt shape mismatch")
+        index = excerpt.get("index")
+        if not isinstance(index, int) or isinstance(index, bool) or index <= previous:
+            raise ValueError("native continuity excerpt order mismatch")
+        previous = index
+        if expected_snapshot is None:
+            continue
+        if index > len(expected_snapshot):
+            raise ValueError("native continuity excerpt index mismatch")
+        source = expected_snapshot[index - 1]
+        source_content = (
+            source.get("api_content") or source.get("content")
+            if isinstance(source, dict)
+            else None
+        )
+        if (
+            not isinstance(source, dict)
+            or excerpt.get("role") != source.get("role")
+            or excerpt.get("content") != source_content
+            or excerpt.get("row_fence") != native_continuity_boundary_fence([source])
+        ):
+            raise ValueError("native continuity excerpt source mismatch")
+    normalized = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    if normalized != canonical or len(normalized) > NATIVE_CONTINUITY_MAX_CHARS:
+        raise ValueError("native continuity handoff is not canonical or bounded")
+    return value
+
+
+def _boundary_committed_user(boundary: NativeContinuityBoundary) -> Dict[str, Any]:
+    user = deepcopy(boundary.triggering_user)
+    wire_content = boundary.wire_triggering_user.get("content")
+    if isinstance(wire_content, str) and wire_content:
+        user["api_content"] = wire_content
+    return user
+
+
+def _provider_triggering_user_fence(message: Dict[str, Any]) -> str:
+    provider_message = deepcopy(message)
+    api_content = provider_message.pop("api_content", None)
+    if isinstance(api_content, str) and api_content:
+        provider_message["content"] = api_content
+    for key in list(provider_message):
+        if str(key).startswith("_"):
+            provider_message.pop(key, None)
+    return native_continuity_boundary_fence([provider_message])
+
+
+def _native_checkpoint(checkpoint: Any, boundary: NativeContinuityBoundary) -> Dict[str, Any]:
+    if not isinstance(checkpoint, dict) or checkpoint.get("type") != "compaction":
+        raise ValueError("native compaction checkpoint missing")
+    encrypted = checkpoint.get("encrypted_content")
+    if not isinstance(encrypted, str) or not encrypted:
+        raise ValueError("native compaction checkpoint is invalid")
+    parse_native_continuity_handoff(
+        boundary.canonical_handoff,
+        boundary.boundary_fence,
+        expected_snapshot=boundary.snapshot,
+    )
+    return {
+        "type": "compaction",
+        "encrypted_content": encrypted,
+        NATIVE_CONTINUITY_METADATA_KEY: {
+            "version": NATIVE_CONTINUITY_VERSION,
+            "boundary_fence": boundary.boundary_fence,
+            "canonical_handoff": boundary.canonical_handoff,
+            "triggering_user_fence": _provider_triggering_user_fence(
+                boundary.wire_triggering_user
+            ),
+        },
+    }
+
+
+def capture_native_continuity_seed(
+    agent: Any,
+    messages: List[Dict[str, Any]],
+    current_turn_user_idx: int,
+) -> bool:
+    """Freeze the durable pre-trigger boundary before request repair can merge it."""
+    try:
+        from agent.codex_responses_adapter import classify_responses_route
+
+        route = classify_responses_route(agent)
+        if not native_continuity_capable(
+            agent,
+            is_codex_backend=route.is_codex_backend,
+            is_xai_responses=route.is_xai_responses,
+            is_github_responses=route.is_github_responses,
+        ):
+            return False
+        if not (0 <= current_turn_user_idx < len(messages)):
+            return False
+        triggering_user = messages[current_turn_user_idx]
+        if not isinstance(triggering_user, dict) or triggering_user.get("role") != "user":
+            return False
+        agent._native_continuity_candidate = NativeContinuitySeed(
+            snapshot=deepcopy(messages[:current_turn_user_idx]),
+            triggering_user=deepcopy(triggering_user),
+        )
+        agent._native_continuity_defer_user_persistence = True
+        return True
+    except Exception:
+        logger.debug("native continuity seed capture declined", exc_info=True)
+        return False
+
+
+def prepare_native_continuity_request(
+    agent: Any,
+    *,
+    api_kwargs: Dict[str, Any],
+) -> bool:
+    """Measure and inject a pending boundary at the final disposable wire edge."""
+    if getattr(agent, "_native_continuity_pending", None) is not None:
+        return False
+    seed = getattr(agent, "_native_continuity_candidate", None)
+    if not isinstance(seed, NativeContinuitySeed):
+        return False
+    try:
+        from agent.codex_responses_adapter import classify_responses_route
+        route = classify_responses_route(agent)
+        if not native_continuity_capable(
+            agent,
+            is_codex_backend=route.is_codex_backend,
+            is_xai_responses=route.is_xai_responses,
+            is_github_responses=route.is_github_responses,
+        ):
+            return False
+        snapshot = deepcopy(seed.snapshot)
+        fence = native_continuity_boundary_fence(snapshot)
+        canonical = canonical_native_continuity_handoff(snapshot, fence)
+        input_items = deepcopy(api_kwargs.get("input"))
+        if not isinstance(input_items, list):
+            return False
+        wire_index = next(
+            (
+                index
+                for index in range(len(input_items) - 1, -1, -1)
+                if isinstance(input_items[index], dict)
+                and input_items[index].get("role") == "user"
+            ),
+            None,
+        )
+        if wire_index is None:
+            return False
+        prepared_input = (
+            input_items[:wire_index]
+            + [protected_handoff_wire_item(canonical)]
+            + input_items[wire_index:]
+        )
+        from agent.model_metadata import estimate_request_tokens_rough
+        estimate = estimate_request_tokens_rough(
+            prepared_input,
+            system_prompt=str(api_kwargs.get("instructions") or ""),
+            tools=api_kwargs.get("tools") or None,
+        )
+        threshold = getattr(getattr(agent, "context_compressor", None), "threshold_tokens", None)
+        if not isinstance(threshold, int) or isinstance(threshold, bool) or threshold <= 0:
+            raise ValueError("live native continuity threshold unavailable")
+        if estimate < threshold:
+            agent._native_continuity_candidate = None
+            return False
+        agent._native_continuity_pending = NativeContinuityBoundary(
+            snapshot=snapshot,
+            triggering_user=deepcopy(seed.triggering_user),
+            canonical_handoff=canonical,
+            boundary_fence=fence,
+            threshold_tokens=threshold,
+            wire_triggering_user=deepcopy(input_items[wire_index]),
+        )
+        agent._native_continuity_candidate = None
+        agent._native_continuity_emit_context_management = True
+        api_kwargs["input"] = prepared_input
+        api_kwargs["context_management"] = [{"type": "compaction", "compact_threshold": threshold}]
+        return True
+    except Exception:
+        logger.debug("native continuity preparation failed", exc_info=True)
+        raise
+
+
+def fail_native_continuity(agent: Any) -> List[Dict[str, Any]]:
+    """Drop a pending request without retry/fallback or a partial durable write."""
+    boundary = getattr(agent, "_native_continuity_pending", None)
+    seed = getattr(agent, "_native_continuity_candidate", None)
+    agent._native_continuity_pending = None
+    agent._native_continuity_candidate = None
+    agent._native_continuity_emit_context_management = False
+    agent._native_continuity_defer_user_persistence = False
+    if isinstance(boundary, NativeContinuityBoundary):
+        return deepcopy(boundary.snapshot)
+    if isinstance(seed, NativeContinuitySeed):
+        return deepcopy(seed.snapshot)
+    return []
+
+
+def commit_native_continuity(agent: Any, assistant_message: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
+    """Atomically rebuild durable history around exactly one valid checkpoint."""
+    boundary = getattr(agent, "_native_continuity_pending", None)
+    if not isinstance(boundary, NativeContinuityBoundary):
+        return None
+    try:
+        items = assistant_message.get("codex_reasoning_items")
+        checkpoints = [
+            item
+            for item in (items if isinstance(items, list) else [])
+            if isinstance(item, dict) and item.get("type") == "compaction"
+        ]
+        if len(checkpoints) != 1:
+            raise ValueError("expected exactly one native compaction checkpoint")
+        carrier = {
+            "role": "assistant",
+            "content": "",
+            "display_kind": "hidden",
+            "codex_reasoning_items": [_native_checkpoint(checkpoints[0], boundary)],
+        }
+        committed_assistant = deepcopy(assistant_message)
+        ordinary = [
+            item
+            for item in (items if isinstance(items, list) else [])
+            if not (isinstance(item, dict) and item.get("type") == "compaction")
+        ]
+        if ordinary:
+            committed_assistant["codex_reasoning_items"] = ordinary
+        else:
+            committed_assistant.pop("codex_reasoning_items", None)
+        committed_user = _boundary_committed_user(boundary)
+        committed = deepcopy(boundary.snapshot) + [
+            carrier,
+            committed_user,
+            committed_assistant,
+        ]
+        agent._native_continuity_pending = None
+        agent._native_continuity_candidate = None
+        agent._native_continuity_emit_context_management = False
+        agent._native_continuity_defer_user_persistence = False
+        agent._persist_user_message_idx = len(boundary.snapshot) + 1
+        return committed
+    except Exception:
+        logger.debug("native continuity checkpoint commit rejected", exc_info=True)
+        return None
+
+
+def native_continuity_handoff_from_checkpoint(
+    checkpoint: Any,
+    *,
+    preceding_messages: Optional[List[Dict[str, Any]]] = None,
+    following_message: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    """Validate native continuity metadata and its complete immutable prefix."""
+    if not isinstance(checkpoint, dict):
+        return None
+    metadata = checkpoint.get(NATIVE_CONTINUITY_METADATA_KEY)
+    if not isinstance(metadata, dict) or metadata.get("version") != NATIVE_CONTINUITY_VERSION:
+        return None
+    fence = metadata.get("boundary_fence")
+    canonical = metadata.get("canonical_handoff")
+    if not isinstance(fence, str) or not isinstance(canonical, str):
+        return None
+    if preceding_messages is None:
+        return None
+    semantic_preceding = [
+        message
+        for message in preceding_messages
+        if isinstance(message, dict) and message.get("role") != "system"
+    ]
+    if native_continuity_boundary_fence(semantic_preceding) != fence:
+        return None
+    triggering_user_fence = metadata.get("triggering_user_fence")
+    if (
+        not isinstance(triggering_user_fence, str)
+        or not isinstance(following_message, dict)
+        or following_message.get("role") != "user"
+        or _provider_triggering_user_fence(following_message) != triggering_user_fence
+    ):
+        return None
+    try:
+        parse_native_continuity_handoff(
+            canonical,
+            fence,
+            expected_snapshot=semantic_preceding,
+        )
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return canonical
 
 
 def _approx_tokens(text: str) -> int:
@@ -792,7 +1209,9 @@ def prune_pre_checkpoint_items(
     # after the opaque checkpoint(s), before retained summaries and tail.  The
     # metadata never reaches the provider: checkpoint items are rebuilt to the
     # two canonical Responses fields here.
-    active_handoff = protected_handoff_from_checkpoint(checkpoint_run[-1])
+    active_handoff = checkpoint_run[-1].get("_hermes_validated_handoff")
+    if not isinstance(active_handoff, str):
+        active_handoff = protected_handoff_from_checkpoint(checkpoint_run[-1])
     canonical_checkpoint_run = [
         {
             "type": "compaction",

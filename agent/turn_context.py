@@ -808,6 +808,12 @@ def build_turn_context(
     append_message(messages, user_msg)
     current_turn_user_idx = len(messages) - 1
     agent._persist_user_message_idx = current_turn_user_idx
+    # A native compaction emitted by this turn's common compression seam may
+    # remain authorized only until api_content composition below finishes.
+    # Clear any capability left behind by an earlier turn that aborted before
+    # reaching its finalization seam.
+    agent._native_compaction_attempt = None
+    agent._native_compaction_turn_active = True
 
     # Track user turns for memory flush and periodic nudge logic.
     agent._user_turn_count += 1
@@ -1109,24 +1115,6 @@ def build_turn_context(
                         _compress_block_reason = _info(_preflight_tokens)[1]
                     except Exception:
                         _compress_block_reason = None
-        # Direct compatible Responses turns defer the threshold decision to the
-        # final wire boundary, after plugin/API transforms.  Do not let this
-        # earlier history-only estimate run Hermes' local compressor first.
-        if _should_compress_now:
-            try:
-                from agent.codex_responses_adapter import classify_responses_route
-                from agent.native_compaction import native_continuity_capable
-
-                _route = classify_responses_route(agent)
-                if native_continuity_capable(
-                    agent,
-                    is_codex_backend=_route.is_codex_backend,
-                    is_xai_responses=_route.is_xai_responses,
-                    is_github_responses=_route.is_github_responses,
-                ):
-                    _should_compress_now = False
-            except Exception:
-                pass
         if _should_compress_now:
             _preflight_compressed = True
             # Compression is actually running (block cleared / was never
@@ -1555,42 +1543,70 @@ def build_turn_context(
         )
         if _api_content is not None and _api_content != _turn_user_msg.get("content"):
             _turn_user_msg["api_content"] = _api_content
-            # In-place preflight compaction has ALREADY inserted this turn's
-            # user row (archive_and_compact runs before prefetch/pre_llm_call
-            # can compose the sidecar), and the crash persist below identity-
-            # skips every compacted dict (they are all in the rebound
-            # conversation_history) — so the stamp would never reach the DB.
-            # Backfill it onto the freshly-inserted row directly. Rotation
-            # mode needs nothing here: its compacted copies flush to the
-            # child session after this stamp.
-            if _preflight_compressed and bool(
-                getattr(agent, "_last_compaction_in_place", False)
+            # Compression persistence has already committed before plugin/memory
+            # context is composed.  For native compaction, both in-place and
+            # rotation therefore need one exact transaction that updates the
+            # current user sidecar and the checkpoint fence together.  The
+            # capability identifies only the checkpoint created by this turn;
+            # retained checkpoints are never discovered or rebound.
+            _db = getattr(agent, "_session_db", None)
+            from agent.native_compaction import (
+                NativeCompactionAttempt,
+                bind_native_compaction_tail,
+            )
+
+            _attempt = getattr(agent, "_native_compaction_attempt", None)
+            if _preflight_compressed and _db is not None and isinstance(
+                _attempt, NativeCompactionAttempt
             ):
-                _db = getattr(agent, "_session_db", None)
-                if _db is not None:
-                    try:
-                        _db.set_latest_user_api_content(
-                            agent.session_id,
-                            _turn_user_msg.get("content"),
-                            _api_content,
-                        )
-                    except Exception:
-                        logger.warning(
-                            "in-place compaction api_content backfill failed "
-                            "for session=%s",
-                            agent.session_id or "none",
-                            exc_info=True,
-                        )
+                _old_metadata = dict(_attempt.metadata)
+                try:
+                    bind_native_compaction_tail(agent, messages)
+                    _db.set_in_place_native_compaction_api_content(
+                        agent.session_id,
+                        user_content=_turn_user_msg.get("content"),
+                        api_content=_api_content,
+                        identity=_attempt.identity,
+                        encrypted_content=_attempt.carrier[
+                            "codex_reasoning_items"
+                        ][0]["encrypted_content"],
+                        old_metadata=_old_metadata,
+                        new_metadata=dict(_attempt.metadata),
+                    )
+                except Exception as exc:
+                    _attempt.metadata.clear()
+                    _attempt.metadata.update(_old_metadata)
+                    _turn_user_msg.pop("api_content", None)
+                    raise ValueError(
+                        "native compaction api_content atomic rebind failed"
+                    ) from exc
+            elif (
+                _preflight_compressed
+                and bool(getattr(agent, "_last_compaction_in_place", False))
+                and _db is not None
+            ):
+                # Preserve the established sidecar-only helper for local and
+                # non-native in-place compression, where no checkpoint exists.
+                try:
+                    _db.set_latest_user_api_content(
+                        agent.session_id,
+                        _turn_user_msg.get("content"),
+                        _api_content,
+                    )
+                except Exception:
+                    logger.warning(
+                        "in-place compaction api_content backfill failed "
+                        "for session=%s",
+                        agent.session_id or "none",
+                        exc_info=True,
+                    )
 
-    # Freeze a native-capable turn before request repair can merge/re-anchor
-    # its user row. The final complete request decides whether this seed becomes
-    # a real threshold-crossing boundary.
-    try:
-        from agent.native_compaction import capture_native_continuity_seed
+    # No caller may carry this authorization into a later ordinary or local
+    # compression.  The last bind sees the final user/tool/TODO tail.
+    from agent.native_compaction import finalize_native_compaction_turn
 
-        capture_native_continuity_seed(agent, messages, current_turn_user_idx)
-    except Exception:
-        logger.debug("native continuity seed capture failed", exc_info=True)
+    finalize_native_compaction_turn(agent, messages)
+    agent._native_compaction_turn_active = False
 
     # Crash-resilience: persist the inbound user turn before the first LLM
     # call. Runs after preflight compression (which rewrites history anyway)
@@ -1601,8 +1617,6 @@ def build_turn_context(
     # the pre-compression attempt above failed transiently.
     def _ensure_and_persist() -> None:
         agent._ensure_db_session()
-        if getattr(agent, "_native_continuity_defer_user_persistence", False):
-            return
         agent._persist_session(messages, conversation_history)
 
     try:

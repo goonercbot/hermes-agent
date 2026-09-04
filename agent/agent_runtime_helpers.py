@@ -891,6 +891,27 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
             and merged[-1].get("role") == "user"
         ):
             prev = merged[-1]
+            # v2 native compaction deliberately places its explicit handoff
+            # user row immediately before the exact current user/tool tail.
+            # It is integrity-bound to the checkpoint carrier, so generic
+            # alternation repair must not merge it or invalidate replay.
+            if len(merged) >= 2:
+                carrier = merged[-2]
+                items = (
+                    carrier.get("codex_reasoning_items")
+                    if isinstance(carrier, dict)
+                    else None
+                )
+                if isinstance(items, list):
+                    from agent.native_compaction import NATIVE_COMPACTION_METADATA_KEY
+
+                    if any(
+                        isinstance(item, dict)
+                        and NATIVE_COMPACTION_METADATA_KEY in item
+                        for item in items
+                    ):
+                        merged.append(msg)
+                        continue
             # A summary carrier followed by a new user row is a deliberate
             # durable shape after retry/rewind.  Do not absorb the fresh ask
             # into the already-persisted carrier: mutating that dict can make

@@ -1897,36 +1897,6 @@ def _notify_context_engine_turn_complete(
         )
 
 
-def _terminal_native_continuity_failure(
-    agent,
-    messages,
-    api_call_count,
-    *,
-    fallback_messages=None,
-):
-    """Restore one failed protected request and clear all turn-local signals."""
-    from agent.native_compaction import fail_native_continuity
-
-    had_pending_boundary = (
-        getattr(agent, "_native_continuity_pending", None) is not None
-        or getattr(agent, "_native_continuity_candidate", None) is not None
-    )
-    restored = fail_native_continuity(agent)
-    if not had_pending_boundary and fallback_messages is not None:
-        restored = deepcopy(fallback_messages)
-    messages[:] = restored
-    agent.clear_interrupt()
-    agent._session_messages = messages
-    return {
-        "final_response": "native_compaction_checkpoint_missing",
-        "messages": messages,
-        "api_calls": api_call_count,
-        "completed": False,
-        "failed": True,
-        "error": "native_compaction_checkpoint_missing",
-    }
-
-
 def run_conversation(
     agent,
     user_message: Any,
@@ -1968,6 +1938,42 @@ def run_conversation(
     Returns:
         Dict: Complete conversation result with final response and message history
     """
+    # Protected persisted v2 compaction must fail before turn construction:
+    # turn_context can otherwise enter preflight local compression before the
+    # adapter gets a chance to validate replay. This is read-only and leaves the
+    # caller's retained history byte-identical on every malformed shape.
+    try:
+        from agent.native_compaction import validate_persisted_native_compaction_history
+
+        validate_persisted_native_compaction_history(conversation_history or [])
+    except ValueError as exc:
+        error = str(exc)
+        # This terminal path must not construct a compression/provider request,
+        # but the turn prologue still records the inbound user row exactly once.
+        # Keep the retained protected source immutable and persist only the new
+        # row so a later repair has the same durable user-side boundary.
+        failed_messages = list(conversation_history or [])
+        staged_user = persist_user_message if persist_user_message is not None else user_message
+        if isinstance(staged_user, str):
+            failed_messages.append({"role": "user", "content": staged_user})
+            persist = getattr(agent, "_persist_session", None)
+            if callable(persist):
+                try:
+                    persist(failed_messages, conversation_history)
+                except Exception:
+                    logger.warning(
+                        "terminal native-compaction replay failure could not persist user row",
+                        exc_info=True,
+                    )
+        return {
+            "final_response": error,
+            "messages": failed_messages,
+            "api_calls": 0,
+            "completed": False,
+            "failed": True,
+            "error": error,
+        }
+
     if moa_config is None:
         try:
             from hermes_cli.moa_config import decode_moa_turn
@@ -2274,35 +2280,24 @@ def run_conversation(
         # However, providers like Moonshot AI require a separate 'reasoning_content' field
         # on assistant messages with tool_calls. We handle both cases here.
         request_logger = getattr(agent, "logger", None) or logging.getLogger(__name__)
-        _native_continuity_source_messages = None
-        _native_replay_request = False
-        if agent.api_mode == "codex_responses":
-            from agent.native_compaction import NATIVE_CONTINUITY_METADATA_KEY
+        _native_continuity_source_messages = messages
+        from agent.native_compaction import validate_persisted_native_compaction_history
 
-            # Preserve the exact durable transcript before any request-only
-            # sanitizer can repair, merge, or drop rows. Persisted continuity
-            # replay has no pending in-memory boundary, so detect its protected
-            # checkpoint directly from the untouched history.
-            _native_continuity_source_messages = messages
-            _native_replay_request = any(
-                isinstance(item, dict)
-                and NATIVE_CONTINUITY_METADATA_KEY in item
-                for msg in messages
-                if isinstance(msg, dict)
-                for items in [msg.get("codex_reasoning_items")]
-                if isinstance(items, list)
-                for item in items
-            )
-        _native_boundary_request = (
-            getattr(agent, "_native_continuity_candidate", None) is not None
-            or getattr(agent, "_native_continuity_pending", None) is not None
-            or _native_replay_request
+        # A valid protected checkpoint needs an immutable validation source on
+        # every replay, not only while the producer capability is still live.
+        # The turn prologue intentionally consumes that capability before the
+        # first provider request, while ordinary role repair would otherwise
+        # merge the handoff user row with the adjacent active user row.
+        _native_boundary_request = bool(
+            validate_persisted_native_compaction_history(messages)
         )
         _request_current_turn_user_idx = current_turn_user_idx
         if _native_boundary_request:
-            # Every request-side sanitizer receives a disposable deep copy.
-            # The durable prefix/user objects captured by the boundary must
-            # never be merged, dropped, or rewritten during wire repair.
+            # The protected handoff and the current user are deliberately
+            # adjacent user rows. Repair may merge consecutive user rows for
+            # ordinary histories, so every request-side sanitizer must receive
+            # a disposable copy while the exact durable boundary remains the
+            # adapter's validation source.
             messages = deepcopy(messages)
         # Per-agent validation cursor: skips re-json.loads-ing tool_call
         # arguments on history messages already validated in a previous
@@ -2896,7 +2891,6 @@ def run_conversation(
             and not _preflight_compression_blocked
             and not _defer_preflight(request_pressure_tokens)
             and not _compression_cooldown
-            and getattr(agent, "_native_continuity_candidate", None) is None
             and _compressor.should_compress(request_pressure_tokens)
         ):
             if _moa_prepared_request is not None:
@@ -3313,42 +3307,6 @@ def run_conversation(
                 except Exception:
                     pass
 
-                # Native continuity is prepared only after ordinary request
-                # repair and plugin mutation. The immutable seed was captured
-                # before those operations could merge or re-anchor the durable
-                # triggering row.
-                if agent.api_mode == "codex_responses" and retry_count == 0:
-                    try:
-                        from agent.native_compaction import prepare_native_continuity_request
-
-                        _native_prepared = prepare_native_continuity_request(
-                            agent,
-                            api_kwargs=api_kwargs,
-                        )
-                    except Exception:
-                        return _terminal_native_continuity_failure(
-                            agent, messages, api_call_count
-                        )
-                    if (
-                        not _native_prepared
-                        and getattr(
-                            agent,
-                            "_native_continuity_defer_user_persistence",
-                            False,
-                        )
-                    ):
-                        # The final complete request stayed below the live
-                        # threshold (or the route changed). Restore ordinary
-                        # crash-resilient persistence before making the call.
-                        agent._native_continuity_candidate = None
-                        agent._native_continuity_defer_user_persistence = False
-                        agent._persist_session(messages, conversation_history)
-                    elif _native_prepared:
-                        # Execution middleware's "original request" must be
-                        # the protected complete payload, never the earlier
-                        # handoff-free request it could otherwise restore.
-                        _original_api_kwargs = deepcopy(api_kwargs)
-
                 if env_var_enabled("HERMES_DUMP_REQUESTS"):
                     agent._dump_api_request_debug(api_kwargs, reason="preflight")
 
@@ -3434,10 +3392,7 @@ def run_conversation(
 
                 def _perform_api_call(next_api_kwargs):
                     nonlocal _native_physical_attempted
-                    _protected_request = (
-                        getattr(agent, "_native_continuity_pending", None)
-                        is not None
-                    )
+                    _protected_request = False
                     if _protected_request and next_api_kwargs != _original_api_kwargs:
                         raise RuntimeError(
                             "protected native compaction request mutated after preflight"
@@ -3547,13 +3502,6 @@ def run_conversation(
                             _model_request_active.clear()
                         _redirect_crossed_response = agent._has_pending_redirect()
                 if _redirect_crossed_response:
-                    # A prepared native-compaction request is single-use. Once
-                    # it reaches the provider, a crossing redirect cannot turn
-                    # that physical attempt into a rebuilt follow-up request.
-                    if getattr(agent, "_native_continuity_pending", None) is not None:
-                        return _terminal_native_continuity_failure(
-                            agent, messages, api_call_count
-                        )
                     # The response and redirect can cross on different threads:
                     # redirect() observed the request as active just before this
                     # call returned. Discard that now-stale response and rebuild
@@ -3668,10 +3616,6 @@ def run_conversation(
                             error_details.append("response.choices is empty")
 
                 if response_invalid:
-                    if getattr(agent, "_native_continuity_pending", None) is not None:
-                        return _terminal_native_continuity_failure(
-                            agent, messages, api_call_count
-                        )
                     agent._invoke_api_request_error_hook(
                         task_id=effective_task_id,
                         turn_id=turn_id,
@@ -3848,28 +3792,6 @@ def run_conversation(
                     continue  # Retry the API call
 
                 agent._turn_received_provider_response = True
-
-                # A local estimate only decides whether Hermes offers native
-                # compaction and includes the deterministic handoff. Codex's
-                # actual response decides whether a protected boundary exists.
-                # No checkpoint is a normal response, not evidence of loss.
-                if getattr(agent, "_native_continuity_pending", None) is not None:
-                    try:
-                        from agent.native_compaction import (
-                            release_native_continuity_without_checkpoint,
-                            response_has_valid_native_checkpoint,
-                        )
-
-                        if not response_has_valid_native_checkpoint(response):
-                            _released = release_native_continuity_without_checkpoint(agent)
-                            if _released is None:
-                                raise ValueError("native continuity candidate unavailable")
-                            messages[:] = _released
-                            agent._session_messages = messages
-                    except Exception:
-                        return _terminal_native_continuity_failure(
-                            agent, messages, api_call_count
-                        )
 
                 # Check finish_reason before proceeding
                 if agent.api_mode == "codex_responses":
@@ -4773,10 +4695,6 @@ def run_conversation(
                 break  # Success, exit retry loop
 
             except InterruptedError:
-                if getattr(agent, "_native_continuity_pending", None) is not None:
-                    return _terminal_native_continuity_failure(
-                        agent, messages, api_call_count
-                    )
                 if thinking_spinner:
                     thinking_spinner.stop("")
                     thinking_spinner = None
@@ -4811,34 +4729,6 @@ def run_conversation(
                 break
 
             except Exception as api_error:
-                # A threshold-crossing native request is exactly-once. Any
-                # exception must preserve the pre-trigger durable history and
-                # must not enter retry, fallback, downgrade or ordinary-error
-                # persistence paths. Invalid persisted protected continuity is
-                # also terminal even before a new boundary has been prepared.
-                _invalid_persisted_continuity = (
-                    _native_replay_request
-                    and "protected native compaction checkpoint" in str(api_error)
-                )
-                if (
-                    getattr(agent, "_native_continuity_pending", None) is not None
-                    or (
-                        getattr(agent, "_native_continuity_candidate", None) is not None
-                        and "protected native compaction checkpoint failed boundary validation"
-                        in str(api_error)
-                    )
-                    or _invalid_persisted_continuity
-                ):
-                    return _terminal_native_continuity_failure(
-                        agent,
-                        messages,
-                        api_call_count,
-                        fallback_messages=(
-                            _native_continuity_source_messages
-                            if _invalid_persisted_continuity
-                            else None
-                        ),
-                    )
                 # Stop spinner silently — retry status is buffered and
                 # only flushed when every retry+fallback is exhausted.
                 if thinking_spinner:
@@ -7192,40 +7082,6 @@ def run_conversation(
             assistant_message = normalized
             finish_reason = normalized.finish_reason
 
-            # A valid provider checkpoint is the only commit authority for a
-            # pending boundary. Normal no-checkpoint responses released the
-            # candidate above and continue through the ordinary response path.
-            if getattr(agent, "_native_continuity_pending", None) is not None:
-                try:
-                    if finish_reason != "stop":
-                        raise ValueError("native checkpoint response was not complete")
-                    _native_candidate = agent._build_assistant_message(
-                        assistant_message, finish_reason
-                    )
-                    from agent.native_compaction import commit_native_continuity
-
-                    _committed = commit_native_continuity(agent, _native_candidate)
-                    if _committed is None:
-                        raise ValueError("native checkpoint missing or invalid")
-                    # The normal response path below owns delivery/ordinary
-                    # assistant construction.  It receives only non-checkpoint
-                    # reasoning; the opaque checkpoint now exists once in the
-                    # hidden carrier immediately before the triggering user.
-                    messages[:] = _committed[:-1]
-                    _ordinary = _committed[-1].get("codex_reasoning_items")
-                    _provider_data = dict(
-                        getattr(assistant_message, "provider_data", None) or {}
-                    )
-                    if isinstance(_ordinary, list) and _ordinary:
-                        _provider_data["codex_reasoning_items"] = _ordinary
-                    else:
-                        _provider_data.pop("codex_reasoning_items", None)
-                    assistant_message.provider_data = _provider_data
-                except Exception:
-                    return _terminal_native_continuity_failure(
-                        agent, messages, api_call_count
-                    )
-            
             # Normalize content to string — some OpenAI-compatible servers
             # (llama-server, etc.) return content as a dict or list instead
             # of a plain string, which crashes downstream .strip() calls.

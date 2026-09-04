@@ -12485,6 +12485,75 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         return self._execute_write(_do)
 
+    def set_in_place_native_compaction_api_content(
+        self,
+        session_id: str,
+        *,
+        user_content: Any,
+        api_content: str,
+        identity: str,
+        encrypted_content: str,
+        old_metadata: Dict[str, Any],
+        new_metadata: Dict[str, Any],
+    ) -> None:
+        """Atomically update one current user sidecar and its v2 checkpoint.
+
+        Every candidate is fully matched before either UPDATE executes; absent,
+        duplicate, or drifted rows raise inside the write transaction and leave
+        the database unchanged.
+        """
+        encoded_user_content = self._encode_content(user_content)
+        encoded_api_content = _scrub_surrogates(api_content)
+
+        def _do(conn):
+            user_rows = conn.execute(
+                "SELECT id FROM messages WHERE session_id = ? AND active = 1 "
+                "AND role = 'user' AND content IS ? ORDER BY id",
+                (session_id, encoded_user_content),
+            ).fetchall()
+            if len(user_rows) != 1:
+                raise ValueError("native compaction api_content user row is missing or ambiguous")
+            matches = []
+            for row in conn.execute(
+                "SELECT id, codex_reasoning_items FROM messages "
+                "WHERE session_id = ? AND active = 1 AND role = 'assistant'",
+                (session_id,),
+            ).fetchall():
+                try:
+                    items = json.loads(row["codex_reasoning_items"])
+                except (TypeError, ValueError):
+                    continue
+                if not isinstance(items, list) or len(items) != 1 or not isinstance(items[0], dict):
+                    continue
+                item = items[0]
+                metadata = item.get("_hermes_native_compaction")
+                if (
+                    item.get("type") == "compaction"
+                    and item.get("encrypted_content") == encrypted_content
+                    and isinstance(metadata, dict)
+                    and metadata.get("identity") == identity
+                ):
+                    matches.append((row["id"], item))
+            if len(matches) != 1:
+                raise ValueError("native compaction api_content carrier is missing or ambiguous")
+            carrier_id, checkpoint = matches[0]
+            if checkpoint.get("_hermes_native_compaction") != old_metadata:
+                raise ValueError("native compaction api_content carrier metadata mismatch")
+            rewritten = dict(checkpoint)
+            rewritten["_hermes_native_compaction"] = new_metadata
+            user_update = conn.execute(
+                "UPDATE messages SET api_content = ? WHERE id = ? AND active = 1",
+                (encoded_api_content, user_rows[0]["id"]),
+            )
+            carrier_update = conn.execute(
+                "UPDATE messages SET codex_reasoning_items = ? WHERE id = ? AND active = 1",
+                (json.dumps([rewritten], ensure_ascii=False, separators=(",", ":")), carrier_id),
+            )
+            if user_update.rowcount != 1 or carrier_update.rowcount != 1:
+                raise ValueError("native compaction api_content update failed")
+
+        self._execute_write(_do)
+
     def get_messages(
         self,
         session_id: str,

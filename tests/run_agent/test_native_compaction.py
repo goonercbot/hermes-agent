@@ -38,8 +38,6 @@ def _agent(
         codex_responses_compact_threshold=threshold,
         context_compressor=compressor or SimpleNamespace(threshold_tokens=204_000),
         capabilities=capabilities or {},
-        _native_continuity_pending=object(),
-        _native_continuity_emit_context_management=True,
     )
 
 
@@ -80,22 +78,20 @@ class TestRouteGate:
 
 
 class TestRequestGate:
-    def test_eligible_route_gets_payload(self):
+    def test_eligible_route_never_arms_ordinary_request(self):
         payload = native_compaction_context_management(
             _agent(), is_codex_backend=False
         )
-        assert payload == [
-            {"type": "compaction", "compact_threshold": 204_000}
-        ]
+        assert payload is None
 
-    def test_codex_backend_gets_payload(self):
+    def test_codex_backend_never_arms_ordinary_request(self):
         payload = native_compaction_context_management(
             _agent(base_url="https://chatgpt.com/backend-api/codex"),
             is_codex_backend=True,
         )
-        assert payload is not None
+        assert payload is None
 
-    def test_trusted_proxy_capability_gets_payload(self):
+    def test_trusted_proxy_never_arms_ordinary_request(self):
         payload = native_compaction_context_management(
             _agent(
                 base_url="https://trusted-proxy.example/v1",
@@ -103,7 +99,7 @@ class TestRequestGate:
             ),
             is_codex_backend=False,
         )
-        assert payload is not None
+        assert payload is None
 
     def test_disabled_by_default_config_value(self):
         assert (
@@ -153,19 +149,19 @@ class TestRequestGate:
             is None
         )
 
-    def test_live_local_compressor_threshold_is_the_only_trigger(self):
+    def test_live_local_compressor_threshold_cannot_arm_ordinary_request(self):
         compressor = SimpleNamespace(threshold_tokens=100_000)
         payload = native_compaction_context_management(
             _agent(compressor=compressor), is_codex_backend=False
         )
-        assert payload[0]["compact_threshold"] == 100_000
+        assert payload is None
 
-    def test_omitted_threshold_tracks_resolved_local_trigger(self):
+    def test_omitted_threshold_cannot_arm_ordinary_request(self):
         compressor = SimpleNamespace(threshold_tokens=765_000)
         payload = native_compaction_context_management(
             _agent(threshold=None, compressor=compressor), is_codex_backend=False
         )
-        assert payload == [{"type": "compaction", "compact_threshold": 765_000}]
+        assert payload is None
 
 
 class TestRejectionMatcher:
@@ -465,30 +461,6 @@ class TestAgentInitConfig:
         kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
         assert "context_management" not in kwargs
 
-    def test_kwargs_include_field_when_enabled_on_eligible_route(self):
-        from run_agent import AIAgent
-
-        agent = AIAgent(
-            api_key="test-key",
-            base_url="https://api.openai.com/v1",
-            api_mode="codex_responses",
-            model="gpt-5.6",
-            provider="openai-api",
-            quiet_mode=True,
-            skip_context_files=True,
-            skip_memory=True,
-            enabled_toolsets=[],
-        )
-        agent.codex_responses_native_compaction = True
-        agent._native_continuity_pending = object()
-        agent._native_continuity_emit_context_management = True
-        kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
-        assert kwargs["context_management"] == [
-            {
-                "type": "compaction",
-                "compact_threshold": agent.context_compressor.threshold_tokens,
-            }
-        ]
 
     def test_kwargs_omit_field_for_ineligible_model_even_when_enabled(self):
         from run_agent import AIAgent

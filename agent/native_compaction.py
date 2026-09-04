@@ -254,8 +254,8 @@ def protected_handoff_boundary_fence(messages: List[Dict[str, Any]]) -> str:
     return f"v2:{len(messages)}:{digest}"
 
 
-def native_continuity_boundary_fence(messages: List[Dict[str, Any]]) -> str:
-    """Hash stable provider-visible transcript semantics for native custody."""
+def _legacy_native_continuity_boundary_fence(messages: List[Dict[str, Any]]) -> str:
+    """Recompute the original byte-sensitive fence for retained checkpoints."""
     provider_rows: List[Dict[str, Any]] = []
     for message in messages:
         if not isinstance(message, dict) or message.get("role") == "system":
@@ -284,6 +284,66 @@ def native_continuity_boundary_fence(messages: List[Dict[str, Any]]) -> str:
     )
     digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
     return f"nv1:{len(provider_rows)}:{digest}"
+
+
+def native_continuity_boundary_fence(messages: List[Dict[str, Any]]) -> str:
+    """Hash provider semantics after deterministic request/persistence repair."""
+    provider_rows: List[Dict[str, Any]] = []
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") == "system":
+            continue
+        row: Dict[str, Any] = {}
+        for key in (
+            "role",
+            "content",
+            "tool_calls",
+            "tool_call_id",
+            "name",
+            "codex_reasoning_items",
+            "codex_message_items",
+        ):
+            if key in message:
+                row[key] = deepcopy(message[key])
+        api_content = message.get("api_content")
+        if isinstance(api_content, str) and api_content:
+            row["content"] = api_content
+        if message.get("role") == "tool":
+            tool_name = message.get("name") or message.get("tool_name")
+            if isinstance(tool_name, str) and tool_name:
+                row["name"] = tool_name
+        tool_calls = row.get("tool_calls")
+        if isinstance(tool_calls, list):
+            for call in tool_calls:
+                if not isinstance(call, dict):
+                    continue
+                function = call.get("function")
+                argument_holders = [function] if isinstance(function, dict) else []
+                argument_holders.append(call)
+                for holder in argument_holders:
+                    arguments = holder.get("arguments")
+                    if not isinstance(arguments, str):
+                        continue
+                    try:
+                        holder["arguments"] = json.loads(arguments)
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        pass
+        provider_rows.append(row)
+    canonical = json.dumps(
+        _stable_fence_value(provider_rows),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return f"nv2:{len(provider_rows)}:{digest}"
+
+
+def _native_continuity_fence_matches(expected: Any, tail: List[Dict[str, Any]]) -> bool:
+    if not isinstance(expected, str):
+        return False
+    if expected.startswith("nv1:"):
+        return expected == _legacy_native_continuity_boundary_fence(tail)
+    return expected == native_continuity_boundary_fence(tail)
 
 
 def _render_protected_handoff_evidence_lane(
@@ -943,7 +1003,7 @@ def validate_native_compaction_checkpoint(checkpoint: Any, following: Any, tail:
     if not isinstance(count, int) or isinstance(count, bool) or count < 0 or len(tail) < count:
         raise ValueError("protected native compaction checkpoint failed boundary validation")
     original_tail = tail[:count]
-    if metadata.get("tail_fence") != native_continuity_boundary_fence(original_tail):
+    if not _native_continuity_fence_matches(metadata.get("tail_fence"), original_tail):
         raise ValueError("protected native compaction checkpoint failed boundary validation")
     return handoff
 
@@ -1020,7 +1080,9 @@ def validate_persisted_native_compaction_history(messages: Any) -> Dict[int, str
         raise ValueError("protected native compaction checkpoint failed boundary validation: handoff mismatch")
     count = metadata["tail_count"]
     tail = messages[index + 2:index + 2 + count]
-    if len(tail) != count or metadata["tail_fence"] != native_continuity_boundary_fence(tail):
+    if len(tail) != count or not _native_continuity_fence_matches(
+        metadata["tail_fence"], tail
+    ):
         raise ValueError("protected native compaction checkpoint failed boundary validation: tail mismatch")
     return {id(checkpoint): metadata["handoff"]}
 

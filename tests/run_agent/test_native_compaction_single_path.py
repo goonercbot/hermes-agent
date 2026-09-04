@@ -319,6 +319,135 @@ def test_new_checkpoint_replay_rejects_tampered_tail():
         )
 
 
+def test_native_request_copy_accepts_canonicalized_tool_arguments_from_valid_source():
+    """Request repair may canonicalize JSON without mutating protected history."""
+    agent, _calls = _agent([
+        _response(_message("handoff")),
+        _response({"type": "compaction", "encrypted_content": "cp"}),
+    ])
+    source = [
+        {"role": "assistant", "content": "old context " * 1000},
+        {"role": "user", "content": "current"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "tool_call",
+                        "arguments": '{"name":"fleet_route_task","arguments":{"work_shape":"direct","consequence":"routine"}}',
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "name": "fleet_route_task",
+            "content": '{"ok":true}',
+        },
+    ]
+    protected = native_compact_context(agent, source, "system")
+    bind_native_compaction_tail(agent, protected)
+    durable_before = deepcopy(protected)
+
+    request_copy = deepcopy(protected)
+    request_copy[3]["tool_calls"][0]["function"]["arguments"] = (
+        '{"arguments":{"consequence":"routine","work_shape":"direct"},'
+        '"name":"fleet_route_task"}'
+    )
+    wire = _chat_messages_to_responses_input(
+        request_copy,
+        current_issuer_kind="openai_codex",
+        native_compaction_eligible=True,
+        native_continuity_source_messages=protected,
+    )
+
+    assert protected == durable_before
+    assert wire[0] == {"type": "compaction", "encrypted_content": "cp"}
+    assert wire[1] == {"role": "user", "content": "handoff"}
+    function_call = next(item for item in wire if item.get("type") == "function_call")
+    assert function_call["arguments"] == request_copy[3]["tool_calls"][0]["function"]["arguments"]
+
+
+def test_native_request_copy_rejects_semantic_tail_mutation():
+    agent, _calls = _agent([
+        _response(_message("handoff")),
+        _response({"type": "compaction", "encrypted_content": "cp"}),
+    ])
+    source = [
+        {"role": "assistant", "content": "old context " * 1000},
+        {"role": "user", "content": "current"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "arguments": '{"path":"/tmp/exact"}',
+                },
+            }],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "name": "read_file",
+            "content": "exact result",
+        },
+    ]
+    protected = native_compact_context(agent, source, "system")
+    bind_native_compaction_tail(agent, protected)
+    request_copy = deepcopy(protected)
+    request_copy[-1]["content"] = "changed result"
+
+    with pytest.raises(ValueError, match="tail mismatch"):
+        _chat_messages_to_responses_input(
+            request_copy,
+            current_issuer_kind="openai_codex",
+            native_compaction_eligible=True,
+            native_continuity_source_messages=protected,
+        )
+
+
+def test_retained_nv1_checkpoint_without_request_repair_still_replays():
+    from agent.native_compaction import _legacy_native_continuity_boundary_fence
+
+    agent, _calls = _agent([
+        _response(_message("handoff")),
+        _response({"type": "compaction", "encrypted_content": "cp"}),
+    ])
+    protected = native_compact_context(
+        agent,
+        [
+            {"role": "assistant", "content": "old context " * 1000},
+            {"role": "user", "content": "current"},
+        ],
+        "system",
+    )
+    bind_native_compaction_tail(agent, protected)
+    metadata = protected[0]["codex_reasoning_items"][0][
+        NATIVE_COMPACTION_METADATA_KEY
+    ]
+    metadata["tail_fence"] = _legacy_native_continuity_boundary_fence(
+        protected[2:]
+    )
+
+    validate_persisted_native_compaction_history(protected)
+    wire = _chat_messages_to_responses_input(
+        protected,
+        current_issuer_kind="openai_codex",
+        native_compaction_eligible=True,
+    )
+    assert wire[:2] == [
+        {"type": "compaction", "encrypted_content": "cp"},
+        {"role": "user", "content": "handoff"},
+    ]
+
+
 def test_new_checkpoint_replay_rejects_tampered_handoff():
     agent, _calls = _agent([
         _response(_message("handoff")),
@@ -932,4 +1061,143 @@ def test_run_conversation_preserves_new_native_handoff_through_request_repair():
         checkpoint = persisted[0]["codex_reasoning_items"][0]
         metadata = checkpoint[NATIVE_COMPACTION_METADATA_KEY]
         assert persisted[1]["content"] == metadata["handoff"] == "exact model handoff"
+        db.close()
+
+
+def test_run_conversation_replays_native_checkpoint_after_real_tool_result():
+    """Mid-turn compression survives canonical repair of completed tool input."""
+    from hermes_state import SessionDB
+    from run_agent import AIAgent
+
+    sid = "native_midturn_request_repair"
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        (tmp_path / "proof.txt").write_text("blue orchid", encoding="utf-8")
+        db = SessionDB(db_path=tmp_path / "state.db")
+        db.create_session(sid, "cli", model="gpt-5.6-sol")
+        db.append_message(sid, "user", "old instruction " * 2_000)
+        db.append_message(sid, "assistant", "old result " * 2_000)
+
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}):
+            agent = AIAgent(
+                api_key="test-key",
+                base_url="https://chatgpt.com/backend-api/codex",
+                api_mode="codex_responses",
+                model="gpt-5.6-sol",
+                provider="openai-codex",
+                quiet_mode=True,
+                session_db=db,
+                session_id=sid,
+                skip_context_files=True,
+                skip_memory=True,
+                enabled_toolsets=["file_tools"],
+            )
+        agent.codex_responses_native_compaction = True
+        agent.compression_in_place = False
+        agent.runtime_capabilities = {"native_compaction": True}
+        agent.capabilities = {"native_compaction": True}
+        agent._compression_feasibility_checked = True
+        agent._disable_streaming = True
+        agent._emit_status = lambda *_args, **_kwargs: None
+        agent._emit_warning = lambda *_args, **_kwargs: None
+        agent.commit_memory_session = lambda *_args, **_kwargs: None
+        agent.context_compressor.threshold_tokens = 100
+        agent.context_compressor.should_compress_preflight = lambda _messages: False
+        compression_checks = 0
+
+        def _compress_after_tool(_tokens):
+            nonlocal compression_checks
+            compression_checks += 1
+            return bool(provider_requests)
+
+        agent.context_compressor.should_compress = _compress_after_tool
+
+        def _main_response(*items):
+            return SimpleNamespace(
+                output=list(items),
+                usage=SimpleNamespace(
+                    input_tokens=600,
+                    output_tokens=4,
+                    total_tokens=604,
+                ),
+                status="completed",
+                model="gpt-5.6-sol",
+            )
+
+        responses = [
+            _main_response(
+                SimpleNamespace(
+                    type="function_call",
+                    id="fc_1",
+                    call_id="call_1",
+                    name="search_files",
+                    arguments=(
+                        '{"target":"files","path":"'
+                        + str(tmp_path)
+                        + '","pattern":"*.txt","limit":5}'
+                    ),
+                )
+            ),
+            _response(_message("exact model handoff")),
+            _response({"type": "compaction", "encrypted_content": "checkpoint"}),
+            _main_response(
+                SimpleNamespace(
+                    type="message",
+                    content=[
+                        SimpleNamespace(type="output_text", text="MIDTURN_CANARY_OK")
+                    ],
+                )
+            ),
+        ]
+        provider_requests = []
+        agent._interruptible_api_call = lambda request: (
+            provider_requests.append(deepcopy(request)) or responses.pop(0)
+        )
+
+        with patch(
+            "hermes_cli.plugins.invoke_hook", return_value=[]
+        ), patch(
+            "hermes_cli.lifecycle.invoke_hook", return_value=[]
+        ), patch(
+            "agent.turn_context._maybe_title_session_at_turn_start", return_value=None
+        ):
+            result = agent.run_conversation(
+                "Find the proof file, then answer.",
+                conversation_history=db.get_messages_as_conversation(sid),
+            )
+
+        assert result["completed"] is True
+        assert result["final_response"] == "MIDTURN_CANARY_OK"
+        assert len(provider_requests) == 4
+        assert provider_requests[2]["context_management"] == [
+            {"type": "compaction", "compact_threshold": 100}
+        ]
+        final_input = provider_requests[3]["input"]
+        assert final_input[0] == {
+            "type": "compaction",
+            "encrypted_content": "checkpoint",
+        }
+        assert final_input[1] == {"role": "user", "content": "exact model handoff"}
+        assert sum(item.get("type") == "function_call" for item in final_input) == 1
+
+        resumed, _display = db.get_resume_conversations(agent.session_id)
+        checkpoint = resumed[0]["codex_reasoning_items"][0]
+        metadata = checkpoint[NATIVE_COMPACTION_METADATA_KEY]
+        resumed_tail = resumed[2:2 + metadata["tail_count"]]
+        live_tail = result["messages"][2:2 + metadata["tail_count"]]
+        live_row_fences = [native_continuity_boundary_fence([row]) for row in live_tail]
+        resumed_row_fences = [native_continuity_boundary_fence([row]) for row in resumed_tail]
+        assert live_row_fences == resumed_row_fences
+        assert metadata["tail_fence"] == native_continuity_boundary_fence(resumed_tail)
+        validate_persisted_native_compaction_history(resumed)
+        resumed_wire = _chat_messages_to_responses_input(
+            resumed,
+            current_issuer_kind="openai_codex",
+            native_compaction_eligible=True,
+        )
+        assert resumed_wire[0] == {
+            "type": "compaction",
+            "encrypted_content": "checkpoint",
+        }
+        assert sum(item.get("type") == "function_call" for item in resumed_wire) == 1
         db.close()

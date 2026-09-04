@@ -852,3 +852,84 @@ def test_turn_prologue_native_checkpoint_refreshes_api_tail_after_restart(in_pla
             {"role": "user", "content": expected_api_tail},
         ]
         restarted_db.close()
+
+
+def test_run_conversation_preserves_new_native_handoff_through_request_repair():
+    """The first live request must not merge the handoff into the active user."""
+    from hermes_state import SessionDB
+    from run_agent import AIAgent
+
+    sid = "native_live_request_repair"
+    with tempfile.TemporaryDirectory() as tmp:
+        db = SessionDB(db_path=Path(tmp) / "state.db")
+        db.create_session(sid, "cli", model="gpt-5.6-sol")
+        db.append_message(sid, "user", "old instruction " * 2_000)
+        db.append_message(sid, "assistant", "old result " * 2_000)
+
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}):
+            agent = AIAgent(
+                api_key="test-key",
+                base_url="https://chatgpt.com/backend-api/codex",
+                api_mode="codex_responses",
+                model="gpt-5.6-sol",
+                provider="openai-codex",
+                quiet_mode=True,
+                session_db=db,
+                session_id=sid,
+                skip_context_files=True,
+                skip_memory=True,
+                enabled_toolsets=[],
+            )
+        agent.codex_responses_native_compaction = True
+        agent.compression_in_place = True
+        agent.runtime_capabilities = {"native_compaction": True}
+        agent.capabilities = {"native_compaction": True}
+        agent._compression_feasibility_checked = True
+        agent._disable_streaming = True
+        agent._emit_status = lambda *_args, **_kwargs: None
+        agent._emit_warning = lambda *_args, **_kwargs: None
+        agent.commit_memory_session = lambda *_args, **_kwargs: None
+        agent.context_compressor.threshold_tokens = 100
+        agent.context_compressor.should_compress_preflight = lambda _messages: True
+
+        responses = [
+            _response(_message("exact model handoff")),
+            _response({"type": "compaction", "encrypted_content": "checkpoint"}),
+            SimpleNamespace(
+                output=[
+                    SimpleNamespace(
+                        type="message",
+                        content=[SimpleNamespace(type="output_text", text="START_CANARY_OK")],
+                    )
+                ],
+                usage=SimpleNamespace(input_tokens=600, output_tokens=4, total_tokens=604),
+                status="completed",
+                model="gpt-5.6-sol",
+            ),
+        ]
+        provider_requests = []
+        agent._interruptible_api_call = lambda request: (
+            provider_requests.append(deepcopy(request)) or responses.pop(0)
+        )
+
+        with patch(
+            "hermes_cli.plugins.invoke_hook", return_value=[]
+        ), patch(
+            "hermes_cli.lifecycle.invoke_hook", return_value=[]
+        ), patch(
+            "agent.turn_context._maybe_title_session_at_turn_start", return_value=None
+        ):
+            result = agent.run_conversation(
+                "Return exactly START_CANARY_OK.",
+                conversation_history=db.get_messages_as_conversation(sid),
+            )
+
+        assert result["completed"] is True
+        assert result["final_response"] == "START_CANARY_OK"
+        assert len(provider_requests) == 3
+        persisted, _display = db.get_resume_conversations(sid)
+        validate_persisted_native_compaction_history(persisted)
+        checkpoint = persisted[0]["codex_reasoning_items"][0]
+        metadata = checkpoint[NATIVE_COMPACTION_METADATA_KEY]
+        assert persisted[1]["content"] == metadata["handoff"] == "exact model handoff"
+        db.close()

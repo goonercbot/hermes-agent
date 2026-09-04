@@ -2281,12 +2281,23 @@ def run_conversation(
         # on assistant messages with tool_calls. We handle both cases here.
         request_logger = getattr(agent, "logger", None) or logging.getLogger(__name__)
         _native_continuity_source_messages = messages
-        _native_boundary_request = False
+        from agent.native_compaction import validate_persisted_native_compaction_history
+
+        # A valid protected checkpoint needs an immutable validation source on
+        # every replay, not only while the producer capability is still live.
+        # The turn prologue intentionally consumes that capability before the
+        # first provider request, while ordinary role repair would otherwise
+        # merge the handoff user row with the adjacent active user row.
+        _native_boundary_request = bool(
+            validate_persisted_native_compaction_history(messages)
+        )
         _request_current_turn_user_idx = current_turn_user_idx
         if _native_boundary_request:
-            # Every request-side sanitizer receives a disposable deep copy.
-            # The durable prefix/user objects captured by the boundary must
-            # never be merged, dropped, or rewritten during wire repair.
+            # The protected handoff and the current user are deliberately
+            # adjacent user rows. Repair may merge consecutive user rows for
+            # ordinary histories, so every request-side sanitizer must receive
+            # a disposable copy while the exact durable boundary remains the
+            # adapter's validation source.
             messages = deepcopy(messages)
         # Per-agent validation cursor: skips re-json.loads-ing tool_call
         # arguments on history messages already validated in a previous

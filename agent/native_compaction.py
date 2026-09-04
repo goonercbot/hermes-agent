@@ -23,16 +23,15 @@ Hermes' support is deliberately narrow (live verification, Aug 2026):
   most would 400 on the unknown parameter, and none can mint or decrypt
   the compaction blob.
 
-Ownership model: Hermes' existing ``ContextCompressor.threshold_tokens`` is the
-only trigger. On that crossing, Hermes adds one deterministic, validated,
-source-verbatim handoff immediately before the triggering user and sends the
-same complete request once with native compaction enabled. A valid encrypted
-checkpoint, handoff, and triggering user are then committed as one hidden
-continuity boundary. Compatible later requests replay that boundary without
-emitting ``context_management`` again. Any preparation, transport, checkpoint,
-commit, or replay failure restores the original durable prefix and fails closed;
-there is no threshold margin, local-summary fallback, model-authored handoff,
-or second protected request.
+Ownership model: Hermes' existing ``ContextCompressor.threshold_tokens`` decides
+when the request carries the server-compaction option and a deterministic,
+validated, source-verbatim handoff. Codex alone decides whether that request
+actually crosses its rendered-token threshold. A normal response without a
+checkpoint is accepted unchanged. Only a returned encrypted checkpoint commits
+the handoff and triggering user as one hidden continuity boundary. Malformed
+checkpoint material, commit failure, and replay failure still fail closed; there
+is no threshold margin, local-summary fallback, model-authored handoff, or
+second protected request.
 
 This module stays free of transport/adapter dependencies so the transport,
 adapter, and conversation loop can share the gate without import cycles. The
@@ -461,7 +460,7 @@ def attach_protected_handoff(
         not isinstance(checkpoint, dict)
         or checkpoint.get("type") != "compaction"
         or not isinstance(encrypted, str)
-        or not encrypted
+        or not encrypted.strip()
     ):
         raise ValueError("handoff requires a valid native checkpoint")
     attached = dict(checkpoint)
@@ -530,7 +529,7 @@ class NativeContinuitySeed:
 
 @dataclass(frozen=True)
 class NativeContinuityBoundary:
-    """Immutable custody record for one threshold-crossing request."""
+    """Immutable candidate boundary for one compaction-enabled request."""
 
     snapshot: List[Dict[str, Any]]
     triggering_user: Dict[str, Any]
@@ -717,7 +716,7 @@ def _native_checkpoint(checkpoint: Any, boundary: NativeContinuityBoundary) -> D
     if not isinstance(checkpoint, dict) or checkpoint.get("type") != "compaction":
         raise ValueError("native compaction checkpoint missing")
     encrypted = checkpoint.get("encrypted_content")
-    if not isinstance(encrypted, str) or not encrypted:
+    if not isinstance(encrypted, str) or not encrypted.strip():
         raise ValueError("native compaction checkpoint is invalid")
     parse_native_continuity_handoff(
         boundary.canonical_handoff,
@@ -776,7 +775,7 @@ def prepare_native_continuity_request(
     *,
     api_kwargs: Dict[str, Any],
 ) -> bool:
-    """Measure and inject a pending boundary at the final disposable wire edge."""
+    """Measure and inject a candidate boundary at the final disposable wire edge."""
     if getattr(agent, "_native_continuity_pending", None) is not None:
         return False
     seed = getattr(agent, "_native_continuity_candidate", None)
@@ -857,6 +856,50 @@ def fail_native_continuity(agent: Any) -> List[Dict[str, Any]]:
     if isinstance(seed, NativeContinuitySeed):
         return deepcopy(seed.snapshot)
     return []
+
+
+def release_native_continuity_without_checkpoint(
+    agent: Any,
+) -> Optional[List[Dict[str, Any]]]:
+    """Restore the ordinary durable turn when Codex chose not to compact."""
+    boundary = getattr(agent, "_native_continuity_pending", None)
+    if not isinstance(boundary, NativeContinuityBoundary):
+        return None
+    released_user = _boundary_committed_user(boundary)
+    if released_user.get("api_content") == released_user.get("content"):
+        released_user.pop("api_content", None)
+    released = deepcopy(boundary.snapshot) + [released_user]
+    agent._native_continuity_pending = None
+    agent._native_continuity_candidate = None
+    agent._native_continuity_emit_context_management = False
+    agent._native_continuity_defer_user_persistence = False
+    agent._persist_user_message_idx = len(boundary.snapshot)
+    return released
+
+
+def response_has_valid_native_checkpoint(response: Any) -> bool:
+    """Return whether Codex emitted one valid checkpoint; reject malformed output."""
+    output = getattr(response, "output", None)
+    if not isinstance(output, list):
+        return False
+    checkpoints: List[Any] = []
+    for item in output:
+        item_type = item.get("type") if isinstance(item, dict) else getattr(item, "type", None)
+        if item_type == "compaction":
+            checkpoints.append(item)
+    if not checkpoints:
+        return False
+    if len(checkpoints) != 1:
+        raise ValueError("expected exactly one native compaction checkpoint")
+    checkpoint = checkpoints[0]
+    encrypted = (
+        checkpoint.get("encrypted_content")
+        if isinstance(checkpoint, dict)
+        else getattr(checkpoint, "encrypted_content", None)
+    )
+    if not isinstance(encrypted, str) or not encrypted.strip():
+        raise ValueError("native compaction checkpoint is invalid")
+    return True
 
 
 def commit_native_continuity(agent: Any, assistant_message: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:

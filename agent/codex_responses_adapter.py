@@ -600,7 +600,7 @@ def _chat_messages_to_responses_input(
                                 )
                                 or ri.get("type") != "compaction"
                                 or not isinstance(ri.get("encrypted_content"), str)
-                                or not ri["encrypted_content"]
+                                or not ri["encrypted_content"].strip()
                             )
                         ):
                             raise ValueError(

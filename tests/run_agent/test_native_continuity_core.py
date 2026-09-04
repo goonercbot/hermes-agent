@@ -18,7 +18,9 @@ from agent.native_compaction import (
     parse_native_continuity_handoff,
     prepare_native_continuity_request,
     protected_handoff_wire_item,
+    release_native_continuity_without_checkpoint,
     resolve_native_compaction_capabilities,
+    response_has_valid_native_checkpoint,
 )
 
 
@@ -193,12 +195,31 @@ def test_checkpoint_commit_restores_immutable_boundary_and_orders_carrier_before
     assert agent._native_continuity_pending is None
 
 
-def test_missing_checkpoint_rolls_back_to_pre_trigger_snapshot():
+def test_missing_checkpoint_releases_the_ordinary_user_turn():
     agent = _agent(threshold=1)
     _messages, _kwargs = _prepared(agent)
     original_snapshot = deepcopy(list(agent._native_continuity_pending.snapshot))
-    assistant = {"role": "assistant", "content": "continued"}
 
-    assert commit_native_continuity(agent, assistant) is None
-    assert fail_native_continuity(agent) == original_snapshot
+    released = release_native_continuity_without_checkpoint(agent)
+
+    assert released == original_snapshot + [
+        {"role": "user", "content": "triggering user"}
+    ]
     assert agent._native_continuity_pending is None
+    assert agent._native_continuity_defer_user_persistence is False
+    assert agent._persist_user_message_idx == len(original_snapshot)
+
+
+def test_native_checkpoint_response_validation_distinguishes_absence_from_malformed():
+    absent = SimpleNamespace(output=[SimpleNamespace(type="message")])
+    valid = SimpleNamespace(
+        output=[SimpleNamespace(type="compaction", encrypted_content="checkpoint")]
+    )
+    malformed = SimpleNamespace(
+        output=[SimpleNamespace(type="compaction", encrypted_content="")]
+    )
+
+    assert response_has_valid_native_checkpoint(absent) is False
+    assert response_has_valid_native_checkpoint(valid) is True
+    with pytest.raises(ValueError, match="checkpoint is invalid"):
+        response_has_valid_native_checkpoint(malformed)

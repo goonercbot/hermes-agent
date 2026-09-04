@@ -3849,6 +3849,28 @@ def run_conversation(
 
                 agent._turn_received_provider_response = True
 
+                # A local estimate only decides whether Hermes offers native
+                # compaction and includes the deterministic handoff. Codex's
+                # actual response decides whether a protected boundary exists.
+                # No checkpoint is a normal response, not evidence of loss.
+                if getattr(agent, "_native_continuity_pending", None) is not None:
+                    try:
+                        from agent.native_compaction import (
+                            release_native_continuity_without_checkpoint,
+                            response_has_valid_native_checkpoint,
+                        )
+
+                        if not response_has_valid_native_checkpoint(response):
+                            _released = release_native_continuity_without_checkpoint(agent)
+                            if _released is None:
+                                raise ValueError("native continuity candidate unavailable")
+                            messages[:] = _released
+                            agent._session_messages = messages
+                    except Exception:
+                        return _terminal_native_continuity_failure(
+                            agent, messages, api_call_count
+                        )
+
                 # Check finish_reason before proceeding
                 if agent.api_mode == "codex_responses":
                     status = getattr(response, "status", None)
@@ -7170,9 +7192,9 @@ def run_conversation(
             assistant_message = normalized
             finish_reason = normalized.finish_reason
 
-            # The provider response is the only commit authority for a pending
-            # boundary. Validate and install its checkpoint carrier before any
-            # normal assistant/tool/retry path can persist a turn fragment.
+            # A valid provider checkpoint is the only commit authority for a
+            # pending boundary. Normal no-checkpoint responses released the
+            # candidate above and continue through the ordinary response path.
             if getattr(agent, "_native_continuity_pending", None) is not None:
                 try:
                     if finish_reason != "stop":

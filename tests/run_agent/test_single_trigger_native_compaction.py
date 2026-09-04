@@ -17,7 +17,12 @@ from agent.native_compaction import (
 )
 
 
-def _raw_response(*, checkpoint: str | None, text: str = "continued"):
+def _raw_response(
+    *,
+    checkpoint: object | None,
+    text: str = "continued",
+    input_tokens: int | None = None,
+):
     output = [
         SimpleNamespace(
             type="reasoning",
@@ -42,7 +47,19 @@ def _raw_response(*, checkpoint: str | None, text: str = "continued"):
             content=[SimpleNamespace(type="output_text", text=text)],
         )
     )
-    return SimpleNamespace(status="completed", output=output, error=None)
+    usage = None
+    if input_tokens is not None:
+        usage = SimpleNamespace(
+            input_tokens=input_tokens,
+            output_tokens=42,
+            total_tokens=input_tokens + 42,
+        )
+    return SimpleNamespace(
+        status="completed",
+        output=output,
+        error=None,
+        usage=usage,
+    )
 
 
 def _real_agent(monkeypatch):
@@ -265,7 +282,12 @@ def test_real_replay_validates_untouched_durable_source_before_tool_argument_rep
 
 @pytest.mark.parametrize(
     "malformation",
-    ["non-dict-metadata", "missing-ciphertext", "wrong-item-type"],
+    [
+        "non-dict-metadata",
+        "missing-ciphertext",
+        "whitespace-ciphertext",
+        "wrong-item-type",
+    ],
 )
 def test_real_replay_rejects_every_malformed_protected_checkpoint_before_call(
     monkeypatch,
@@ -277,6 +299,8 @@ def test_real_replay_rejects_every_malformed_protected_checkpoint_before_call(
         checkpoint[NATIVE_CONTINUITY_METADATA_KEY] = "malformed"
     elif malformation == "missing-ciphertext":
         checkpoint.pop("encrypted_content")
+    elif malformation == "whitespace-ciphertext":
+        checkpoint["encrypted_content"] = " \t"
     else:
         checkpoint["type"] = "reasoning"
 
@@ -351,13 +375,54 @@ def test_real_run_conversation_sends_one_exact_boundary_and_commits_checkpoint(
     ]
 
 
-def test_real_run_missing_checkpoint_is_one_attempt_and_preserves_prefix(monkeypatch):
+def test_real_run_accepts_normal_no_checkpoint_response_when_local_estimate_crosses(
+    monkeypatch,
+):
+    agent = _real_agent(monkeypatch)
+    getattr(agent, "context_compressor").threshold_tokens = 231_200
+    calls = []
+
+    monkeypatch.setattr(
+        "agent.model_metadata.estimate_request_tokens_rough",
+        lambda *_args, **_kwargs: 261_589,
+    )
+
+    def fake_call(api_kwargs):
+        calls.append(deepcopy(api_kwargs))
+        return _raw_response(checkpoint=None, input_tokens=178_222)
+
+    agent._interruptible_api_call = fake_call
+    history = [{"role": "user", "content": "durable prefix"}]
+    result = agent.run_conversation("triggering user", conversation_history=history)
+
+    assert len(calls) == 1
+    assert calls[0]["context_management"] == [
+        {"type": "compaction", "compact_threshold": 231_200}
+    ]
+    assert result["completed"] is True
+    assert result["final_response"] == "continued"
+    assert [message["role"] for message in result["messages"][-2:]] == [
+        "user",
+        "assistant",
+    ]
+    assert result["messages"][-2]["content"] == "triggering user"
+    assert result["messages"][-1]["content"] == "continued"
+    assert all(
+        message.get("display_kind") != "hidden"
+        for message in result["messages"]
+    )
+    assert getattr(agent, "_native_continuity_pending") is None
+    assert getattr(agent, "_native_continuity_defer_user_persistence") is False
+
+
+@pytest.mark.parametrize("checkpoint", ["", " \t"])
+def test_real_run_rejects_malformed_returned_checkpoint(monkeypatch, checkpoint):
     agent = _real_agent(monkeypatch)
     calls = []
 
-    def fake_call(kwargs):
-        calls.append(deepcopy(kwargs))
-        return _raw_response(checkpoint=None)
+    def fake_call(api_kwargs):
+        calls.append(deepcopy(api_kwargs))
+        return _raw_response(checkpoint=checkpoint)
 
     agent._interruptible_api_call = fake_call
     history = [{"role": "user", "content": "durable prefix"}]

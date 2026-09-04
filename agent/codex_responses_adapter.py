@@ -542,6 +542,13 @@ def _chat_messages_to_responses_input(
     prefix and triggering-user fences before any wire pruning occurs.
     """
     items: List[Dict[str, Any]] = []
+    # This must precede every conversion, estimate, repair, compression, and
+    # provider construction. A v2 metadata key is protected by presence, not
+    # truthiness, so malformed scalar/list/null values cannot fall through to
+    # an ordinary/local compression path.
+    from agent.native_compaction import validate_persisted_native_compaction_history
+
+    protected_native_handoffs = validate_persisted_native_compaction_history(messages)
     # Parallel to `items`: the raw chat message each converted item came
     # from. Pruning needs this to read a canonical summary carrier's
     # up-to-date, provenance-tagged content directly — the converted `item`
@@ -585,6 +592,7 @@ def _chat_messages_to_responses_input(
                 if isinstance(codex_reasoning, list):
                     from agent.native_compaction import (
                         NATIVE_CONTINUITY_METADATA_KEY,
+                        NATIVE_COMPACTION_METADATA_KEY,
                         PROTECTED_HANDOFF_METADATA_KEY,
                         native_continuity_handoff_from_checkpoint,
                         protected_handoff_from_checkpoint,
@@ -669,10 +677,19 @@ def _chat_messages_to_responses_input(
                                 }
                                 metadata = ri.get(PROTECTED_HANDOFF_METADATA_KEY)
                                 native_metadata = ri.get(NATIVE_CONTINUITY_METADATA_KEY)
+                                native_compaction_metadata = ri.get(NATIVE_COMPACTION_METADATA_KEY)
                                 if isinstance(metadata, dict):
                                     replay_item[PROTECTED_HANDOFF_METADATA_KEY] = metadata
                                 if isinstance(native_metadata, dict):
                                     replay_item[NATIVE_CONTINUITY_METADATA_KEY] = native_metadata
+                                if NATIVE_COMPACTION_METADATA_KEY in ri:
+                                    _validated_handoff = protected_native_handoffs.get(id(ri))
+                                    if not isinstance(_validated_handoff, str):
+                                        raise ValueError(
+                                            "protected native compaction checkpoint failed boundary validation"
+                                        )
+                                    replay_item["_hermes_native_handoff"] = _validated_handoff
+                                    has_protected_compaction_handoff = True
                                 if isinstance(metadata, dict) or isinstance(native_metadata, dict):
                                     if isinstance(native_metadata, dict):
                                         validation_messages = messages

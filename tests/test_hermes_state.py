@@ -4681,6 +4681,108 @@ class TestLoneSurrogatePersistence:
 
 
 
+class TestInPlaceNativeCompactionSidecar:
+    @staticmethod
+    def _checkpoint(encrypted_content="checkpoint"):
+        return {
+            "type": "compaction",
+            "encrypted_content": encrypted_content,
+            "_hermes_native_compaction": {
+                "version": 2,
+                "identity": "attempt-1",
+                "handoff": "exact handoff",
+                "tail_fence": "old tail fence",
+                "tail_count": 1,
+            },
+        }
+
+    def _seed(self, db, checkpoint=None):
+        db.create_session("s1", source="cli")
+        db.append_message(
+            "s1",
+            "assistant",
+            "",
+            codex_reasoning_items=[checkpoint or self._checkpoint()],
+        )
+        db.append_message("s1", "user", "current user")
+
+    def test_updates_api_content_and_checkpoint_as_one_transaction(self, db):
+        self._seed(db)
+        original = self._checkpoint()
+        refreshed = self._checkpoint()
+        refreshed["_hermes_native_compaction"]["tail_fence"] = "final tail fence"
+        refreshed["_hermes_native_compaction"]["tail_count"] = 2
+
+        db.set_in_place_native_compaction_api_content(
+            "s1", user_content="current user", api_content="current user\n\nPLUGIN",
+            identity="attempt-1", encrypted_content="checkpoint",
+            old_metadata=original["_hermes_native_compaction"],
+            new_metadata=refreshed["_hermes_native_compaction"],
+        )
+
+        messages = db.get_messages_as_conversation("s1")
+        assert messages[0]["codex_reasoning_items"] == [refreshed]
+        assert messages[1]["api_content"] == "current user\n\nPLUGIN"
+
+    def test_checkpoint_mismatch_rolls_back_user_sidecar(self, db):
+        self._seed(db, self._checkpoint("stored checkpoint"))
+        before = db.get_messages_as_conversation("s1")
+
+        with pytest.raises(ValueError, match="carrier is missing or ambiguous"):
+            db.set_in_place_native_compaction_api_content(
+                "s1", user_content="current user", api_content="current user\n\nPLUGIN",
+                identity="attempt-1", encrypted_content="checkpoint",
+                old_metadata=self._checkpoint()["_hermes_native_compaction"],
+                new_metadata=self._checkpoint()["_hermes_native_compaction"],
+            )
+
+        assert db.get_messages_as_conversation("s1") == before
+
+    def test_ambiguous_checkpoint_rolls_back_user_sidecar(self, db):
+        self._seed(db)
+        db.append_message(
+            "s1",
+            "assistant",
+            "",
+            codex_reasoning_items=[self._checkpoint()],
+        )
+        before = db.get_messages_as_conversation("s1")
+
+        with pytest.raises(ValueError, match="carrier is missing or ambiguous"):
+            db.set_in_place_native_compaction_api_content(
+                "s1", user_content="current user", api_content="current user\n\nPLUGIN",
+                identity="attempt-1", encrypted_content="checkpoint",
+                old_metadata=self._checkpoint()["_hermes_native_compaction"],
+                new_metadata=self._checkpoint()["_hermes_native_compaction"],
+            )
+
+        assert db.get_messages_as_conversation("s1") == before
+
+    def test_checkpoint_update_error_rolls_back_user_sidecar(self, db):
+        self._seed(db)
+        original = self._checkpoint()
+        refreshed = self._checkpoint()
+        refreshed["_hermes_native_compaction"]["tail_fence"] = "final tail fence"
+        before = db.get_messages_as_conversation("s1")
+        db._execute_write(
+            lambda conn: conn.execute(
+                "CREATE TRIGGER fail_native_checkpoint_update "
+                "BEFORE UPDATE OF codex_reasoning_items ON messages "
+                "BEGIN SELECT RAISE(ABORT, 'test checkpoint rollback'); END"
+            )
+        )
+
+        with pytest.raises(sqlite3.IntegrityError, match="test checkpoint rollback"):
+            db.set_in_place_native_compaction_api_content(
+                "s1", user_content="current user", api_content="current user\n\nPLUGIN",
+                identity="attempt-1", encrypted_content="checkpoint",
+                old_metadata=original["_hermes_native_compaction"],
+                new_metadata=refreshed["_hermes_native_compaction"],
+            )
+
+        assert db.get_messages_as_conversation("s1") == before
+
+
 class TestDisplayMetadataPersistence:
     """Round-trip display_kind/display_metadata through every write path."""
 

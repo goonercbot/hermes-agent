@@ -2850,10 +2850,7 @@ def init_agent(
     agent.codex_app_server_auto_compaction = codex_app_server_auto_compaction
     agent.codex_responses_native_compaction = codex_responses_native_compaction
     agent.codex_responses_compact_threshold = codex_responses_compact_threshold
-    agent._native_continuity_candidate = None
-    agent._native_continuity_pending = None
-    agent._native_continuity_emit_context_management = False
-    agent._native_continuity_defer_user_persistence = False
+    agent._native_compaction_attempt = None
     from agent.native_compaction import resolve_native_compaction_capabilities
     agent.runtime_capabilities = resolve_native_compaction_capabilities(
         model=agent.model,

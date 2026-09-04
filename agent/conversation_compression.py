@@ -3814,6 +3814,20 @@ def compress_context(
                         # run_agent.py keeps both views aligned.
                         agent._persist_user_message_idx = len(messages)
 
+        from agent.native_compaction import native_compact_context, native_continuity_capable
+        from agent.codex_responses_adapter import classify_responses_route
+
+        _native_route = classify_responses_route(agent) if getattr(agent, "api_mode", None) == "codex_responses" else None
+        _use_native_compressor = bool(
+            _native_route is not None
+            and native_continuity_capable(
+                agent,
+                is_codex_backend=_native_route.is_codex_backend,
+                is_xai_responses=_native_route.is_xai_responses,
+                is_github_responses=_native_route.is_github_responses,
+            )
+        )
+
         # Notify external memory provider before compression discards context.
         # The provider's on_pre_compress() may return a string of insights it
         # wants surfaced inside the compression summary; capture and forward it
@@ -3824,7 +3838,7 @@ def compress_context(
         # normalized evidence list is handed only to API v2+ checkpoint
         # providers inside MemoryManager.on_pre_compress().
         evidence_messages = _direct_messages_for_pre_compress_memory(messages)
-        if checkpoint_required:
+        if checkpoint_required and not _use_native_compressor:
             supports_checkpoint = getattr(
                 memory_manager, "supports_pre_compress_checkpoint", None
             )
@@ -3956,7 +3970,15 @@ def compress_context(
                 with aux_progress_hook(_progress_hook), aux_interrupt_protection(
                     cancel_event=_hard_cancel_event
                 ):
-                    compressed = compress_fn(messages, **compress_kwargs)
+                    if _use_native_compressor:
+                        # The shared destructive seam owns the complete two-call
+                        # lifecycle. No turn-boundary candidate or final-wire
+                        # side path may arm native compaction.
+                        agent.context_compressor._last_compress_aborted = False
+                        agent.context_compressor._last_summary_error = None
+                        compressed = native_compact_context(agent, messages, system_message)
+                    else:
+                        compressed = compress_fn(messages, **compress_kwargs)
                     # Freeze a hard stop that arrived after the final provider
                     # attempt unwound but before this transaction can rotate
                     # session state.
@@ -4393,6 +4415,11 @@ def compress_context(
         compressed_user_turn_outcome = _ensure_compressed_has_user_turn(
             messages, compressed
         )
+        # api_content/TODO/user-tail composition is now final.  Only the
+        # identity minted by this exact native operation may receive the fence;
+        # retained checkpoints are intentionally never discovered or rebound.
+        from agent.native_compaction import bind_native_compaction_tail
+        bind_native_compaction_tail(agent, compressed)
 
         cached_system_prompt = agent._cached_system_prompt
         agent._invalidate_system_prompt()

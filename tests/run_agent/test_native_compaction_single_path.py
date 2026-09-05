@@ -983,12 +983,13 @@ def test_turn_prologue_native_checkpoint_refreshes_api_tail_after_restart(in_pla
         restarted_db.close()
 
 
-def test_run_conversation_preserves_new_native_handoff_through_request_repair():
+@pytest.mark.parametrize("in_place", [True, False])
+def test_run_conversation_preserves_new_native_handoff_through_request_repair(in_place):
     """The first live request must not merge the handoff into the active user."""
     from hermes_state import SessionDB
     from run_agent import AIAgent
 
-    sid = "native_live_request_repair"
+    sid = f"native_live_request_repair_{in_place}"
     with tempfile.TemporaryDirectory() as tmp:
         db = SessionDB(db_path=Path(tmp) / "state.db")
         db.create_session(sid, "cli", model="gpt-5.6-sol")
@@ -1010,7 +1011,7 @@ def test_run_conversation_preserves_new_native_handoff_through_request_repair():
                 enabled_toolsets=[],
             )
         agent.codex_responses_native_compaction = True
-        agent.compression_in_place = True
+        setattr(agent, "compression_in_place", in_place)
         agent.runtime_capabilities = {"native_compaction": True}
         agent.capabilities = {"native_compaction": True}
         agent._compression_feasibility_checked = True
@@ -1022,7 +1023,7 @@ def test_run_conversation_preserves_new_native_handoff_through_request_repair():
         agent.context_compressor.should_compress_preflight = lambda _messages: True
 
         responses = [
-            _response(_message("exact model handoff")),
+            _response(_message("exact model handoff\n")),
             _response({"type": "compaction", "encrypted_content": "checkpoint"}),
             SimpleNamespace(
                 output=[
@@ -1032,6 +1033,17 @@ def test_run_conversation_preserves_new_native_handoff_through_request_repair():
                     )
                 ],
                 usage=SimpleNamespace(input_tokens=600, output_tokens=4, total_tokens=604),
+                status="completed",
+                model="gpt-5.6-sol",
+            ),
+            SimpleNamespace(
+                output=[
+                    SimpleNamespace(
+                        type="message",
+                        content=[SimpleNamespace(type="output_text", text="SECOND_CANARY_OK")],
+                    )
+                ],
+                usage=SimpleNamespace(input_tokens=640, output_tokens=4, total_tokens=644),
                 status="completed",
                 model="gpt-5.6-sol",
             ),
@@ -1056,11 +1068,40 @@ def test_run_conversation_preserves_new_native_handoff_through_request_repair():
         assert result["completed"] is True
         assert result["final_response"] == "START_CANARY_OK"
         assert len(provider_requests) == 3
-        persisted, _display = db.get_resume_conversations(sid)
+        validate_persisted_native_compaction_history(result["messages"])
+        live_checkpoint = result["messages"][0]["codex_reasoning_items"][0]
+        assert result["messages"][1]["content"] == (
+            live_checkpoint[NATIVE_COMPACTION_METADATA_KEY]["handoff"]
+        )
+        persisted, _display = db.get_resume_conversations(agent.session_id)
         validate_persisted_native_compaction_history(persisted)
         checkpoint = persisted[0]["codex_reasoning_items"][0]
         metadata = checkpoint[NATIVE_COMPACTION_METADATA_KEY]
-        assert persisted[1]["content"] == metadata["handoff"] == "exact model handoff"
+        assert persisted[1]["content"] == metadata["handoff"] == "exact model handoff\n"
+
+        getattr(agent, "context_compressor").should_compress_preflight = lambda _messages: False
+        with patch(
+            "hermes_cli.plugins.invoke_hook", return_value=[]
+        ), patch(
+            "hermes_cli.lifecycle.invoke_hook", return_value=[]
+        ), patch(
+            "agent.turn_context._maybe_title_session_at_turn_start", return_value=None
+        ):
+            second_result = agent.run_conversation(
+                "Return exactly SECOND_CANARY_OK.",
+                conversation_history=result["messages"],
+            )
+
+        assert second_result["completed"] is True
+        assert second_result["final_response"] == "SECOND_CANARY_OK"
+        assert len(provider_requests) == 4
+        validate_persisted_native_compaction_history(second_result["messages"])
+        validate_persisted_native_compaction_history(agent._session_messages)
+        assert agent._session_messages == second_result["messages"]
+        second_checkpoint = second_result["messages"][0]["codex_reasoning_items"][0]
+        assert second_result["messages"][1]["content"] == (
+            second_checkpoint[NATIVE_COMPACTION_METADATA_KEY]["handoff"]
+        )
         db.close()
 
 

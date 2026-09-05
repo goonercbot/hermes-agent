@@ -984,7 +984,10 @@ def test_turn_prologue_native_checkpoint_refreshes_api_tail_after_restart(in_pla
 
 
 @pytest.mark.parametrize("in_place", [True, False])
-def test_run_conversation_preserves_new_native_handoff_through_request_repair(in_place):
+@pytest.mark.parametrize("checkpoint_first", [False, True])
+def test_run_conversation_preserves_new_native_handoff_through_request_repair(
+    in_place, checkpoint_first
+):
     """The first live request must not merge the handoff into the active user."""
     from hermes_state import SessionDB
     from run_agent import AIAgent
@@ -1022,9 +1025,18 @@ def test_run_conversation_preserves_new_native_handoff_through_request_repair(in
         agent.context_compressor.threshold_tokens = 100
         agent.context_compressor.should_compress_preflight = lambda _messages: True
 
-        responses = [
-            _response(_message("exact model handoff\n")),
-            _response({"type": "compaction", "encrypted_content": "checkpoint"}),
+        compaction_responses = (
+            [
+                _response({"type": "compaction", "encrypted_content": "checkpoint"}),
+                _response(_message("exact model handoff\n")),
+            ]
+            if checkpoint_first
+            else [
+                _response(_message("exact model handoff\n")),
+                _response({"type": "compaction", "encrypted_content": "checkpoint"}),
+            ]
+        )
+        responses = compaction_responses + [
             SimpleNamespace(
                 output=[
                     SimpleNamespace(
@@ -1068,6 +1080,17 @@ def test_run_conversation_preserves_new_native_handoff_through_request_repair(in
         assert result["completed"] is True
         assert result["final_response"] == "START_CANARY_OK"
         assert len(provider_requests) == 3
+        if checkpoint_first:
+            assert provider_requests[1]["input"] == [
+                {"type": "compaction", "encrypted_content": "checkpoint"}
+            ]
+            assert "context_management" not in provider_requests[1]
+        first_normal_input = provider_requests[2]["input"]
+        assert first_normal_input[0] == {
+            "type": "compaction", "encrypted_content": "checkpoint"
+        }
+        assert first_normal_input[1]["content"] == "exact model handoff\n"
+        assert first_normal_input[-1]["content"] == "Return exactly START_CANARY_OK."
         validate_persisted_native_compaction_history(result["messages"])
         live_checkpoint = result["messages"][0]["codex_reasoning_items"][0]
         assert result["messages"][1]["content"] == (

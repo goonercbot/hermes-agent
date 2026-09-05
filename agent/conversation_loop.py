@@ -2669,8 +2669,23 @@ def run_conversation(
         # (llama.cpp, vLLM, Ollama) and improves cache hit rates for
         # cloud providers.  Operates on api_messages (the API copy) so
         # the original conversation history in `messages` is untouched.
-        for am in api_messages:
-            if isinstance(am.get("content"), str):
+        # A valid native checkpoint seals its carrier, exact handoff, and
+        # tail bytes. Preserve only that validated span; every other message
+        # keeps the ordinary normalization behavior.
+        _protected_native_indices: set[int] = set()
+        if _native_boundary_request:
+            from agent.native_compaction import (
+                native_compaction_protected_message_indices,
+            )
+
+            _protected_native_indices = native_compaction_protected_message_indices(
+                api_messages
+            )
+        for _api_index, am in enumerate(api_messages):
+            if (
+                _api_index not in _protected_native_indices
+                and isinstance(am.get("content"), str)
+            ):
                 am["content"] = am["content"].strip()
         _canonicalize_api_tool_calls(api_messages)
 

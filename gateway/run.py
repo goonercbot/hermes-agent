@@ -1836,8 +1836,26 @@ def _build_gateway_agent_history(
     agent_history: List[Dict[str, Any]] = []
     observed_group_context: List[str] = []
     separate_observed_context = _uses_telegram_observed_group_context(channel_prompt)
+    from agent.native_compaction import native_compaction_protected_message_indices
 
-    for msg in history or []:
+    protected_history_indices = native_compaction_protected_message_indices(
+        history or []
+    )
+
+    for history_index, msg in enumerate(history or []):
+        if history_index in protected_history_indices:
+            # The native checkpoint seals this carrier/handoff/tail span.
+            # Keep content and replay fields byte-exact; timestamp/observed are
+            # gateway bookkeeping and are never provider payload fields.
+            agent_history.append(
+                {
+                    key: value
+                    for key, value in msg.items()
+                    if key not in {"timestamp", "observed"}
+                }
+            )
+            continue
+
         role = msg.get("role")
         if not role:
             continue
@@ -1863,8 +1881,17 @@ def _build_gateway_agent_history(
         has_tool_calls = "tool_calls" in msg
         has_tool_call_id = "tool_call_id" in msg
         is_tool_message = role == "tool"
+        has_assistant_replay_state = (
+            role == "assistant"
+            and any(field in msg for field in _ASSISTANT_REPLAY_FIELDS)
+        )
 
-        if has_tool_calls or has_tool_call_id or is_tool_message:
+        if (
+            has_tool_calls
+            or has_tool_call_id
+            or is_tool_message
+            or has_assistant_replay_state
+        ):
             clean_msg = {k: v for k, v in msg.items() if k not in {"timestamp", "observed"}}
             agent_history.append(clean_msg)
         elif content:
@@ -1889,25 +1916,24 @@ def _build_gateway_agent_history(
             entry = _build_replay_entry(role, content, msg, preserve_timestamp=(role == "user"))
             agent_history.append(entry)
 
-    # Strip interrupted tool-call tails so the LLM doesn't re-execute
-    # tools that were killed mid-flight.
-    agent_history = strip_interrupted_tool_tails(agent_history)
+    def _clean_replay_segment(segment: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        cleaned = strip_interrupted_tool_tails(segment)
+        cleaned = strip_dangling_tool_call_tail(cleaned)
+        return strip_stale_dangerous_confirmations(cleaned, now=time.time())
 
-    # Strip a dangling assistant(tool_calls) tail with no tool answers —
-    # the signature of a SIGKILL mid-tool-call (e.g. the tool itself ran
-    # `docker restart`/`kill` and took the gateway down before the result
-    # was persisted). Without this the model re-issues the unanswered call
-    # on resume and loops the restart forever (#49201).
-    agent_history = strip_dangling_tool_call_tail(agent_history)
-
-    # Strip stale dangerous-confirmation text in user messages (#59607).
-    # A high-risk confirmation phrase (e.g. "confirm forced restart") that
-    # is older than the expiry window must not be replayed to the model,
-    # otherwise an unrelated follow-up message can be interpreted as a
-    # fresh confirmation and trigger the destructive action a second time.
-    agent_history = strip_stale_dangerous_confirmations(
-        agent_history, now=time.time()
+    protected_replay_indices = native_compaction_protected_message_indices(
+        agent_history
     )
+    if protected_replay_indices:
+        protected_start = min(protected_replay_indices)
+        protected_end = max(protected_replay_indices) + 1
+        agent_history = (
+            _clean_replay_segment(agent_history[:protected_start])
+            + agent_history[protected_start:protected_end]
+            + _clean_replay_segment(agent_history[protected_end:])
+        )
+    else:
+        agent_history = _clean_replay_segment(agent_history)
 
     observed_context = "\n".join(observed_group_context).strip() or None
     return agent_history, observed_context

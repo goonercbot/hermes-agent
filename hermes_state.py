@@ -12969,6 +12969,41 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         "api_content, display_kind, display_metadata"
     )
 
+    @staticmethod
+    def _native_compaction_protected_following_count(
+        carrier: Any,
+        remaining_rows: int,
+    ) -> int:
+        """Return the exact handoff+tail span sealed by a valid v2 carrier."""
+        if not isinstance(carrier, dict) or carrier.get("role") != "assistant":
+            return 0
+        items = carrier.get("codex_reasoning_items")
+        if not isinstance(items, list) or len(items) != 1 or not isinstance(items[0], dict):
+            return 0
+        checkpoint = items[0]
+        metadata = checkpoint.get("_hermes_native_compaction")
+        if not (
+            checkpoint.get("type") == "compaction"
+            and isinstance(checkpoint.get("encrypted_content"), str)
+            and checkpoint["encrypted_content"].strip()
+            and isinstance(metadata, dict)
+            and set(metadata) == {
+                "version", "identity", "handoff", "tail_count", "tail_fence"
+            }
+            and metadata.get("version") == 2
+            and isinstance(metadata.get("identity"), str)
+            and metadata["identity"].strip()
+            and isinstance(metadata.get("handoff"), str)
+            and metadata["handoff"].strip()
+            and isinstance(metadata.get("tail_count"), int)
+            and not isinstance(metadata.get("tail_count"), bool)
+            and metadata["tail_count"] >= 0
+            and isinstance(metadata.get("tail_fence"), str)
+        ):
+            return 0
+        protected_count = 1 + metadata["tail_count"]
+        return protected_count if protected_count <= remaining_rows else 0
+
     def _rows_to_conversation(
         self,
         rows,
@@ -12992,9 +13027,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # exact durable clone identity while decoding instead of rescanning the
         # whole accumulated lineage for every user row.
         exact_user_clones: Dict[Tuple[Any, str], Dict[str, Any]] = {}
-        for row in rows:
+        protected_native_rows_remaining = 0
+        for row_index, row in enumerate(rows):
             content = self._decode_content(row["content"])
-            if row["role"] in {"user", "assistant"} and isinstance(content, str):
+            preserve_exact_native_content = protected_native_rows_remaining > 0
+            if preserve_exact_native_content:
+                protected_native_rows_remaining -= 1
+            if (
+                row["role"] in {"user", "assistant"}
+                and isinstance(content, str)
+                and not preserve_exact_native_content
+            ):
                 content = sanitize_context(content).strip()
             msg = {"role": row["role"], "content": content}
             # Born durable (#92231): this dict is materialized FROM a durable
@@ -13123,6 +13166,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     else:
                         continue
             messages.append(msg)
+            protected_following_count = (
+                self._native_compaction_protected_following_count(
+                    msg,
+                    len(rows) - row_index - 1,
+                )
+            )
+            if protected_following_count:
+                protected_native_rows_remaining = protected_following_count
             if include_ancestors and exact_clone_key is not None:
                 exact_user_clones[exact_clone_key] = msg
         # DEFENSE-IN-DEPTH against background-review session pollution: a forked

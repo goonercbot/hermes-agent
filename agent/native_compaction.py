@@ -1087,6 +1087,30 @@ def validate_persisted_native_compaction_history(messages: Any) -> Dict[int, str
     return {id(checkpoint): metadata["handoff"]}
 
 
+def native_compaction_protected_message_indices(messages: Any) -> set[int]:
+    """Return the exact carrier/handoff/tail indices for one valid v2 boundary.
+
+    Validation remains the authority.  Callers use the indices only to prevent
+    generic request-copy normalizers from changing bytes the checkpoint seals.
+    """
+    protected = validate_persisted_native_compaction_history(messages)
+    if not protected:
+        return set()
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            continue
+        items = message.get("codex_reasoning_items")
+        if not isinstance(items, list):
+            continue
+        for checkpoint in items:
+            if isinstance(checkpoint, dict) and id(checkpoint) in protected:
+                metadata = checkpoint[NATIVE_COMPACTION_METADATA_KEY]
+                return set(range(index, index + 2 + metadata["tail_count"]))
+    raise ValueError(
+        "protected native compaction checkpoint failed boundary validation: carrier shape"
+    )
+
+
 def _approx_tokens(text: str) -> int:
     """Cheap chars//4 token estimate — same shape Codex uses for retention."""
     return max(1, len(text) // 4)

@@ -4681,6 +4681,63 @@ class TestLoneSurrogatePersistence:
 
 
 
+class TestNativeCompactionHandoffReplay:
+    def test_preserves_exact_native_handoff_bytes(self, db):
+        from agent.native_compaction import (
+            NATIVE_COMPACTION_METADATA_KEY,
+            native_continuity_boundary_fence,
+            validate_persisted_native_compaction_history,
+        )
+
+        db.create_session(session_id="native-handoff", source="cli")
+        handoff = "exact model handoff with trailing newline\n"
+        tail = [
+            {"role": "user", "content": " current user with whitespace \n"},
+            {"role": "assistant", "content": " assistant tail with whitespace \n"},
+        ]
+        checkpoint = {
+            "type": "compaction",
+            "encrypted_content": "opaque checkpoint",
+            NATIVE_COMPACTION_METADATA_KEY: {
+                "version": 2,
+                "identity": "attempt-1",
+                "handoff": handoff,
+                "tail_count": len(tail),
+                "tail_fence": native_continuity_boundary_fence(tail),
+            },
+        }
+        db.append_message(
+            "native-handoff",
+            "assistant",
+            "",
+            codex_reasoning_items=[checkpoint],
+            display_kind="hidden",
+        )
+        db.append_message("native-handoff", "user", handoff)
+        for message in tail:
+            db.append_message(
+                "native-handoff",
+                message["role"],
+                message["content"],
+            )
+
+        messages = db.get_messages_as_conversation("native-handoff")
+
+        assert messages[1]["content"] == handoff
+        assert [message["content"] for message in messages[2:]] == [
+            message["content"] for message in tail
+        ]
+        validate_persisted_native_compaction_history(messages)
+
+    def test_ordinary_user_content_keeps_existing_sanitization(self, db):
+        db.create_session(session_id="ordinary-trim", source="cli")
+        db.append_message("ordinary-trim", "user", " ordinary user text \n")
+
+        messages = db.get_messages_as_conversation("ordinary-trim")
+
+        assert messages[0]["content"] == "ordinary user text"
+
+
 class TestInPlaceNativeCompactionSidecar:
     @staticmethod
     def _checkpoint(encrypted_content="checkpoint"):

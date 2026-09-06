@@ -14,6 +14,7 @@ import time
 from unittest.mock import patch
 
 from agent.context_compressor import ContextCompressor
+from agent.conversation_compression import compress_context
 from agent.turn_context import build_turn_context
 from tests.agent.test_turn_context import _FakeAgent
 
@@ -92,6 +93,25 @@ def _build_warn_agent(compressor: ContextCompressor) -> _WarnAgent:
     return agent
 
 
+def _make_native_codex_responses(agent: _WarnAgent) -> None:
+    """Configure the exact native-continuity route used by the real gate."""
+    agent.api_mode = "codex_responses"
+    agent.model = "gpt-5.6-test"
+    agent.provider = "openai-codex"
+    agent.base_url = "https://chatgpt.com/backend-api/codex"
+    for name, value in {
+        "_base_url_hostname": "chatgpt.com",
+        "_base_url_lower": agent.base_url,
+        "codex_responses_native_compaction": True,
+        "_codex_reasoning_replay_enabled": True,
+        "runtime_capabilities": {"native_compaction": True},
+        "capabilities": {"native_compaction": True},
+        "_compression_feasibility_checked": True,
+        "compression_in_place": False,
+    }.items():
+        setattr(agent, name, value)
+
+
 def _run_build(agent):
     """Run build_turn_context with the prologue-side effects stubbed."""
     with patch("agent.auxiliary_client.set_runtime_main", lambda *a, **k: None), \
@@ -116,6 +136,73 @@ def _run_build(agent):
 
 
 class TestTurnContextOverflowWarning:
+    def test_native_structural_backoff_dispatches_once_without_warning(self):
+        """The public preflight must reach native compaction, then stop on no-op."""
+        comp = _make_compressor()
+        comp.last_prompt_tokens = 73_000
+        comp._structural_no_op_backoff_until = time.monotonic() + 30
+        agent = _build_warn_agent(comp)
+        _make_native_codex_responses(agent)
+        for name, value in {
+            "_memory_manager": None,
+            "_session_db": None,
+            "_todo_store": type(
+                "Todo", (), {"format_for_injection": lambda _self: ""}
+            )(),
+            "_invalidate_system_prompt": lambda: None,
+            "_build_system_prompt": lambda system_message: system_message,
+        }.items():
+            setattr(agent, name, value)
+        dispatched = []
+
+        def _compress_through_real_dispatch(messages, system_message, **kwargs):
+            return compress_context(
+                agent,
+                messages,
+                system_message or "",
+                approx_tokens=kwargs["approx_tokens"],
+            )
+
+        setattr(agent, "_compress_context", _compress_through_real_dispatch)
+
+        def _native_no_progress(_agent, messages, _system_message):
+            dispatched.append(True)
+            comp._last_compress_aborted = False
+            comp._last_summary_error = None
+            comp._last_compression_made_progress = False
+            comp._last_summary_fallback_used = False
+            return messages
+
+        # A native provider can return the input unchanged. Existing progress
+        # protection must stop the preflight pass rather than retrying it.
+        # Keep the estimator on the generic fallback so the test controls the
+        # public threshold input rather than constructing a Responses payload.
+        with patch(
+            "agent.codex_responses_adapter.estimate_native_responses_preflight_tokens",
+            return_value=None,
+        ), patch(
+            "agent.native_compaction.native_compact_context",
+            side_effect=_native_no_progress,
+        ):
+            _run_build(agent)
+
+        assert dispatched == [True]
+        assert agent._warnings == []
+        assert comp._native_no_progress_rearm_tokens > 73_000
+
+    def test_ineligible_structural_backoff_still_warns_and_blocks(self):
+        """Generic routes retain the structural-backoff anti-thrash guard."""
+        comp = _make_compressor()
+        comp.last_prompt_tokens = 73_000
+        comp._structural_no_op_backoff_until = time.monotonic() + 30
+        agent = _build_warn_agent(comp)
+
+        _run_build(agent)
+
+        assert agent._compress_calls == 0
+        assert len(agent._warnings) == 1
+        assert "blocked (structural_backoff:" in agent._warnings[0]
+
     def test_warns_on_cooldown_block(self):
         comp = _make_compressor()
         comp.last_prompt_tokens = 73_000

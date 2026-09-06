@@ -34,6 +34,7 @@ from agent.conversation_compression import (
     COMPRESSION_RETRY_TOKENS_STATUS_TEMPLATE,
     COMPRESSION_RETRY_TOO_LARGE_STATUS_TEMPLATE,
     PRE_API_COMPRESSION_STATUS_TEMPLATE,
+    automatic_compression_should_attempt,
     compression_blocked_transiently,
     compression_skipped_due_to_lock,
     conversation_history_after_compression,
@@ -2906,7 +2907,9 @@ def run_conversation(
             and not _preflight_compression_blocked
             and not _defer_preflight(request_pressure_tokens)
             and not _compression_cooldown
-            and _compressor.should_compress(request_pressure_tokens)
+            and automatic_compression_should_attempt(
+                agent, _compressor, request_pressure_tokens
+            )
         ):
             if _moa_prepared_request is not None:
                 pending_moa_prepared_request = _moa_prepared_request
@@ -7918,7 +7921,9 @@ def run_conversation(
                 if (
                     agent.compression_enabled
                     and compression_attempts < max_compression_attempts
-                    and _compressor.should_compress(_real_tokens)
+                    and automatic_compression_should_attempt(
+                        agent, _compressor, _real_tokens
+                    )
                 ):
                     compression_attempts += 1
                     # Compression is actually running (block cleared / was

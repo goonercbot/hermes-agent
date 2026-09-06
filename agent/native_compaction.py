@@ -778,7 +778,15 @@ def _response_text(response: Any) -> str:
                 text = _item_value(part, "text")
                 if isinstance(text, str):
                     chunks.append(text)
-    return "".join(chunks)
+    text = "".join(chunks)
+    if text:
+        return text
+    # The Responses SDK also exposes a canonical top-level output_text.  Some
+    # Codex response shapes retain that text after their raw message item has
+    # been consumed or omitted.  This is still provider-written text; using it
+    # is not a host-generated handoff or generic answer normalization.
+    output_text = _item_value(response, "output_text")
+    return output_text if isinstance(output_text, str) else ""
 
 
 def _raw_checkpoint(response: Any) -> Optional[Dict[str, Any]]:
@@ -884,7 +892,27 @@ def native_compact_context(agent: Any, messages: List[Dict[str, Any]], system_me
         handoff_response = _native_request(
             agent, instructions=_native_handoff_prompt(), input_items=wire,
         )
+        # The provider may compact this first request itself.  Its checkpoint
+        # is authoritative even though the ordinary handoff text is empty: use
+        # it as the checkpoint and ask its replay for the model-written handoff.
+        # Never invent a host handoff or demote this valid checkpoint to the
+        # generic empty-answer path.
+        checkpoint = _raw_checkpoint(handoff_response)
         handoff = _response_text(handoff_response)
+        if checkpoint is not None and not handoff.strip():
+            handoff_response = _native_request(
+                agent,
+                instructions=_native_handoff_prompt(),
+                input_items=[checkpoint],
+            )
+            replay_checkpoint = _raw_checkpoint(handoff_response)
+            handoff = _response_text(handoff_response)
+            if replay_checkpoint is not None and not handoff.strip():
+                raise ValueError(
+                    "native compaction checkpoint replay returned no handoff"
+                )
+            if replay_checkpoint is not None:
+                checkpoint = replay_checkpoint
         if not isinstance(handoff, str) or not handoff.strip():
             raise ValueError("native compaction handoff response is empty")
         if len(handoff) > NATIVE_COMPACTION_HANDOFF_MAX_CHARS:
@@ -892,21 +920,25 @@ def native_compact_context(agent: Any, messages: List[Dict[str, Any]], system_me
         # Preserve exact model bytes.  The second request includes the handoff
         # as a distinct user item, then the same frozen conversation; no local
         # estimate is allowed to decide whether a checkpoint exists.
-        compact_response = _native_request(
-            agent,
-            instructions=system_message or _native_handoff_prompt(),
-            input_items=wire + [{"role": NATIVE_COMPACTION_HANDOFF_ROLE, "content": handoff}],
-            context_management=[{"type": "compaction", "compact_threshold": threshold}],
-        )
-        checkpoint = _raw_checkpoint(compact_response)
         if checkpoint is None:
-            if _response_text(compact_response).strip():
-                _set_native_attempt_state(agent)
-                return messages
-            status = getattr(compact_response, "status", "completed")
-            if status != "completed":
-                raise ValueError(f"native compaction response failed: {status}")
-            raise ValueError("native compaction response declined without ordinary text")
+            compact_response = _native_request(
+                agent,
+                instructions=system_message or _native_handoff_prompt(),
+                input_items=wire + [{"role": NATIVE_COMPACTION_HANDOFF_ROLE, "content": handoff}],
+                context_management=[{"type": "compaction", "compact_threshold": threshold}],
+            )
+            # Checkpoint detection deliberately precedes ordinary-text and
+            # derived-status handling: a valid checkpoint-only response has no
+            # visible answer but is a successful provider-owned compaction.
+            checkpoint = _raw_checkpoint(compact_response)
+            if checkpoint is None:
+                if _response_text(compact_response).strip():
+                    _set_native_attempt_state(agent)
+                    return messages
+                status = getattr(compact_response, "status", "completed")
+                if status != "completed":
+                    raise ValueError(f"native compaction response failed: {status}")
+                raise ValueError("native compaction response declined without ordinary text")
     except BaseException as exc:
         _set_native_attempt_state(agent, error=str(exc), aborted=True)
         raise

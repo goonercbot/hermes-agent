@@ -2475,15 +2475,23 @@ class SecondaryPortBindingConfigError(MultiplexConfigError):
 
 
 class HygieneTurnHoldExceeded(Exception):
-    """The hygiene-compression turn-hold budget elapsed while the summary
-    model was still streaming progress.
+    """Non-native hygiene exceeded its bounded user-turn hold."""
 
-    This is an availability boundary, not a failure: the compressor is
-    healthy, but the current user turn cannot wait any longer. It must NOT
-    be routed through the idle-timeout failure path (which stamps
-    AGENT_COMPRESSION_TIMEOUT, sends a "no output" message, and advances
-    the failure cooldown ladder).
-    """
+
+def _hygiene_requires_exclusive_completion(agent: object) -> bool:
+    """Return whether starting the user turn would invalidate compaction."""
+    if getattr(agent, "api_mode", "") != "codex_responses":
+        return False
+    from agent.codex_responses_adapter import classify_responses_route
+    from agent.native_compaction import native_continuity_capable
+
+    route = classify_responses_route(agent)
+    return native_continuity_capable(
+        agent,
+        is_codex_backend=route.is_codex_backend,
+        is_xai_responses=route.is_xai_responses,
+        is_github_responses=route.is_github_responses,
+    )
 
 
 def _multiplex_profile_homes(config: object) -> list[tuple[str, "Path"]]:
@@ -20902,13 +20910,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _hyg_hard_msg_limit = 5000
             _hyg_timeout_seconds = 30.0
             _hyg_total_ceiling_seconds = 600.0
-            # Max wall-clock the user's TURN is held waiting on hygiene
-            # compression before the gateway stops waiting and proceeds on the
-            # uncompressed transcript (#TKT-0029). The compressor keeps running
-            # detached; its commit is fenced (revoke_commit_admission) so a
-            # stale result can never clobber turns appended after the wait was
-            # abandoned. Capped well below typical transport idle-timeouts
-            # (Telegram ~30s) so the wire never goes silent long enough to sever.
             _hyg_max_turn_hold_seconds = 10.0
             _hyg_failure_cooldown_seconds = 300.0
             _hyg_config_context_length = None
@@ -21301,6 +21302,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     # would end the live gateway session row.
                                     _hyg_agent._end_session_on_close = False
                                     _hyg_agent._print_fn = lambda *a, **kw: None
+                                    # A native Responses checkpoint is bound to
+                                    # the frozen transcript. Starting the
+                                    # triggering user turn before its commit
+                                    # invalidates that boundary, so native
+                                    # hygiene owns the session until success or
+                                    # a real idle/total timeout. Other
+                                    # compressors retain the availability bound.
+                                    _hyg_require_completion = (
+                                        _hygiene_requires_exclusive_completion(
+                                            _hyg_agent
+                                        )
+                                    )
 
                                     loop = asyncio.get_running_loop()
                                     _hyg_commit_fence = CompressionCommitFence(
@@ -21338,43 +21351,45 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             _hyg_waited = (
                                                 time.monotonic() - _hyg_wait_started
                                             )
-                                            _slice = min(
-                                                max(
-                                                    _hyg_timeout_seconds
-                                                    - _hyg_commit_fence.seconds_since_progress(),
-                                                    0.005,
-                                                ),
-                                                max(
-                                                    _hyg_total_ceiling_seconds
-                                                    - _hyg_waited,
-                                                    0.005,
-                                                ),
+                                            _total_left = max(
+                                                _hyg_total_ceiling_seconds
+                                                - _hyg_waited,
+                                                0.005,
                                             )
-                                            # Bounded turn-hold (#TKT-0029): cap
-                                            # this slice at the remaining
-                                            # turn-hold budget so the wait is
-                                            # re-evaluated against
-                                            # _hyg_max_turn_hold_seconds at
-                                            # least that often — otherwise a
-                                            # continuously-streaming worker
-                                            # (which keeps the inactivity slice
-                                            # large) would hold the turn until
-                                            # the total ceiling before the
-                                            # budget check ever runs.
-                                            _turn_hold_remaining = (
-                                                _hyg_max_turn_hold_seconds
-                                                - (time.monotonic() - _hyg_wait_started)
-                                            )
-                                            if _turn_hold_remaining <= 0:
-                                                # Budget already exhausted —
-                                                # force an immediate timeout so
-                                                # the abandonment path below runs.
-                                                _slice = 0.005
+                                            if _hyg_require_completion:
+                                                # Native compaction uses direct
+                                                # Responses requests, whose SSE
+                                                # events are consumed inside the
+                                                # adapter and cannot tick the
+                                                # summary-model progress fence.
+                                                # Its provider watchdogs own
+                                                # request inactivity; this outer
+                                                # owner waits to the hard total
+                                                # ceiling instead of mistaking a
+                                                # healthy checkpoint prefill for
+                                                # 30 seconds of silence.
+                                                _slice = _total_left
                                             else:
+                                                _slice = min(
+                                                    max(
+                                                        _hyg_timeout_seconds
+                                                        - _hyg_commit_fence.seconds_since_progress(),
+                                                        0.005,
+                                                    ),
+                                                    _total_left,
+                                                )
+                                                _turn_hold_remaining = (
+                                                    _hyg_max_turn_hold_seconds
+                                                    - (
+                                                        time.monotonic()
+                                                        - _hyg_wait_started
+                                                    )
+                                                )
                                                 _slice = min(
                                                     _slice,
                                                     max(_turn_hold_remaining, 0.005),
                                                 )
+
                                             # Re-check the fence on a short poll so a
                                             # /stop or /restart cancel is not stuck
                                             # behind a full idle window (#96953).
@@ -21395,38 +21410,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                     raise
                                                 _hyg_waited = time.monotonic() - _hyg_wait_started
                                                 _idle = _hyg_commit_fence.seconds_since_progress()
-                                                # Bounded turn-hold (#TKT-0029):
-                                                # never hold the user's TURN
-                                                # longer than
-                                                # _hyg_max_turn_hold_seconds,
-                                                # even if the summary model is
-                                                # still streaming. Past the
-                                                # budget we stop waiting and
-                                                # fall through to the timeout
-                                                # path below, which revokes
-                                                # commit admission and proceeds
-                                                # on the uncompressed
-                                                # transcript — the wire never
-                                                # stays silent long enough to
-                                                # trip a transport idle-timeout.
                                                 if (
-                                                    _hyg_waited
+                                                    not _hyg_require_completion
+                                                    and _hyg_waited
                                                     >= _hyg_max_turn_hold_seconds
                                                 ):
-                                                    logger.info(
-                                                        "Session hygiene compression for "
-                                                        "session %s exceeded the turn-hold "
-                                                        "budget (%.1fs >= %.1fs) — "
-                                                        "abandoning inline wait, proceeding "
-                                                        "without compression this turn",
-                                                        session_entry.session_id,
-                                                        _hyg_waited,
-                                                        _hyg_max_turn_hold_seconds,
-                                                    )
-                                                    raise HygieneTurnHoldExceeded(
-                                                        f"turn-hold budget {_hyg_max_turn_hold_seconds:.1f}s "
-                                                        f"elapsed after {_hyg_waited:.1f}s"
-                                                    )
+                                                    raise HygieneTurnHoldExceeded
+                                                if (
+                                                    _hyg_require_completion
+                                                    and _hyg_waited
+                                                    < _hyg_total_ceiling_seconds
+                                                ):
+                                                    continue
                                                 if hygiene_wait_should_extend(
                                                         idle=_idle,
                                                         timeout=_hyg_timeout_seconds,
@@ -21447,14 +21442,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                     continue
                                                 raise
                                     except HygieneTurnHoldExceeded:
-                                        # Turn-hold expiry is an availability boundary,
-                                        # not a failure. The compressor is healthy and
-                                        # still streaming; we simply cannot hold the
-                                        # current user turn any longer. Share the safe
-                                        # mechanics (fence, release, defer, proceed
-                                        # uncompressed) but with distinct provenance,
-                                        # user message, and NO failure-cooldown
-                                        # increment.
                                         _cancelled = None
                                         while _cancelled is None:
                                             if _hyg_commit_fence.commit_in_flight:
@@ -21466,15 +21453,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             if _cancelled is None:
                                                 await asyncio.sleep(0.025)
                                         if not _cancelled:
-                                            # NOTE: bounded overshoot by design.
-                                            # The turn can be held past
-                                            # _hyg_max_turn_hold_seconds by up to the
-                                            # commit duration (summary apply + storage
-                                            # write). Aborting mid-commit would corrupt
-                                            # the message-store transaction — the
-                                            # overshoot is the cheaper failure mode.
-                                            # Do NOT "fix" this into a mid-commit
-                                            # cancellation.
                                             _compressed, _ = await _hyg_future
                                         else:
                                             _hyg_commit_fence.release_cancelled_compression_lock()
@@ -21484,22 +21462,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                 context="session hygiene turn-hold",
                                             )
                                             _hyg_cleanup_deferred = True
-                                            # Short, NON-escalating retry-after. Without
-                                            # it, every subsequent turn re-spawns a fresh
-                                            # compressor, holds it for the turn-hold
-                                            # budget, and cancels it again — a per-turn
-                                            # summary-model token burn that never commits
-                                            # under sustained traffic. This is deliberately
-                                            # NOT _hygiene_cooldown_for_failure: the
-                                            # compressor is healthy, so the failure streak
-                                            # must not advance (behavior witness below);
-                                            # only the flat retry spacing is recorded.
                                             _record_hygiene_cooldown(
-                                                self, session_entry.session_id,
+                                                self,
+                                                session_entry.session_id,
                                                 _HYGIENE_TURNHOLD_RETRY_SECONDS,
-                                                "hygiene compression deferred: "
-                                                "turn-hold budget expired while the "
-                                                "summary was still streaming",
+                                                "hygiene compression deferred: turn-hold "
+                                                "budget expired while the summary was "
+                                                "still streaming",
                                             )
                                             from agent.session_activity import (
                                                 ActivityProvenance,
@@ -21508,8 +21477,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                 _hyg_agent,
                                                 "session hygiene compression turn-hold",
                                                 ActivityProvenance.AGENT_COMPRESSION_TURNHOLD,
-                                                "hygiene compression turn-hold "
-                                                "activity stamp failed",
+                                                "hygiene compression turn-hold activity "
+                                                "stamp failed",
                                             )
                                             logger.info(
                                                 "Session hygiene compression for session %s "
@@ -21518,15 +21487,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                 session_entry.session_id,
                                                 time.monotonic() - _hyg_wait_started,
                                             )
-                                            _turnhold_msg = t(
-                                                "gateway.compress.turnhold_deferred"
-                                            )
                                             try:
                                                 _adapter = self._adapter_for_source(source)
                                                 if _adapter and source.chat_id:
                                                     await _adapter.send(
                                                         source.chat_id,
-                                                        _turnhold_msg,
+                                                        t(
+                                                            "gateway.compress."
+                                                            "turnhold_deferred"
+                                                        ),
                                                         metadata=_hyg_meta,
                                                     )
                                             except Exception as _werr:

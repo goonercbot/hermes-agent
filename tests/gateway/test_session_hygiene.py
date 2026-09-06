@@ -650,10 +650,11 @@ async def test_session_hygiene_timeout_continues_to_agent_and_sets_cooldown(monk
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("report_progress", [True, False])
 async def test_session_hygiene_streaming_compression_keeps_turn_exclusive_until_commit(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, report_progress
 ):
-    """A healthy hygiene worker commits before the inbound turn can start."""
+    """Native hygiene owns the turn through checkpoint prefill and commit."""
     fake_dotenv = types.ModuleType("dotenv")
     fake_dotenv.load_dotenv = lambda *args, **kwargs: None
     monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
@@ -699,7 +700,7 @@ async def test_session_hygiene_streaming_compression_keeps_turn_exclusive_until_
             # exclusive until this worker commits, not start on stale history.
             threading.Timer(0.35, release_worker.set).start()
             while not release_worker.is_set():
-                if commit_fence is not None:
+                if commit_fence is not None and report_progress:
                     commit_fence.touch_progress()
                 time.sleep(0.01)
             if commit_fence is not None and not commit_fence.begin_commit():
@@ -723,9 +724,10 @@ async def test_session_hygiene_streaming_compression_keeps_turn_exclusive_until_
     cfg_path.write_text(
         "compression:\n"
         "  enabled: true\n"
-        # Inactivity budget is huge, so this proves streaming compression
-        # remains exclusive until it finishes.
-        "  hygiene_timeout_seconds: 60\n"
+        # The no-progress arm reproduces a native Responses checkpoint request:
+        # its SSE events are not summary-progress events, so the provider's own
+        # watchdog and this hard ceiling — not the generic idle budget — own it.
+        "  hygiene_timeout_seconds: 0.1\n"
         "  hygiene_total_ceiling_seconds: 600\n"
         # Native compaction must ignore the ordinary availability cutoff.
         "  hygiene_max_turn_hold_seconds: 0.3\n"

@@ -21351,19 +21351,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             _hyg_waited = (
                                                 time.monotonic() - _hyg_wait_started
                                             )
-                                            _slice = min(
-                                                max(
-                                                    _hyg_timeout_seconds
-                                                    - _hyg_commit_fence.seconds_since_progress(),
-                                                    0.005,
-                                                ),
-                                                max(
-                                                    _hyg_total_ceiling_seconds
-                                                    - _hyg_waited,
-                                                    0.005,
-                                                ),
+                                            _total_left = max(
+                                                _hyg_total_ceiling_seconds
+                                                - _hyg_waited,
+                                                0.005,
                                             )
-                                            if not _hyg_require_completion:
+                                            if _hyg_require_completion:
+                                                # Native compaction uses direct
+                                                # Responses requests, whose SSE
+                                                # events are consumed inside the
+                                                # adapter and cannot tick the
+                                                # summary-model progress fence.
+                                                # Its provider watchdogs own
+                                                # request inactivity; this outer
+                                                # owner waits to the hard total
+                                                # ceiling instead of mistaking a
+                                                # healthy checkpoint prefill for
+                                                # 30 seconds of silence.
+                                                _slice = _total_left
+                                            else:
+                                                _slice = min(
+                                                    max(
+                                                        _hyg_timeout_seconds
+                                                        - _hyg_commit_fence.seconds_since_progress(),
+                                                        0.005,
+                                                    ),
+                                                    _total_left,
+                                                )
                                                 _turn_hold_remaining = (
                                                     _hyg_max_turn_hold_seconds
                                                     - (
@@ -21402,6 +21416,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                     >= _hyg_max_turn_hold_seconds
                                                 ):
                                                     raise HygieneTurnHoldExceeded
+                                                if (
+                                                    _hyg_require_completion
+                                                    and _hyg_waited
+                                                    < _hyg_total_ceiling_seconds
+                                                ):
+                                                    continue
                                                 if hygiene_wait_should_extend(
                                                         idle=_idle,
                                                         timeout=_hyg_timeout_seconds,

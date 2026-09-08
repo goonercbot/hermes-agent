@@ -1004,6 +1004,13 @@ DEFAULT_CONFIG = {
                                       # Native continuity always uses the live
                                       # ContextCompressor.threshold_tokens value;
                                       # explicit legacy values are ignored.
+        "native_incremental_handoff": False,  # Opt in to the one-call Codex
+                                      # mini incremental checkpoint route. This
+                                      # is independent of the legacy gpt-5.6
+                                      # native path and never invokes the active
+                                      # agent model to make a handoff.
+        "native_incremental_model": "gpt-5.6-luna",
+        "native_incremental_compact_threshold": 32000,
         "in_place": True,             # When True, compaction rewrites the message
                                       # list and rebuilds the system prompt WITHOUT
                                       # rotating the session id — the conversation

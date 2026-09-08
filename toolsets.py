@@ -216,6 +216,12 @@ TOOLSETS = {
         "includes": []
     },
     
+    "continuity": {
+        "description": "Opt-in native incremental continuity notes",
+        "tools": ["continuity_note"],
+        "includes": []
+    },
+
     "memory": {
         "description": "Persistent memory across sessions (personal notes + user profile)",
         "tools": ["memory"],

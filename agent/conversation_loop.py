@@ -1975,6 +1975,17 @@ def run_conversation(
             "error": error,
         }
 
+    # Restore an authenticated persisted ordinary-work note before turn-context
+    # preflight can decide whether native compaction is ready. This is a
+    # deterministic rebind of recorded fields, never an inference over history.
+    if bool(getattr(agent, "native_incremental_handoff_enabled", False)):
+        try:
+            from agent.native_incremental_handoff import restore_native_incremental_note
+            restore_native_incremental_note(agent, conversation_history or [])
+        except Exception:
+            logger.warning("native incremental continuity-note restore failed closed", exc_info=True)
+            agent._native_incremental_handoff_note = None
+
     if moa_config is None:
         try:
             from hermes_cli.moa_config import decode_moa_turn
@@ -2644,11 +2655,33 @@ def run_conversation(
             logger=request_logger,
         )
 
+        # A validated checkpoint is native Responses state. Preserve it byte-for-
+        # byte only while the current transport is actually Responses; provider
+        # labels are not a transport contract. A generic chat fallback cannot
+        # consume the opaque carrier/reasoning sidecars, so give it a disposable
+        # projection with the ordinary handoff and suffix intact, then apply the
+        # ordinary sanitizer. Durable history remains the validation authority.
+        _native_responses_request = (
+            _native_boundary_request and agent.api_mode == "codex_responses"
+        )
+        if _native_boundary_request and not _native_responses_request:
+            from agent.native_compaction import has_compaction_checkpoint
+
+            api_messages = [
+                {
+                    key: value
+                    for key, value in api_msg.items()
+                    if key != "codex_reasoning_items"
+                }
+                for api_msg in api_messages
+                if not has_compaction_checkpoint(api_msg.get("codex_reasoning_items"))
+            ]
+
         # Safety net: strip orphaned tool results / add stubs for missing
-        # results before sending to the API.  Runs unconditionally — not
-        # gated on context_compressor — so orphans from session loading or
-        # manual message manipulation are always caught.
-        api_messages = agent._sanitize_api_messages(api_messages)
+        # results before sending to the API. Native Responses conversion owns
+        # its validated checkpoint wire; every generic projection is repaired.
+        if not _native_responses_request:
+            api_messages = agent._sanitize_api_messages(api_messages)
 
         # Drop thinking-only assistant turns (reasoning but no visible
         # output and no tool_calls) and merge any adjacent user messages
@@ -2658,7 +2691,7 @@ def run_conversation(
         # a thinking-only turn. Runs on the per-call copy only — the
         # stored conversation history keeps the reasoning block for the
         # UI transcript and session persistence.
-        if not _native_boundary_request:
+        if not _native_responses_request:
             api_messages = agent._drop_thinking_only_and_merge_users(
                 api_messages,
                 drop_codex_reasoning_items=agent.api_mode != "codex_responses",
@@ -2674,7 +2707,7 @@ def run_conversation(
         # tail bytes. Preserve only that validated span; every other message
         # keeps the ordinary normalization behavior.
         _protected_native_indices: set[int] = set()
-        if _native_boundary_request:
+        if _native_responses_request:
             from agent.native_compaction import (
                 native_compaction_protected_message_indices,
             )
@@ -3201,6 +3234,18 @@ def run_conversation(
                         _native_continuity_source_messages
                     )
                 api_kwargs = agent._build_api_kwargs(api_messages, **_build_kwargs)
+                if (
+                    agent.api_mode == "codex_responses"
+                    and getattr(agent, "native_incremental_handoff_enabled", False)
+                    and any(item.get("type") == "compaction" for item in api_kwargs.get("input", []))
+                ):
+                    from agent.native_incremental_handoff import native_incremental_resume_instructions
+
+                    # Request-local only: do not alter cached system prompts,
+                    # encrypted checkpoint bytes, or the durable conversation.
+                    api_kwargs["instructions"] = native_incremental_resume_instructions(
+                        api_kwargs.get("instructions", ""), _native_continuity_source_messages
+                    )
                 # Outbound-request surrogate chokepoint (#50959): the messages
                 # were scrubbed above, but the rest of the request body —
                 # tool/function descriptions (session_search's ±-heavy text is

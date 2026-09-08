@@ -3898,6 +3898,7 @@ def compress_context(
                         # adopt-directly behavior for that shape
                         # (test_compression_concurrent_fork).
                         _preflush_ok = True
+                    _adopted_native_watermark = None
                     if not _preflush_ok:
                         logger.warning(
                             "compression: session=%s grew before lease "
@@ -3911,7 +3912,23 @@ def compress_context(
                     else:
                         # Re-read after the flush so the adopted snapshot
                         # carries the just-persisted tail.
-                        durable_parent = durable_loader(_lock_db, _lock_sid)
+                        if getattr(agent, "native_incremental_handoff_enabled", False):
+                            # Bind the watermark to the SAME DB read as the
+                            # adopted history. A later MAX(id) could skip an
+                            # unseen writer; the old watermark would duplicate
+                            # our preflushed triggering user in the child.
+                            durable_parent = durable_loader(
+                                _lock_db, _lock_sid, include_row_ids=True
+                            )
+                            _adopted_ids = [
+                                row.pop("_row_id", None) for row in durable_parent
+                            ]
+                            _adopted_native_watermark = max(
+                                (rid for rid in _adopted_ids if isinstance(rid, int)),
+                                default=None,
+                            )
+                        else:
+                            durable_parent = durable_loader(_lock_db, _lock_sid)
                     if (
                         _preflush_ok
                         and isinstance(durable_parent, list)
@@ -3925,6 +3942,21 @@ def compress_context(
                             len(durable_parent),
                         )
                         messages = durable_parent
+                        if getattr(agent, "native_incremental_handoff_enabled", False):
+                            if _adopted_native_watermark is not None:
+                                _commit_watermark = _adopted_native_watermark
+                            from agent.native_incremental_handoff import (
+                                bind_native_incremental_replay_projection,
+                                restore_native_incremental_note,
+                            )
+
+                            # This is the lease-owned canonical DB read, not an
+                            # arbitrary request rewrite. Rebind both views and
+                            # revalidate the recorded note against that source.
+                            bind_native_incremental_replay_projection(
+                                agent, source_messages=messages, replay_messages=messages
+                            )
+                            restore_native_incremental_note(agent, messages)
                         _pre_msg_count = len(messages)
                         # Token estimate was for the stale snapshot; clear it so
                         # the compressor re-derives from the adopted transcript
@@ -3944,8 +3976,35 @@ def compress_context(
                         agent._persist_user_message_idx = len(messages)
 
         from agent.native_compaction import native_compact_context
+        from agent.native_incremental_handoff import (
+            native_incremental_compact_context,
+            native_incremental_continuity_capable,
+        )
 
-        _use_native_compressor = _native_continuity_eligible_for_compression(agent)
+        # An explicit incremental opt-in owns this compression decision even
+        # when its route/model configuration is invalid. It therefore reaches
+        # the fail-closed mini operation (which records ``invalid_route`` and
+        # leaves history unchanged) rather than falling through to the legacy
+        # native or full-summary compressor.
+        _incremental_requested = bool(
+            getattr(agent, "native_incremental_handoff_enabled", False)
+        )
+        _use_native_compressor = (
+            _incremental_requested or _native_continuity_eligible_for_compression(agent)
+        )
+        if _incremental_requested:
+            _use_native_incremental = True
+        elif _use_native_compressor:
+            from agent.codex_responses_adapter import classify_responses_route
+            _native_route = classify_responses_route(agent)
+            _use_native_incremental = native_incremental_continuity_capable(
+                agent,
+                is_codex_backend=_native_route.is_codex_backend,
+                is_xai_responses=_native_route.is_xai_responses,
+                is_github_responses=_native_route.is_github_responses,
+            )
+        else:
+            _use_native_incremental = False
 
         # Notify external memory provider before compression discards context.
         # The provider's on_pre_compress() may return a string of insights it
@@ -4089,10 +4148,16 @@ def compress_context(
                 with aux_progress_hook(_progress_hook), aux_interrupt_protection(
                     cancel_event=_hard_cancel_event
                 ):
-                    if _use_native_compressor:
-                        # The shared destructive seam owns the complete two-call
-                        # lifecycle. No turn-boundary candidate or final-wire
-                        # side path may arm native compaction.
+                    if _use_native_incremental:
+                        # The incremental path is one pinned-mini inline
+                        # compaction request. It has no main-model handoff.
+                        agent.context_compressor._last_compress_aborted = False
+                        agent.context_compressor._last_summary_error = None
+                        compressed = native_incremental_compact_context(
+                            agent, messages, system_message
+                        )
+                    elif _use_native_compressor:
+                        # Legacy native lifecycle remains unchanged.
                         agent.context_compressor._last_compress_aborted = False
                         agent.context_compressor._last_summary_error = None
                         compressed = native_compact_context(agent, messages, system_message)

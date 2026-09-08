@@ -69,12 +69,13 @@ class TestTurnRunner:
         runner = _make_runner(ctx)  # stub adapter resolver returns None
         assert asyncio.run(runner.send_progress_messages()) is None
 
-    def test_normal_response_preserves_compression_exhausted(self):
+    def test_normal_response_preserves_compression_exhausted(self, monkeypatch):
         """A non-empty exhaustion response must still reach auto-reset consumers."""
 
         class _ExhaustedAgent:
             def __init__(self, **kwargs):
                 self.model = kwargs["model"]
+                self.native_incremental_handoff_enabled = True
                 self.session_id = kwargs["session_id"]
                 self.tools = []
                 self.context_compressor = SimpleNamespace(
@@ -91,6 +92,14 @@ class TestTurnRunner:
                     "compression_exhausted": True,
                     "messages": [],
                 }
+
+        bound = []
+        monkeypatch.setattr(
+            "agent.native_incremental_handoff.bind_native_incremental_replay_projection",
+            lambda agent, *, source_messages, replay_messages: bound.append(
+                (source_messages, replay_messages)
+            ) or True,
+        )
 
         gateway_runner = MagicMock()
         gateway_runner.config = SimpleNamespace(streaming=None)
@@ -127,7 +136,14 @@ class TestTurnRunner:
         ctx = TurnContext(
             source=source,
             message="continue",
-            history=[],
+            history=[
+                {"role": "user", "content": "deploy"},
+                {"role": "assistant", "content": "", "tool_calls": [{
+                    "id": "interrupted", "function": {"name": "terminal", "arguments": "{}"},
+                }]},
+                {"role": "tool", "tool_call_id": "interrupted", "name": "terminal",
+                 "content": '{"exit_code":130,"output":"[Command interrupted]"}'},
+            ],
             session_id="test-session",
             session_key="test-session-key",
             user_config={},
@@ -145,3 +161,7 @@ class TestTurnRunner:
             "Context length exceeded. Cannot compress further."
         )
         assert result["compression_exhausted"] is True
+        # This reaches the actual TurnRunner caller: canonical rows stay the
+        # source while the model-facing projection retains UNKNOWN effect state.
+        assert bound and bound[0][0] == ctx.history
+        assert bound[0][1][-1]["effect_disposition"] == "unknown"

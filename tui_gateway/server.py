@@ -6794,6 +6794,18 @@ def _apply_live_compression_config(agent: Any, cfg: dict | None) -> None:
     # Parsed by config compatibility, but intentionally inert. The live
     # ContextCompressor threshold is the sole native-continuity trigger.
     agent.codex_responses_compact_threshold = None
+    agent.native_incremental_handoff_enabled = is_truthy_value(
+        compression.get("native_incremental_handoff", False)
+    )
+    agent.native_incremental_handoff_model = str(
+        compression.get("native_incremental_model", "gpt-5.6-luna") or ""
+    ).strip().lower()
+    try:
+        agent.native_incremental_compact_threshold = int(
+            compression.get("native_incremental_compact_threshold", 32000)
+        )
+    except (TypeError, ValueError):
+        agent.native_incremental_compact_threshold = 0
 
     # Absence restores the agent_init/config default (0 = disabled).
     idle_raw = compression.get("idle_compact_after_seconds", 0)

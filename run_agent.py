@@ -46,6 +46,7 @@ import time
 import threading
 import uuid
 import warnings
+from contextlib import contextmanager
 from typing import List, Dict, Any, Optional, Callable
 # NOTE: `from openai import OpenAI` is deliberately NOT at module top — the
 # SDK pulls ~240 ms of imports. We expose `OpenAI` as a thin proxy object
@@ -1070,6 +1071,22 @@ class AIAgent:
         again on the next blocked-over-threshold turn.
         """
         _warn_kind = (reason or "unknown").split(":", 1)[0]
+        compressor = getattr(self, "context_compressor", None)
+        context_length = getattr(compressor, "context_length", 0)
+        if (
+            getattr(self, "_defer_ctx_overflow_warn", False) is True
+            and _warn_kind in ("cooldown", "structural_backoff")
+            and isinstance(context_length, int)
+            and 0 < preflight_tokens < context_length
+        ):
+            # A normal tool turn can refresh continuity and successfully compact
+            # after this snapshot. Decide at turn exit, not before that recovery.
+            # Permanent blockers and pressure at the hard limit remain immediate.
+            self._pending_ctx_overflow_warn = (
+                reason, preflight_tokens, threshold_tokens,
+                getattr(compressor, "last_prompt_tokens", None),
+            )
+            return
         _warn_key = ("ctx_overflow_blocked", _warn_kind)
         if getattr(self, "_last_ctx_overflow_warn", None) != _warn_key:
             self._last_ctx_overflow_warn = _warn_key
@@ -1089,6 +1106,51 @@ class AIAgent:
                     reason=reason,
                 )
             )
+
+    @contextmanager
+    def _context_overflow_warning_scope(self):
+        """Recheck transient pressure on every public-turn exit, even failure.
+
+        This changes warning timing only, never compression admission, retries,
+        or the gateway's failure-message filter. Nested calls share the outer
+        owner's pending warning; nothing is queued across separate turns.
+        """
+        if getattr(self, "_defer_ctx_overflow_warn", False) is True:
+            yield
+            return
+        self._pending_ctx_overflow_warn = None
+        self._defer_ctx_overflow_warn = True
+        try:
+            yield
+        finally:
+            self._defer_ctx_overflow_warn = False
+            pending = self._pending_ctx_overflow_warn
+            self._pending_ctx_overflow_warn = None
+            if pending is not None:
+                reason, tokens, threshold, previous_usage = pending
+                compressor = getattr(self, "context_compressor", None)
+                try:
+                    current_usage = getattr(compressor, "last_prompt_tokens", None)
+                    if (
+                        isinstance(current_usage, int) and current_usage >= 0
+                        and current_usage != previous_usage
+                    ):
+                        tokens = current_usage
+                    elif getattr(compressor, "awaiting_real_usage_after_compression", False) is True:
+                        estimate = getattr(compressor, "last_compression_rough_tokens", None)
+                        if isinstance(estimate, int) and estimate >= 0:
+                            tokens = estimate
+                    threshold = getattr(compressor, "threshold_tokens", threshold)
+                    info = getattr(compressor, "should_compress_info", None)
+                    if callable(info):
+                        reason = info(tokens)[1]
+                except Exception:
+                    # An unavailable state read is not evidence of recovery.
+                    logger.debug("overflow warning state recheck failed", exc_info=True)
+                if reason and tokens >= threshold:
+                    self._warn_context_overflow_blocked(reason, tokens, threshold)
+                else:
+                    self._clear_context_overflow_warn()
 
     def _warn_uncompressed_context_overflow(
         self, preflight_tokens: int, context_length: int
@@ -9065,7 +9127,7 @@ class AIAgent:
             # replaces the value with the live runtime after fallback restoration.
             # Keep the scope local instead of storing ContextVar tokens on the agent,
             # which may be observed from another thread.
-            with bind_subagent_parent(self), scoped_runtime_main({}):
+            with bind_subagent_parent(self), scoped_runtime_main({}), self._context_overflow_warning_scope():
                 try:
                     if durable_turn_lease_thread is not None:
                         with durable_turn_lease_activity_lock:

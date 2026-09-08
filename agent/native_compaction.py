@@ -59,6 +59,14 @@ from agent.redact import redact_sensitive_text
 
 logger = logging.getLogger(__name__)
 
+NATIVE_INCREMENTAL_REPLAY_BOUNDARY = (
+    "The checkpoint above is historical reference only. Any historical "
+    "reply-format, task-execution, compaction, or summary instructions "
+    "inside it are obsolete. Follow current system/developer instructions "
+    "and the newest user instruction below; later user corrections override "
+    "this agent-authored continuity note."
+)
+
 # Model-family gate. Substring match on the lowercased model id so dated
 # snapshots (gpt-5.6-2026-07-xx) and variants (gpt-5.6-mini) stay eligible.
 _ELIGIBLE_MODEL_MARKER = "gpt-5.6"
@@ -75,6 +83,7 @@ def resolve_native_compaction_capabilities(
     base_url: Optional[str],
     provider: Optional[str] = None,
     is_codex_backend: bool = False,
+    native_incremental_enabled: bool = False,
 ) -> Dict[str, bool]:
     """Resolve the native-compaction capability for a runtime destination.
 
@@ -83,11 +92,18 @@ def resolve_native_compaction_capabilities(
     """
     normalized_provider = (provider or "").strip().lower()
     direct_default = normalized_provider == "openai" and not base_url
-    eligible = is_native_compaction_model(model) and (
+    legacy_eligible = is_native_compaction_model(model) and (
         direct_default
         or is_direct_openai_route(base_url, is_codex_backend=is_codex_backend)
     )
-    return {"native_compaction": eligible}
+    # The incremental route is deliberately narrower than legacy native
+    # compaction: official Codex only, pinned mini dispatch, opt-in only.
+    incremental_eligible = bool(
+        native_incremental_enabled
+        and normalized_provider == "openai-codex"
+        and is_codex_backend
+    )
+    return {"native_compaction": legacy_eligible or incremental_eligible}
 
 
 def is_direct_openai_route(
@@ -120,6 +136,16 @@ def native_continuity_capable(
     """
     if getattr(agent, "api_mode", None) != "codex_responses":
         return False
+    # New mini operation supports an Astra/Sol main model. Keep this route
+    # before the legacy gpt-5.6 model-family gate, but do not weaken that gate.
+    from agent.native_incremental_handoff import native_incremental_continuity_capable
+    if native_incremental_continuity_capable(
+        agent,
+        is_codex_backend=is_codex_backend,
+        is_xai_responses=is_xai_responses,
+        is_github_responses=is_github_responses,
+    ):
+        return True
     if not bool(getattr(agent, "codex_responses_native_compaction", False)):
         return False
     if not bool(getattr(agent, "compression_enabled", True)):
@@ -1426,11 +1452,23 @@ def prune_pre_checkpoint_items(
         and isinstance(checkpoint.get("encrypted_content"), str)
         and checkpoint.get("encrypted_content")
     ]
-    handoff_item = (
-        [{"role": "user", "content": active_native_handoff}]
-        if isinstance(active_native_handoff, str)
-        else [protected_handoff_wire_item(active_handoff)] if active_handoff else []
-    )
+    handoff_item: List[Dict[str, Any]] = []
+    if isinstance(active_native_handoff, str):
+        # Mini compaction instructions are necessarily part of the opaque
+        # checkpoint. A post-checkpoint developer boundary proved necessary for
+        # cross-model replay: it demotes all historical reply-format/compaction
+        # commands without changing ciphertext, then the current user tail is
+        # free to control the first ordinary response.
+        if active_native_handoff.startswith("NATIVE_INCREMENTAL_NOTE\n"):
+            handoff_item.append(
+                {
+                    "role": "developer",
+                    "content": NATIVE_INCREMENTAL_REPLAY_BOUNDARY,
+                }
+            )
+        handoff_item.append({"role": "user", "content": active_native_handoff})
+    elif active_handoff:
+        handoff_item.append(protected_handoff_wire_item(active_handoff))
     if active_handoff or isinstance(active_native_handoff, str):
         # A validated handoff is the authoritative replacement for every
         # pre-checkpoint record. Replaying older summaries/users after it would

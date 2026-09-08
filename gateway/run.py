@@ -6652,7 +6652,6 @@ class TurnRunner:
             channel_prompt=ctx.channel_prompt,
             inject_timestamps=_message_timestamps_enabled(ctx.user_config),
         )
-
         # FTS write-corruption guard (#50502): when message persistence
         # fails silently through corrupt FTS triggers, the reloaded
         # transcript above is stale/empty even though the SAME cached agent
@@ -6680,6 +6679,17 @@ class TurnRunner:
                 agent_history = strip_stale_dangerous_confirmations(
                     _selected, now=time.time()
                 )
+        # Keep canonical DB rows as the continuity-note authentication source
+        # while passing the final host-cleaned replay projection to the model.
+        # Bind after the cached-agent guard: that branch can replace the
+        # projection with an unpersisted live suffix. This transient state is
+        # needed only by the explicit incremental route; avoid copying every
+        # gateway history while the feature remains off by default.
+        if bool(getattr(agent, "native_incremental_handoff_enabled", False)):
+            from agent.native_incremental_handoff import bind_native_incremental_replay_projection
+            bind_native_incremental_replay_projection(
+                agent, source_messages=ctx.history, replay_messages=agent_history
+            )
         
         # Collect MEDIA paths already in history so we can exclude them
         # from the current turn's extraction. This is compression-safe:
@@ -21302,6 +21312,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     # would end the live gateway session row.
                                     _hyg_agent._end_session_on_close = False
                                     _hyg_agent._print_fn = lambda *a, **kw: None
+                                    # Hygiene invokes _compress_context directly,
+                                    # bypassing run_conversation's normal restore.
+                                    # Its SessionDB rows are the canonical source,
+                                    # so restore the authenticated note before the
+                                    # opt-in incremental preflight can inspect it.
+                                    if bool(getattr(_hyg_agent, "native_incremental_handoff_enabled", False)):
+                                        from agent.native_incremental_handoff import restore_native_incremental_note
+                                        restore_native_incremental_note(_hyg_agent, _hyg_msgs)
                                     # A native Responses checkpoint is bound to
                                     # the frozen transcript. Starting the
                                     # triggering user turn before its commit

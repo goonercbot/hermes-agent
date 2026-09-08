@@ -2345,6 +2345,18 @@ def init_agent(
     # Legacy compatibility input only. Native continuity has one trigger:
     # ContextCompressor.threshold_tokens. Explicit old values are inert.
     codex_responses_compact_threshold = None
+    native_incremental_handoff_enabled = _is_truthy(
+        _compression_cfg.get("native_incremental_handoff", False)
+    )
+    native_incremental_handoff_model = str(
+        _compression_cfg.get("native_incremental_model", "gpt-5.6-luna") or ""
+    ).strip().lower()
+    try:
+        native_incremental_compact_threshold = int(
+            _compression_cfg.get("native_incremental_compact_threshold", 32000)
+        )
+    except (TypeError, ValueError):
+        native_incremental_compact_threshold = 0
     # Opt-in idle compaction: compact a session up front when it resumes after
     # this many seconds of inactivity (0 = disabled). Time-based, so it
     # complements the size-based threshold above. Consumed by build_turn_context().
@@ -2850,6 +2862,11 @@ def init_agent(
     agent.codex_app_server_auto_compaction = codex_app_server_auto_compaction
     agent.codex_responses_native_compaction = codex_responses_native_compaction
     agent.codex_responses_compact_threshold = codex_responses_compact_threshold
+    agent.native_incremental_handoff_enabled = native_incremental_handoff_enabled
+    agent.native_incremental_handoff_model = native_incremental_handoff_model
+    agent.native_incremental_compact_threshold = native_incremental_compact_threshold
+    agent._native_incremental_handoff_note = None
+    agent._native_incremental_no_progress_fingerprint = None
     agent._native_compaction_attempt = None
     from agent.native_compaction import resolve_native_compaction_capabilities
     agent.runtime_capabilities = resolve_native_compaction_capabilities(
@@ -2857,6 +2874,7 @@ def init_agent(
         base_url=agent.base_url,
         provider=agent.provider,
         is_codex_backend=(agent.provider or "").strip().lower() == "openai-codex",
+        native_incremental_enabled=native_incremental_handoff_enabled,
     )
     agent.max_compression_attempts = compression_max_attempts
     agent.compression_idle_compact_after_seconds = (

@@ -3625,6 +3625,13 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 ),
                 next_args,
             )
+    elif function_name == "continuity_note":
+        def _execute(next_args: dict) -> Any:
+            from agent.native_incremental_handoff import record_native_incremental_note_from_tool_call
+            return _finish_agent_tool(
+                record_native_incremental_note_from_tool_call(agent, next_args, messages or []),
+                next_args,
+            )
     elif function_name == "read_terminal":
         def _execute(next_args: dict) -> Any:
             from tools.read_terminal_tool import read_terminal_tool as _read_terminal_tool

@@ -1956,6 +1956,131 @@ def _mark_compression_blocked_transient(agent: Any, compressor: Any) -> None:
             pass
 
 
+def _native_continuity_eligible_for_compression(agent: Any) -> bool:
+    """Use the native-continuity gate before applying generic local backoff."""
+    if getattr(agent, "api_mode", None) != "codex_responses":
+        return False
+    from agent.codex_responses_adapter import classify_responses_route
+    from agent.native_compaction import native_continuity_capable
+
+    route = classify_responses_route(agent)
+    return native_continuity_capable(
+        agent,
+        is_codex_backend=route.is_codex_backend,
+        is_xai_responses=route.is_xai_responses,
+        is_github_responses=route.is_github_responses,
+    )
+
+
+_NATIVE_NO_PROGRESS_REARM_TOKENS = 1024
+
+
+def _native_structural_backoff_is_the_only_guard(
+    compressor: Any, prompt_tokens: int | None = None
+) -> bool:
+    """Whether native compaction may bypass this local-only generic backoff.
+
+    The generic compressor's structural no-op says only that its own protected
+    window had no work. Native compaction owns a different provider-side
+    boundary, so it may proceed. Summary-failure cooldown and ineffective
+    breakers remain authoritative for every route.
+    """
+    now = time.monotonic()
+    try:
+        structural_until = float(
+            getattr(compressor, "_structural_no_op_backoff_until")
+        )
+        cooldown_until = float(
+            getattr(compressor, "_summary_failure_cooldown_until")
+        )
+        ineffective_count = int(
+            getattr(compressor, "_ineffective_compression_count")
+        )
+        fallback_streak = int(
+            getattr(compressor, "_fallback_compression_streak")
+        )
+    except (AttributeError, TypeError, ValueError):
+        # Unknown/plugin compressor state must keep the existing gate intact.
+        return False
+    structural_only = (
+        structural_until > now
+        and cooldown_until <= now
+        and ineffective_count < 2
+        and fallback_streak < 2
+    )
+    if not structural_only:
+        return False
+
+    # A generic local structural no-op has no native pressure baseline, so it
+    # must not delay the first provider-native attempt. If native compaction
+    # itself returned no checkpoint, however, do not resend essentially the
+    # same request: rearm after one meaningful block of new context arrives.
+    try:
+        native_rearm_tokens = int(
+            getattr(compressor, "_native_no_progress_rearm_tokens", 0) or 0
+        )
+    except (TypeError, ValueError):
+        return False
+    if native_rearm_tokens <= 0:
+        return True
+    try:
+        return prompt_tokens is not None and int(prompt_tokens) >= native_rearm_tokens
+    except (TypeError, ValueError):
+        return False
+
+
+def _automatic_compression_blocked_for_attempt(
+    compressor: Any,
+    *,
+    native_continuity_eligible: bool,
+    prompt_tokens: int | None = None,
+) -> bool:
+    """Apply automatic guards, exempting only native-inapplicable backoff."""
+    blocked = getattr(type(compressor), "_automatic_compression_blocked", None)
+    if not callable(blocked) or not blocked(compressor):
+        return False
+    return not (
+        native_continuity_eligible
+        and _native_structural_backoff_is_the_only_guard(
+            compressor, prompt_tokens
+        )
+    )
+
+
+def automatic_compression_should_attempt(
+    agent: Any, compressor: Any, prompt_tokens: int | None = None
+) -> bool:
+    """Return whether a public automatic trigger may enter compression.
+
+    ``ContextCompressor.should_compress`` is intentionally still the default
+    decision and remains authoritative for every non-native route.  The only
+    exception is a native-continuity-capable Codex Responses route blocked by
+    the generic compressor's transient structural no-op: that backoff describes
+    the generic protected window, not the provider-side native boundary.
+    """
+    if compressor.should_compress(prompt_tokens):
+        return True
+    if not _native_continuity_eligible_for_compression(agent):
+        return False
+    try:
+        tokens = (
+            int(prompt_tokens)
+            if prompt_tokens is not None
+            else int(getattr(compressor, "last_prompt_tokens"))
+        )
+        threshold = int(getattr(compressor, "threshold_tokens"))
+    except (AttributeError, TypeError, ValueError):
+        return False
+    if tokens < threshold:
+        return False
+    blocked = getattr(type(compressor), "_automatic_compression_blocked", None)
+    return bool(
+        callable(blocked)
+        and blocked(compressor)
+        and _native_structural_backoff_is_the_only_guard(compressor, tokens)
+    )
+
+
 def _adopt_live_compression_child(
     agent: Any,
     session_db: Any,
@@ -3215,14 +3340,17 @@ def compress_context(
     # Every automatic entrypoint must honor compressor-owned cooldown and
     # breaker state. Gateway hygiene constructs a fresh AIAgent, so the
     # persisted fallback streak is loaded by bind_session_state() before this.
+    # Native continuity has a provider-owned boundary and may proceed past a
+    # stale generic structural no-op; the helper retains cooldown and
+    # ineffective-breaker protection for that route.
+    _native_continuity_eligible = _native_continuity_eligible_for_compression(agent)
     if not force:
         _refresh_persisted_compression_guards(agent.context_compressor)
-        blocked = getattr(
-            type(agent.context_compressor),
-            "_automatic_compression_blocked",
-            None,
-        )
-        if callable(blocked) and blocked(agent.context_compressor):
+        if _automatic_compression_blocked_for_attempt(
+            agent.context_compressor,
+            native_continuity_eligible=_native_continuity_eligible,
+            prompt_tokens=approx_tokens,
+        ):
             _mark_compression_blocked_transient(agent, agent.context_compressor)
             existing_prompt = getattr(agent, "_cached_system_prompt", None)
             if not existing_prompt:
@@ -3676,12 +3804,13 @@ def compress_context(
             compressor,
             include_cooldown=False,
         )
-        blocked = getattr(
-            type(compressor),
-            "_automatic_compression_blocked",
-            None,
-        )
-        if callable(blocked) and blocked(compressor):
+        if _automatic_compression_blocked_for_attempt(
+            compressor,
+            native_continuity_eligible=_native_continuity_eligible_for_compression(
+                agent
+            ),
+            prompt_tokens=approx_tokens,
+        ):
             _mark_compression_blocked_transient(agent, compressor)
             _release_lock()
             existing_prompt = getattr(agent, "_cached_system_prompt", None)
@@ -3769,6 +3898,7 @@ def compress_context(
                         # adopt-directly behavior for that shape
                         # (test_compression_concurrent_fork).
                         _preflush_ok = True
+                    _adopted_native_watermark = None
                     if not _preflush_ok:
                         logger.warning(
                             "compression: session=%s grew before lease "
@@ -3782,7 +3912,23 @@ def compress_context(
                     else:
                         # Re-read after the flush so the adopted snapshot
                         # carries the just-persisted tail.
-                        durable_parent = durable_loader(_lock_db, _lock_sid)
+                        if getattr(agent, "native_incremental_handoff_enabled", False):
+                            # Bind the watermark to the SAME DB read as the
+                            # adopted history. A later MAX(id) could skip an
+                            # unseen writer; the old watermark would duplicate
+                            # our preflushed triggering user in the child.
+                            durable_parent = durable_loader(
+                                _lock_db, _lock_sid, include_row_ids=True
+                            )
+                            _adopted_ids = [
+                                row.pop("_row_id", None) for row in durable_parent
+                            ]
+                            _adopted_native_watermark = max(
+                                (rid for rid in _adopted_ids if isinstance(rid, int)),
+                                default=None,
+                            )
+                        else:
+                            durable_parent = durable_loader(_lock_db, _lock_sid)
                     if (
                         _preflush_ok
                         and isinstance(durable_parent, list)
@@ -3796,6 +3942,21 @@ def compress_context(
                             len(durable_parent),
                         )
                         messages = durable_parent
+                        if getattr(agent, "native_incremental_handoff_enabled", False):
+                            if _adopted_native_watermark is not None:
+                                _commit_watermark = _adopted_native_watermark
+                            from agent.native_incremental_handoff import (
+                                bind_native_incremental_replay_projection,
+                                restore_native_incremental_note,
+                            )
+
+                            # This is the lease-owned canonical DB read, not an
+                            # arbitrary request rewrite. Rebind both views and
+                            # revalidate the recorded note against that source.
+                            bind_native_incremental_replay_projection(
+                                agent, source_messages=messages, replay_messages=messages
+                            )
+                            restore_native_incremental_note(agent, messages)
                         _pre_msg_count = len(messages)
                         # Token estimate was for the stale snapshot; clear it so
                         # the compressor re-derives from the adopted transcript
@@ -3814,19 +3975,36 @@ def compress_context(
                         # run_agent.py keeps both views aligned.
                         agent._persist_user_message_idx = len(messages)
 
-        from agent.native_compaction import native_compact_context, native_continuity_capable
-        from agent.codex_responses_adapter import classify_responses_route
+        from agent.native_compaction import native_compact_context
+        from agent.native_incremental_handoff import (
+            native_incremental_compact_context,
+            native_incremental_continuity_capable,
+        )
 
-        _native_route = classify_responses_route(agent) if getattr(agent, "api_mode", None) == "codex_responses" else None
-        _use_native_compressor = bool(
-            _native_route is not None
-            and native_continuity_capable(
+        # An explicit incremental opt-in owns this compression decision even
+        # when its route/model configuration is invalid. It therefore reaches
+        # the fail-closed mini operation (which records ``invalid_route`` and
+        # leaves history unchanged) rather than falling through to the legacy
+        # native or full-summary compressor.
+        _incremental_requested = bool(
+            getattr(agent, "native_incremental_handoff_enabled", False)
+        )
+        _use_native_compressor = (
+            _incremental_requested or _native_continuity_eligible_for_compression(agent)
+        )
+        if _incremental_requested:
+            _use_native_incremental = True
+        elif _use_native_compressor:
+            from agent.codex_responses_adapter import classify_responses_route
+            _native_route = classify_responses_route(agent)
+            _use_native_incremental = native_incremental_continuity_capable(
                 agent,
                 is_codex_backend=_native_route.is_codex_backend,
                 is_xai_responses=_native_route.is_xai_responses,
                 is_github_responses=_native_route.is_github_responses,
             )
-        )
+        else:
+            _use_native_incremental = False
 
         # Notify external memory provider before compression discards context.
         # The provider's on_pre_compress() may return a string of insights it
@@ -3970,10 +4148,16 @@ def compress_context(
                 with aux_progress_hook(_progress_hook), aux_interrupt_protection(
                     cancel_event=_hard_cancel_event
                 ):
-                    if _use_native_compressor:
-                        # The shared destructive seam owns the complete two-call
-                        # lifecycle. No turn-boundary candidate or final-wire
-                        # side path may arm native compaction.
+                    if _use_native_incremental:
+                        # The incremental path is one pinned-mini inline
+                        # compaction request. It has no main-model handoff.
+                        agent.context_compressor._last_compress_aborted = False
+                        agent.context_compressor._last_summary_error = None
+                        compressed = native_incremental_compact_context(
+                            agent, messages, system_message
+                        )
+                    elif _use_native_compressor:
+                        # Legacy native lifecycle remains unchanged.
                         agent.context_compressor._last_compress_aborted = False
                         agent.context_compressor._last_summary_error = None
                         compressed = native_compact_context(agent, messages, system_message)
@@ -4156,6 +4340,15 @@ def compress_context(
                         "compaction returned the transcript unchanged "
                         "(no_progress)"
                     )
+                    if _use_native_compressor:
+                        try:
+                            _native_pressure = max(0, int(approx_tokens or 0))
+                        except (TypeError, ValueError):
+                            _native_pressure = 0
+                        if _native_pressure:
+                            agent.context_compressor._native_no_progress_rearm_tokens = (
+                                _native_pressure + _NATIVE_NO_PROGRESS_REARM_TOKENS
+                            )
             except Exception:
                 logger.debug(
                     "no-progress backoff arm failed", exc_info=True

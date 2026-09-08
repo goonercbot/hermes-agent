@@ -2295,6 +2295,7 @@ class ContextCompressor(ContextEngine):
         self._ineffective_compression_count = 0
         self._anti_thrash_recovery_deadline = 0.0
         self._structural_no_op_backoff_until = 0.0
+        self._native_no_progress_rearm_tokens = 0
         self._prellm_skip_count = 0
         self._fallback_compression_streak = 0
         self._verify_compaction_cleared_threshold = False
@@ -2599,6 +2600,7 @@ class ContextCompressor(ContextEngine):
         self._ineffective_compression_count = 0
         self._anti_thrash_recovery_deadline = 0.0
         self._structural_no_op_backoff_until = 0.0
+        self._native_no_progress_rearm_tokens = 0
         self._prellm_skip_count = 0
         self._fallback_compression_streak = 0
         self._verify_compaction_cleared_threshold = False
@@ -2632,6 +2634,7 @@ class ContextCompressor(ContextEngine):
         self._prellm_skip_count = 0
         self._anti_thrash_recovery_deadline = 0.0
         self._structural_no_op_backoff_until = 0.0
+        self._native_no_progress_rearm_tokens = 0
         self._proactive_prune_rearm_tokens = 0
         self.get_active_compression_failure_cooldown()
         self._load_fallback_compression_streak()
@@ -2826,6 +2829,10 @@ class ContextCompressor(ContextEngine):
         turn) while auto-compaction resumes on its own once the backoff
         lapses or the transcript outgrows the window.
         """
+        # Generic structural no-ops have no native provider-pressure baseline.
+        # The native wrapper may stamp one immediately after this call when
+        # the provider itself returned no checkpoint.
+        self._native_no_progress_rearm_tokens = 0
         self._structural_no_op_backoff_until = (
             time.monotonic() + self._STRUCTURAL_NO_OP_BACKOFF_SECONDS
         )
@@ -2879,6 +2886,7 @@ class ContextCompressor(ContextEngine):
         # lift any pending structural no-op backoff (#93022) alongside the
         # usual bookkeeping.
         self._structural_no_op_backoff_until = 0.0
+        self._native_no_progress_rearm_tokens = 0
         self._verify_compaction_cleared_threshold = True
         if feasibility_skip:
             # A deliberate pre-LLM feasibility skip (#60451) is not a
@@ -3549,6 +3557,10 @@ class ContextCompressor(ContextEngine):
         # Transient deferral after a structural no-op (#93022) — see the
         # _STRUCTURAL_NO_OP_BACKOFF_SECONDS class constant.
         self._structural_no_op_backoff_until: float = 0.0
+        # Native no-progress retries are pressure-rearmed rather than purely
+        # time-rearmed. Zero means the structural backoff came from the generic
+        # compressor and does not describe the native provider boundary.
+        self._native_no_progress_rearm_tokens: int = 0
         # True while the live local cooldown failed to persist to the DB;
         # a refresh must then treat an empty durable row as unknown, not
         # cleared (see get_active_compression_failure_cooldown).
@@ -7715,6 +7727,7 @@ This compaction should PRIORITISE preserving all information related to the focu
             # Manual /compress also overrides a structural no-op backoff
             # (#93022): an explicit user request must always get a real try.
             self._structural_no_op_backoff_until = 0.0
+            self._native_no_progress_rearm_tokens = 0
         n_messages = len(messages)
         # Only need head + 3 tail messages minimum (token budget decides the real tail size)
         _min_for_compress = self._protect_head_size(messages) + 3 + 1

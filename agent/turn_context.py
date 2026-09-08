@@ -34,6 +34,7 @@ from typing import Any, Dict, List, Mapping, Optional
 from agent.conversation_compression import (
     IDLE_COMPACTION_STATUS_TEMPLATE,
     PREFLIGHT_COMPRESSION_STATUS_TEMPLATE,
+    automatic_compression_should_attempt,
     compression_skipped_due_to_lock,
     conversation_history_after_compression,
     recover_rotated_compression_session,
@@ -1101,7 +1102,9 @@ def build_turn_context(
                 getattr(agent, "codex_app_server_auto_compaction", "native"),
             )
         else:
-            _should_compress_now = _compressor.should_compress(_preflight_tokens)
+            _should_compress_now = automatic_compression_should_attempt(
+                agent, _compressor, _preflight_tokens
+            )
             if not _should_compress_now:
                 # Context is over threshold but compression is blocked
                 # (summary-LLM cooldown or anti-thrashing). Ask should_compress_info
@@ -1201,7 +1204,9 @@ def build_turn_context(
                 agent._last_content_with_tools = None
                 agent._last_content_tools_all_housekeeping = False
                 agent._mute_post_response = False
-                if not _compressor.should_compress(_preflight_tokens):
+                if not automatic_compression_should_attempt(
+                    agent, _compressor, _preflight_tokens
+                ):
                     break
                 if not _compression_warrants_another_preflight_pass(
                     _orig_tokens,

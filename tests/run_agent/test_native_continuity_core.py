@@ -241,6 +241,92 @@ def test_checkpoint_only_and_checkpoint_plus_text_use_checkpoint_path(with_text)
     assert compacted[0]["codex_reasoning_items"][0]["encrypted_content"] == "checkpoint"
 
 
+def test_checkpoint_first_handoff_replays_before_empty_answer_handling():
+    """A valid checkpoint from the handoff request needs a model handoff, not fallback."""
+    agent, calls = _agent(
+        [
+            _response({"type": "compaction", "encrypted_content": "checkpoint"}),
+            _response(_message("replayed model handoff")),
+        ]
+    )
+
+    compacted = native_compact_context(agent, _source(), "system")
+
+    assert len(calls) == 2
+    assert "context_management" not in calls[0]
+    assert calls[1]["input"] == [
+        {"type": "compaction", "encrypted_content": "checkpoint"}
+    ]
+    assert "context_management" not in calls[1]
+    assert compacted[0]["codex_reasoning_items"][0]["encrypted_content"] == "checkpoint"
+    assert compacted[1]["content"] == "replayed model handoff"
+
+
+def test_top_level_output_text_is_accepted_as_provider_written_handoff():
+    """The SDK may expose text only through Response.output_text."""
+    agent, calls = _agent(
+        [
+            SimpleNamespace(
+                output=[], status="completed", output_text="top-level handoff"
+            ),
+            _response({"type": "compaction", "encrypted_content": "checkpoint"}),
+        ]
+    )
+
+    compacted = native_compact_context(agent, _source(), "system")
+
+    assert len(calls) == 2
+    assert compacted[0]["codex_reasoning_items"][0]["encrypted_content"] == "checkpoint"
+    assert compacted[1]["content"] == "top-level handoff"
+
+
+def test_checkpoint_plus_handoff_in_first_response_needs_no_replay_request():
+    agent, calls = _agent(
+        [
+            _response(
+                {"type": "compaction", "encrypted_content": "checkpoint"},
+                _message("same-response handoff"),
+            )
+        ]
+    )
+
+    compacted = native_compact_context(agent, _source(), "system")
+
+    assert len(calls) == 1
+    assert compacted[0]["codex_reasoning_items"][0]["encrypted_content"] == "checkpoint"
+    assert compacted[1]["content"] == "same-response handoff"
+
+
+def test_checkpoint_first_replay_checkpoint_fails_without_fabricating_handoff():
+    agent, _calls = _agent(
+        [
+            _response({"type": "compaction", "encrypted_content": "first"}),
+            _response({"type": "compaction", "encrypted_content": "second"}),
+        ]
+    )
+
+    with pytest.raises(ValueError, match="replay returned no handoff"):
+        native_compact_context(agent, _source(), "system")
+
+
+def test_checkpoint_first_replay_checkpoint_plus_handoff_uses_latest_checkpoint():
+    agent, calls = _agent(
+        [
+            _response({"type": "compaction", "encrypted_content": "first"}),
+            _response(
+                {"type": "compaction", "encrypted_content": "second"},
+                _message("replayed handoff"),
+            ),
+        ]
+    )
+
+    compacted = native_compact_context(agent, _source(), "system")
+
+    assert len(calls) == 2
+    assert compacted[0]["codex_reasoning_items"][0]["encrypted_content"] == "second"
+    assert compacted[1]["content"] == "replayed handoff"
+
+
 def test_no_checkpoint_ordinary_response_releases_original_history():
     source = _source()
     before = deepcopy(source)

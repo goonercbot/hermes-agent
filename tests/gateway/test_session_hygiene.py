@@ -650,19 +650,11 @@ async def test_session_hygiene_timeout_continues_to_agent_and_sets_cooldown(monk
 
 
 @pytest.mark.asyncio
-async def test_session_hygiene_turn_hold_budget_abandons_streaming_wait(
-    monkeypatch, tmp_path
+@pytest.mark.parametrize("report_progress", [True, False])
+async def test_session_hygiene_streaming_compression_keeps_turn_exclusive_until_commit(
+    monkeypatch, tmp_path, report_progress
 ):
-    """A compression that still streams progress must not hold the turn hostage.
-
-    Regression test for the bounded turn-hold (#TKT-0029). The worker keeps
-    ticking the commit fence (touch_progress), so the per-slice inactivity
-    timeout NEVER fires — without a turn-hold budget the gateway would extend
-    the wait up to the total ceiling (default 600s) while zero bytes hit the
-    wire, severing the transport. The turn must instead be abandoned once it
-    exceeds ``hygiene_max_turn_hold_seconds``, proceed on the uncompressed
-    transcript, and fence the stale commit.
-    """
+    """Native hygiene owns the turn through checkpoint prefill and commit."""
     fake_dotenv = types.ModuleType("dotenv")
     fake_dotenv.load_dotenv = lambda *args, **kwargs: None
     monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
@@ -679,6 +671,17 @@ async def test_session_hygiene_turn_hold_budget_abandons_streaming_wait(
         def __init__(self, **kwargs):
             self.session_id = kwargs.get("session_id", "fake-session")
             self._session_db = kwargs.get("session_db")
+            self.api_mode = "codex_responses"
+            self.provider = "openai-codex"
+            self.base_url = "https://chatgpt.com/backend-api/codex/"
+            self.model = "gpt-5.6-sol"
+            self.codex_responses_native_compaction = True
+            self.compression_enabled = True
+            self._codex_reasoning_replay_enabled = True
+            self.runtime_capabilities = {"native_compaction": True}
+            self.capabilities = {}
+            self._is_codex_backend = lambda: True
+            self._is_copilot_url = lambda: False
             self._last_compaction_in_place = False
             self.context_compressor = SimpleNamespace(
                 bind_session_state=MagicMock(),
@@ -693,10 +696,11 @@ async def test_session_hygiene_turn_hold_budget_abandons_streaming_wait(
             self, messages, *_args, commit_fence=None, **_kwargs
         ):
             worker_started.set()
-            # Stream progress continuously so the inactivity slice never
-            # times out; only the turn-hold budget can abandon this wait.
+            # Stream past the old turn-hold default. The turn must remain
+            # exclusive until this worker commits, not start on stale history.
+            threading.Timer(0.35, release_worker.set).start()
             while not release_worker.is_set():
-                if commit_fence is not None:
+                if commit_fence is not None and report_progress:
                     commit_fence.touch_progress()
                 time.sleep(0.01)
             if commit_fence is not None and not commit_fence.begin_commit():
@@ -720,10 +724,12 @@ async def test_session_hygiene_turn_hold_budget_abandons_streaming_wait(
     cfg_path.write_text(
         "compression:\n"
         "  enabled: true\n"
-        # Inactivity budget is huge, so the slice timeout can never fire on
-        # its own; the turn-hold budget is the ONLY thing that abandons.
-        "  hygiene_timeout_seconds: 60\n"
+        # The no-progress arm reproduces a native Responses checkpoint request:
+        # its SSE events are not summary-progress events, so the provider's own
+        # watchdog and this hard ceiling — not the generic idle budget — own it.
+        "  hygiene_timeout_seconds: 0.1\n"
         "  hygiene_total_ceiling_seconds: 600\n"
+        # Native compaction must ignore the ordinary availability cutoff.
         "  hygiene_max_turn_hold_seconds: 0.3\n"
         "  hygiene_failure_cooldown_seconds: 120\n"
     )
@@ -787,62 +793,89 @@ async def test_session_hygiene_turn_hold_budget_abandons_streaming_wait(
     )
 
     started = time.monotonic()
-    result = await asyncio.wait_for(runner._handle_message(event), timeout=15)
+    first_turn = asyncio.create_task(runner._handle_message(event))
+    await asyncio.wait_for(asyncio.to_thread(worker_started.wait), timeout=3)
+
+    followup = MessageEvent(
+        text="follow-up",
+        source=event.source,
+        message_id="2",
+    )
+    assert await runner._handle_message(followup) is None
+    assert adapter._pending_messages["agent:main:telegram:dm:12345"].text == "follow-up"
+    assert runner._run_agent.await_count == 0
+
+    result = await asyncio.wait_for(first_turn, timeout=15)
     elapsed = time.monotonic() - started
 
-    # The turn proceeded on the uncompressed transcript well under the 600s
-    # ceiling — the turn-hold budget (~0.3s) abandoned the streaming wait.
+    # The worker streamed for longer than the former turn-hold test budget
+    # and committed before this handler was allowed to start the user turn.
     assert result == "ok"
-    assert elapsed < 5.0, f"turn held for {elapsed:.1f}s despite the turn-hold budget"
+    assert elapsed >= 0.3, f"turn started before hygiene committed ({elapsed:.2f}s)"
+    assert elapsed < 5.0
     assert worker_started.is_set()
     assert runner._run_agent.await_count == 1
-    # The stale commit must be fenced: the late worker never mutates the session.
-    fake_db.archive_and_compact.assert_not_called()
+    fake_db.archive_and_compact.assert_called_once()
 
-    release_worker.set()
     await asyncio.wait_for(asyncio.to_thread(cleanup_done.wait), timeout=3)
-    fake_db.archive_and_compact.assert_not_called()
     StreamingCompressAgent.last_instance.close.assert_called_once()
 
-    # Behavior witness 1: turn-hold expiry must NOT stamp the idle-timeout
-    # provenance or send the "no output" user message.
+    # A completed streaming worker neither emits a timeout nor records a
+    # cancellation cooldown.
     sent_contents = [m["content"] for m in adapter.sent]
     assert not any(
-        "timed out" in c.lower() and "no output" in c.lower()
+        "timed out" in c.lower() or "deferred" in c.lower()
         for c in sent_contents
-    ), f"turn-hold must not send idle-timeout message, got: {sent_contents}"
-    assert any(
-        "deferred" in c.lower() or "still streaming" in c.lower()
-        for c in sent_contents
-    ), f"turn-hold must send deferral notice, got: {sent_contents}"
-
-    # Behavior witness 2: turn-hold must NOT advance the failure STREAK.
+    ), f"completed hygiene must not send a deferral/timeout, got: {sent_contents}"
     fake_db.get_compression_failure_cooldown.assert_called()
-    # The escalating ladder (x1, x3, x9) is reserved for real failures via
-    # _hygiene_cooldown_for_failure -> increment_hygiene_failure_streak.
-    # The turn-hold path records only a flat, non-escalating retry-after
-    # (spacing out re-attempts so sustained traffic does not spawn and
-    # cancel a fresh compressor every turn) and must never touch the streak.
-    assert not fake_db.increment_hygiene_failure_streak.called, \
-        "turn-hold must not advance the failure streak"
-    assert fake_db.record_compression_failure_cooldown.called, \
-        "turn-hold must record the flat retry-after spacing"
-    _th_args = fake_db.record_compression_failure_cooldown.call_args[0]
-    import time as _time_mod
-    _th_retry = _th_args[1] - _time_mod.time()
-    assert _th_retry <= 120, (
-        f"turn-hold retry-after must stay flat (~60s), got {_th_retry:.0f}s "
-        "— escalating ladder leaked into the deferral path"
-    )
-    assert "turn-hold" in (_th_args[2] or ""), \
-        "retry-after reason must name the turn-hold deferral"
+    assert not fake_db.record_compression_failure_cooldown.called
 
-    # Behavior witness 3: the #87011 contract remains truthful —
-    # "session hygiene compression timed out" still means a real idle
-    # timeout, not a turn-hold deferral. The turn-hold path must use a
-    # distinct provenance stamp.
-    # (Verified indirectly: the idle-timeout path would have sent the
-    # "no output" message, which we already asserted absent above.)
+
+def test_exclusive_completion_policy_is_native_codex_responses_only():
+    from gateway.run import _hygiene_requires_exclusive_completion
+
+    direct_native = SimpleNamespace(
+        api_mode="codex_responses",
+        provider="openai-codex",
+        base_url="https://chatgpt.com/backend-api/codex/",
+        model="gpt-5.6-sol",
+        codex_responses_native_compaction=True,
+        compression_enabled=True,
+        _codex_reasoning_replay_enabled=True,
+        runtime_capabilities={"native_compaction": True},
+        capabilities={},
+        _is_codex_backend=lambda: True,
+        _is_copilot_url=lambda: False,
+    )
+    assert _hygiene_requires_exclusive_completion(
+        direct_native
+    )
+    assert not _hygiene_requires_exclusive_completion(
+        SimpleNamespace(
+            **{
+                **direct_native.__dict__,
+                "codex_responses_native_compaction": False,
+            }
+        )
+    )
+    assert not _hygiene_requires_exclusive_completion(
+        SimpleNamespace(
+            **{
+                **direct_native.__dict__,
+                "provider": "xai",
+                "base_url": "https://api.x.ai/v1",
+                "_is_codex_backend": lambda: False,
+            }
+        )
+    )
+    assert not _hygiene_requires_exclusive_completion(
+        SimpleNamespace(
+            **{
+                **direct_native.__dict__,
+                "model": "gpt-5.5",
+            }
+        )
+    )
 
 
 @pytest.mark.asyncio
@@ -901,7 +934,6 @@ async def test_session_hygiene_idle_timeout_still_takes_failure_path(
         "  enabled: true\n"
         "  hygiene_timeout_seconds: 0.1\n"
         "  hygiene_total_ceiling_seconds: 600\n"
-        "  hygiene_max_turn_hold_seconds: 60\n"
         "  hygiene_failure_cooldown_seconds: 120\n"
     )
 

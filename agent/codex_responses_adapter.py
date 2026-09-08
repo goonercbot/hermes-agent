@@ -1283,6 +1283,14 @@ def _preflight_codex_input_items(
             continue
 
         role = item.get("role")
+        if role == "developer":
+            from agent.native_compaction import NATIVE_INCREMENTAL_REPLAY_BOUNDARY
+            # Only the host's fixed boundary immediately after a checkpoint is
+            # admitted here; arbitrary developer rows remain unsupported.
+            if (normalized and normalized[-1].get("type") == "compaction"
+                    and item.get("content") == NATIVE_INCREMENTAL_REPLAY_BOUNDARY):
+                normalized.append({"role": "developer", "content": NATIVE_INCREMENTAL_REPLAY_BOUNDARY})
+                continue
         if role in {"user", "assistant"}:
             content = item.get("content", "")
             if content is None:

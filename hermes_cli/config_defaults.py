@@ -927,13 +927,11 @@ DEFAULT_CONFIG = {
                                       # while tokens are still moving — bounds a degenerate
                                       # trickle stream. Clamped to >= hygiene_timeout_seconds.
         "hygiene_failure_cooldown_seconds": 300,  # skip repeated failed hygiene attempts for this session
-        "hygiene_max_turn_hold_seconds": 10,  # max seconds an ARRIVING user turn is held while a
-                                      # still-streaming hygiene summary finishes. Distinct from
-                                      # hygiene_timeout_seconds (compressor inactivity budget):
-                                      # this bounds user-visible latency once real input is
-                                      # waiting. Kept well under chat-transport idle timeouts
-                                      # (Telegram ~30s). On expiry the turn proceeds
-                                      # uncompressed — an availability boundary, not a failure.
+        "hygiene_max_turn_hold_seconds": 10,  # non-native hygiene only: max seconds an arriving
+                                      # user turn waits while a streaming summary finishes.
+                                      # Native Responses compaction must retain exclusive
+                                      # ownership through commit so its checkpoint is not
+                                      # invalidated by the triggering turn.
         "context_timeout_seconds": 120,  # inactivity budget for in-agent compress_context
                                       # (conversation loop, /compress, preflight, etc.).
                                       # Same progress-aware semantics as hygiene_timeout_seconds:
@@ -1006,6 +1004,13 @@ DEFAULT_CONFIG = {
                                       # Native continuity always uses the live
                                       # ContextCompressor.threshold_tokens value;
                                       # explicit legacy values are ignored.
+        "native_incremental_handoff": False,  # Opt in to the one-call Codex
+                                      # mini incremental checkpoint route. This
+                                      # is independent of the legacy gpt-5.6
+                                      # native path and never invokes the active
+                                      # agent model to make a handoff.
+        "native_incremental_model": "gpt-5.6-luna",
+        "native_incremental_compact_threshold": 32000,
         "in_place": True,             # When True, compaction rewrites the message
                                       # list and rebuilds the system prompt WITHOUT
                                       # rotating the session id — the conversation

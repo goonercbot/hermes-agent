@@ -18,7 +18,7 @@ change credentials, restart services, or enable a fleet rollout.
 compression:
   native_incremental_handoff: true
   native_incremental_model: gpt-5.6-luna
-  native_incremental_compact_threshold: 32000
+  native_incremental_compact_threshold: 128000
 ```
 
 The supported route is `openai-codex` with `api_mode: codex_responses`. The
@@ -33,6 +33,12 @@ The tool is unavailable when the feature flag is off. Tool search can expose
 it through its deferred catalogue. The host's existing compression threshold
 still decides when to attempt compression; `native_incremental_compact_threshold`
 is the provider's inline checkpoint setting, not a second host retry trigger.
+
+The default is 128,000 tokens. The former 32,000 setting can trigger repeated
+compaction passes within one request when the resulting context still exceeds
+that target. Existing explicit settings are respected: updating code alone
+does not migrate a profile pinned to 32,000. Any profile-setting change needs
+its own activation approval. The host trigger and idle/total limits are unchanged.
 
 ## Ordinary-work note
 
@@ -51,6 +57,13 @@ the note and publication watermark are rebound to that same read.
 Missing or stale notes leave the source unchanged. A missing note is not an
 instruction to discard history or silently invoke the slow main-model handoff.
 Ordinary note maintenance is a prerequisite, not a guaranteed autonomous task.
+
+The gateway `/compress` helper restores the authenticated note before invoking
+the native route, like automatic hygiene. It does not mint or renew a note to
+bypass a stale source fence. A blocked no-op reports its reason rather than only
+"No changes". Post-note rows remain protected, so an old note can still prevent
+useful reduction; record current progress during ordinary work instead of
+weakening history validation.
 
 ## Request and replay safety
 
@@ -104,8 +117,23 @@ seconds and compression plus a correct first reply in 17.618 seconds. Another
 turn and a fresh-process reload retained the required facts. A subsequent
 natural Riccardo-only compression committed in 52.133 seconds and ordinary
 Astra replies resumed. These are individual observations, not a benchmark or
-proof of long-term reliability. The warning-timing addition is locally tested,
-not yet activated or naturally observed.
+proof of long-term reliability. Those observations predate the progress,
+manual-command, and compression-target corrections described below.
+
+Subsequent isolated timing investigation distinguished provider recursion from
+the host progress bug: one historical 180-row source at 32,000 emitted repeated
+checkpoints and reached the 600-second total ceiling. The same source and prompt
+at 128,000 emitted one checkpoint and completed in 102.775 seconds, but no
+smaller candidate was committed; its old note left most history protected.
+That diagnostic is not a successful compression canary.
+
+A separate real 500-row source with a current authenticated note, at 128,000,
+compressed in 55.115 seconds; its subsequent Astra call took 3.231 seconds and
+correctly recalled the requested periods and layout restriction. Source rows
+were read back unchanged and private databases removed. These observations
+support the target correction, not an unconditional latency guarantee. The
+progress-fence correction separately keeps genuine native stream activity from
+being cancelled by the generic idle timer; real stalls and total ceilings remain.
 
 Run the relevant tests from an isolated development environment:
 

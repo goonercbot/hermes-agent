@@ -4704,6 +4704,12 @@ class GatewaySlashCommandsMixin:
                 session_db=getattr(self._session_db, "_db", self._session_db),
             )
             _seed_hygiene_system_prompt(tmp_agent, session_row)
+            # This helper does not enter ordinary turn setup, which restores
+            # the authenticated continuity note. Match automatic hygiene before
+            # invoking native compression; force=True must not bypass validation.
+            if getattr(tmp_agent, "native_incremental_handoff_enabled", False) is True:
+                from agent.native_incremental_handoff import restore_native_incremental_note
+                restore_native_incremental_note(tmp_agent, head)
             # Keep the real source platform during construction so external
             # context engines bind correctly. If compression has to rebuild the
             # prompt, stamp that provider-less fallback as stale for the next

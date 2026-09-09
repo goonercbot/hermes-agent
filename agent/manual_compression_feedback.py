@@ -81,6 +81,8 @@ def summarize_manual_compression(
         headline = (
             f"Compressed with fallback: {before_count} → {after_count} messages"
         )
+    elif noop and failure_reason:
+        headline = f"Compression blocked: {before_count} messages preserved"
     elif noop:
         headline = f"No changes from compression: {before_count} messages"
     else:
@@ -119,8 +121,10 @@ def summarize_manual_compression(
             "Note: fewer messages can still raise this estimate when "
             "compression rewrites the transcript into denser summaries."
         )
+    elif noop and failure_reason:
+        note = "Compression could not proceed; no messages were removed."
 
-    if failure_reason and (aborted or fallback_used):
+    if failure_reason and (aborted or fallback_used or noop):
         # This text crosses a user-facing UI boundary.  Never let a disabled
         # global redaction preference expose credentials embedded in provider
         # exception text.

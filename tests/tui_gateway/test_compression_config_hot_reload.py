@@ -36,6 +36,22 @@ def _session_with_compressor(**compression_ctor):
     }, compressor
 
 
+def test_native_target_default_and_explicit_override_preserve_host_trigger(monkeypatch):
+    for explicit in (None, 64000):
+        session, compressor = _session_with_compressor()
+        before = compressor.threshold_tokens
+        compression = {'native_incremental_handoff': True}
+        if explicit is not None:
+            compression['native_incremental_compact_threshold'] = explicit
+        monkeypatch.setattr(server, '_load_cfg', lambda: {
+            'model': {'default': 'gpt-5.6-sol', 'provider': 'openai-codex', 'context_length': 272_000},
+            'compression': compression,
+        })
+        server._sync_agent_compression_with_config('native-target', session)
+        assert session['agent'].native_incremental_compact_threshold == (explicit or 128000)
+        assert compressor.threshold_tokens == before
+
+
 def test_live_threshold_tokens_applies_on_next_turn_without_rebuild(monkeypatch):
     session, compressor = _session_with_compressor()
     stale = compressor.threshold_tokens

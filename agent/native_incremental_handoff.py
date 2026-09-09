@@ -33,7 +33,9 @@ logger = logging.getLogger(__name__)
 
 NATIVE_INCREMENTAL_NOTE_VERSION = 1
 NATIVE_INCREMENTAL_MODEL = "gpt-5.6-luna"
-NATIVE_INCREMENTAL_COMPACT_THRESHOLD = 32_000
+# Leave enough room for the rendered checkpoint. An overly small target can
+# trigger repeated provider compactions inside a single Responses request.
+NATIVE_INCREMENTAL_COMPACT_THRESHOLD = 128_000
 NATIVE_INCREMENTAL_NOTE_MAX_CHARS = 8_000
 NATIVE_INCREMENTAL_SUFFIX_MAX_ITEMS = 16
 

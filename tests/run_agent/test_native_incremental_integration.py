@@ -439,11 +439,26 @@ def test_unbound_tool_and_unpaired_payload_cannot_stage_note():
     assert restore_native_incremental_note(NS(session_id='session'),history) is None
 
 
-def test_native_operation_default_is_separate_from_main_trigger():
+def test_native_operation_default_is_separate_from_main_trigger(tmp_path, monkeypatch):
     from agent.native_incremental_handoff import NATIVE_INCREMENTAL_COMPACT_THRESHOLD
     from hermes_cli.config_defaults import DEFAULT_CONFIG
-    assert NATIVE_INCREMENTAL_COMPACT_THRESHOLD==32000
-    assert DEFAULT_CONFIG['compression']['native_incremental_compact_threshold']==32000
+    from run_agent import AIAgent
+    assert NATIVE_INCREMENTAL_COMPACT_THRESHOLD==128000
+    assert DEFAULT_CONFIG['compression']['native_incremental_compact_threshold']==128000
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    for explicit in (None, 64000):
+        config = 'compression:\n  enabled: true\n  native_incremental_handoff: true\n'
+        if explicit is not None:
+            config += f'  native_incremental_compact_threshold: {explicit}\n'
+        (tmp_path/'config.yaml').write_text(config)
+        agent = AIAgent(api_key='fixture', base_url='https://chatgpt.com/backend-api/codex',
+                        api_mode='codex_responses', model='gpt-6-astra', provider='openai-codex',
+                        quiet_mode=True, skip_memory=True, skip_context_files=True,
+                        skip_background_review=True, enabled_toolsets=[])
+        try:
+            assert agent.native_incremental_compact_threshold == (explicit or 128000)
+        finally:
+            agent.close()
 
 
 @pytest.mark.parametrize('item',[

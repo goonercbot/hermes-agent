@@ -6802,7 +6802,7 @@ def _apply_live_compression_config(agent: Any, cfg: dict | None) -> None:
     ).strip().lower()
     try:
         agent.native_incremental_compact_threshold = int(
-            compression.get("native_incremental_compact_threshold", 32000)
+            compression.get("native_incremental_compact_threshold", 128000)
         )
     except (TypeError, ValueError):
         agent.native_incremental_compact_threshold = 0

@@ -248,6 +248,12 @@ def record_native_incremental_note(
     if not isinstance(note, dict) or note != expected:
         raise ValueError("native incremental note has invalid identity or shape")
     agent._native_incremental_handoff_note = deepcopy(expected)
+    previous = getattr(agent, "_last_native_incremental_compaction", {}) or {}
+    if previous.get("disposition") in ("refresh_required", "not_ready"):
+        compressor = getattr(agent, "context_compressor", None)
+        if compressor is not None:
+            compressor._structural_no_op_backoff_until = 0.0
+            compressor._native_no_progress_rearm_tokens = 0
     return deepcopy(expected)
 
 
@@ -300,12 +306,20 @@ def _protected_tail_since_note(
     cursor = note["source_cursor"] if projection_cursor is None else projection_cursor
     latest_user_tail = _latest_user_tail(messages)
     latest_user_start = len(messages) - len(latest_user_tail)
-    start = min(cursor, latest_user_start)
-    # Recording happens inside a tool group. Its result can be the first row
-    # after the cursor, so keep the matching assistant call and sibling results.
+    start = cursor
+    # Keep the latest tool group intact, including pending sibling results.
+    # A fresh ordinary note is itself in that group. Keeping every row since
+    # an older user message would defeat that refreshed boundary on long turns.
+    latest_group = next((index for index in range(len(messages) - 1, -1, -1)
+                         if messages[index].get("role") == "assistant"
+                         and messages[index].get("tool_calls")), None)
+    if latest_group is not None:
+        start = min(start, latest_group)
     while start > 0 and start < len(messages) and messages[start].get("role") == "tool":
         start -= 1
-    return deepcopy(messages[start:])
+    if latest_user_start < start:
+        return deepcopy([messages[latest_user_start], *messages[start:]])
+    return deepcopy(messages[min(start, latest_user_start):])
 
 
 def _continuity_note_arguments(value: Any) -> Optional[Dict[str, Any]]:
@@ -648,6 +662,57 @@ def _usage(response: Any) -> Dict[str, Optional[int]]:
     }
 
 
+def native_note_refresh_required(agent: Any, messages: List[Dict[str, Any]]) -> bool:
+    """Bound the uncheckpointed tail before it becomes impossible to shrink.
+
+    Authentication is unchanged. A valid but old note still protects every
+    later row; it must be refreshed by ordinary model/tool execution, never
+    silently rebound by the host. Size is a local serialized-character proxy,
+    not a claim about provider token counts.
+    """
+    note = _staged_note(agent, messages)
+    # Freshness measures evidence added after the authenticated cursor. The
+    # latest user message remains protected independently, however large it is;
+    # asking for another note cannot make that required input disappear.
+    cursor = getattr(agent, "_native_incremental_handoff_projection_cursor", None)
+    tail = messages if note is None else messages[cursor if cursor is not None else note["source_cursor"]:]
+    return _native_message_size(tail) > 128_000
+
+
+def prepare_native_note_refresh_request(agent: Any, messages: List[Dict[str, Any]], request: Dict[str, Any]) -> bool:
+    """Use the next ordinary turn for a note, not an extra summary-model pass."""
+    from agent.codex_responses_adapter import classify_responses_route
+    from tools.continuity_note_tool import CONTINUITY_NOTE_SCHEMA
+    route = classify_responses_route(agent)
+    if not native_incremental_continuity_capable(
+        agent, is_codex_backend=route.is_codex_backend,
+        is_xai_responses=route.is_xai_responses, is_github_responses=route.is_github_responses,
+    ) or not native_note_refresh_required(agent, messages):
+        return False
+    request_id = getattr(agent, "_current_api_request_id", None)
+    if isinstance(request_id, str) and ":api:" in request_id:
+        note = _staged_note(agent, messages) or {}
+        identity = (request_id.partition(":api:")[0], note.get("source_prefix_fence"))
+        previous = getattr(agent, "_native_note_refresh_request_guard", None)
+        if previous and previous[0] == identity and previous[1] != request_id:
+            raise RuntimeError("Continuity-note refresh did not advance its authenticated cursor; stopping repeated maintenance requests")
+        agent._native_note_refresh_request_guard = (identity, request_id)
+    # The note is a registered, host-bound maintenance tool. No executable
+    # user tools can run in this maintenance response; normal tools return on
+    # the next request. Durable history and cached instructions stay unchanged.
+    request["tools"] = [{"type": "function", **deepcopy(CONTINUITY_NOTE_SCHEMA)}]
+    request["tool_choice"] = {"type": "function", "name": "continuity_note"}
+    request["parallel_tool_calls"] = False
+    request["instructions"] = str(request.get("instructions", "")) + (
+        "\nContext maintenance: call continuity_note now with a concise, current "
+        "objective, verified work state, next action, and unresolved blockers. "
+        "Incorporate the latest user corrections; do not copy an obsolete note. "
+        "Do not perform other work or answer the user in this maintenance step. "
+        "The ordinary task continues immediately after the note is recorded."
+    )
+    return True
+
+
 def native_incremental_compact_context(
     agent: Any, messages: List[Dict[str, Any]], system_message: str = ""
 ) -> List[Dict[str, Any]]:
@@ -667,6 +732,12 @@ def native_incremental_compact_context(
     ):
         _set_native_attempt_state(agent, error="native incremental route configuration is invalid")
         agent._last_native_incremental_compaction = {"disposition": "invalid_route"}
+        return messages
+    validate_persisted_native_compaction_history(messages)
+    if native_note_refresh_required(agent, messages):
+        _set_native_attempt_state(agent, error="native incremental continuity note refresh required")
+        agent._last_native_incremental_compaction = {"disposition": "refresh_required"}
+        logger.info("Native incremental compaction deferred: protected tail requires a fresh continuity note")
         return messages
     note = _staged_note(agent, messages)
     if note is None:

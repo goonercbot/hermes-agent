@@ -56,7 +56,23 @@ the note and publication watermark are rebound to that same read.
 
 Missing or stale notes leave the source unchanged. A missing note is not an
 instruction to discard history or silently invoke the slow main-model handoff.
-Ordinary note maintenance is a prerequisite, not a guaranteed autonomous task.
+When evidence added after the authenticated cursor exceeds 128,000 serialized
+characters, the next ordinary Responses request is restricted to the existing
+`continuity_note` tool. This is a local maintenance guard, not another provider
+token setting or a separate full-history summary-model pass. No unrelated tool
+may execute in that response. Normal tools resume on the next request.
+
+An old valid note with that much uncovered evidence defers native compaction
+before spending a Luna request. The authenticated note tool clears only the
+readiness-related structural retry pause; failure cooldowns and ineffective
+compression guards remain intact. Failed maintenance cannot repeat against the
+same note within one user turn. Transport retries retain their existing budget.
+
+After refresh, keep all post-note rows, the latest user instruction, and the
+latest complete/pending tool group verbatim. Do not retain every already-covered
+intermediate row merely because the latest user message preceded the note.
+Large required user input stays protected and does not itself demand endlessly
+repeated notes. Past rows remain in the canonical archive after compression.
 
 The gateway `/compress` helper restores the authenticated note before invoking
 the native route, like automatic hygiene. It does not mint or renew a note to

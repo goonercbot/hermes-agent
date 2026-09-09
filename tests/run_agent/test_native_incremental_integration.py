@@ -9,6 +9,78 @@ from agent.native_compaction import validate_persisted_native_compaction_history
 
 ARGS=dict(objective='Verify native continuity',current_plan='Run isolated tests',next_action='Report results',blockers=['Not live'])
 
+
+@pytest.mark.parametrize('in_place', [False, True])
+def test_native_stream_progress_survives_host_idle_and_continues(tmp_path, monkeypatch, in_place):
+    """Actual native dispatch/stream consumption outlives the host idle window."""
+    import time
+    from hermes_state import SessionDB
+    from run_agent import AIAgent
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    (tmp_path/'config.yaml').write_text('compression:\n  enabled: true\n  codex_responses_native: true\n  native_incremental_handoff: true\n  native_incremental_model: gpt-5.6-luna\n  native_incremental_compact_threshold: 1000\n  context_timeout_seconds: 0.4\n  context_total_ceiling_seconds: 5\n')
+    db=SessionDB(db_path=tmp_path/'state.db')
+    sid='native-progress-regression'
+    db.create_session(sid, 'cli', model='gpt-6-astra')
+    a=AIAgent(api_key='test-key', base_url='https://chatgpt.com/backend-api/codex', api_mode='codex_responses', model='gpt-6-astra', provider='openai-codex', session_db=db, session_id=sid, quiet_mode=True, skip_memory=True, skip_context_files=True, skip_background_review=True, enabled_toolsets=[])
+    calls=[];warnings=[]
+    class Stream:
+        def __init__(self, model): self.model=model
+        def __iter__(self):
+            yield {'type':'response.created','response':{'id':'fixture'}}
+            if self.model=='gpt-5.6-luna':
+                for _ in range(12):
+                    time.sleep(.06)
+                    yield {'type':'keepalive'}
+                item=NS(type='compaction',id='cp-progress',encrypted_content='progress-checkpoint')
+            else:
+                item=message('CONTINUATION_OK')
+                item.id='answer'
+            yield NS(type='response.output_item.done', output_index=0, item=item)
+            yield NS(type='response.completed', response=response(item, model=self.model))
+        def close(self): pass
+    def create(**request):
+        calls.append(deepcopy(request))
+        return Stream(request['model'])
+    client=NS(responses=NS(create=create))
+    a._create_request_openai_client=lambda *args,**kwargs: client
+    a._close_request_openai_client=lambda *args,**kwargs: None
+    a._abort_request_openai_client=lambda *args,**kwargs: None
+    a._disable_streaming=True
+    a.compression_in_place=in_place
+    a._compression_feasibility_checked=True
+    a._emit_warning=lambda value,*args,**kwargs: warnings.append(value)
+    a._emit_status=lambda *args,**kwargs: None
+    a.commit_memory_session=lambda *args,**kwargs: None
+    a.context_compressor.threshold_tokens=100
+    a.context_compressor.should_compress_preflight=lambda _:True
+    a.context_compressor.should_compress=lambda _:False
+    db.append_message(sid, 'user', 'old objective '*2000)
+    db.append_message(sid, 'assistant', 'old evidence '*2000)
+    db.append_message(sid, 'assistant', '', tool_calls=[{'id':'note-1','type':'function','function':{'name':'continuity_note','arguments':json.dumps(ARGS)}}])
+    # Generate the note against canonical source rows, as the real executor
+    # does. The output writer normalizes tool-call fields before this point.
+    source=db.get_messages_as_conversation(sid, repair_alternation=False)
+    note_result=record_native_incremental_note_from_tool_call(a, ARGS, source)
+    db.append_message(sid, 'tool', note_result, tool_call_id='note-1', tool_name='continuity_note')
+    source=db.get_messages_as_conversation(sid, repair_alternation=False)
+    assert restore_native_incremental_note(a, source) is not None
+    try:
+        with patch('hermes_cli.plugins.invoke_hook',return_value=[]), patch('hermes_cli.lifecycle.invoke_hook',return_value=[]), patch('agent.turn_context._maybe_title_session_at_turn_start',return_value=None):
+            result=a.run_conversation('Reply CONTINUATION_OK; no other action.', conversation_history=source)
+        assert not a._last_compression_timed_out, warnings
+        assert result['completed'] and result['final_response']=='CONTINUATION_OK'
+        assert [call['model'] for call in calls]==['gpt-5.6-luna','gpt-6-astra']
+        assert not any('timed out' in warning for warning in warnings)
+        assert (a.session_id == sid) is in_place
+        validate_persisted_native_compaction_history(result['messages'])
+        # Validate canonical stored rows, never an alternation-repaired view.
+        persisted=db.get_messages_as_conversation(a.session_id, repair_alternation=False)
+        validate_persisted_native_compaction_history(persisted)
+        assert any('CONTINUATION_OK' in str(row.get('content')) for row in persisted)
+    finally:
+        a.close();db.close()
+
+
 def response(*items,model='gpt-6-astra'):
     return NS(output=list(items),usage=NS(input_tokens=600,output_tokens=4,total_tokens=604),status='completed',model=model)
 
@@ -367,11 +439,26 @@ def test_unbound_tool_and_unpaired_payload_cannot_stage_note():
     assert restore_native_incremental_note(NS(session_id='session'),history) is None
 
 
-def test_native_operation_default_is_separate_from_main_trigger():
+def test_native_operation_default_is_separate_from_main_trigger(tmp_path, monkeypatch):
     from agent.native_incremental_handoff import NATIVE_INCREMENTAL_COMPACT_THRESHOLD
     from hermes_cli.config_defaults import DEFAULT_CONFIG
-    assert NATIVE_INCREMENTAL_COMPACT_THRESHOLD==32000
-    assert DEFAULT_CONFIG['compression']['native_incremental_compact_threshold']==32000
+    from run_agent import AIAgent
+    assert NATIVE_INCREMENTAL_COMPACT_THRESHOLD==128000
+    assert DEFAULT_CONFIG['compression']['native_incremental_compact_threshold']==128000
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    for explicit in (None, 64000):
+        config = 'compression:\n  enabled: true\n  native_incremental_handoff: true\n'
+        if explicit is not None:
+            config += f'  native_incremental_compact_threshold: {explicit}\n'
+        (tmp_path/'config.yaml').write_text(config)
+        agent = AIAgent(api_key='fixture', base_url='https://chatgpt.com/backend-api/codex',
+                        api_mode='codex_responses', model='gpt-6-astra', provider='openai-codex',
+                        quiet_mode=True, skip_memory=True, skip_context_files=True,
+                        skip_background_review=True, enabled_toolsets=[])
+        try:
+            assert agent.native_incremental_compact_threshold == (explicit or 128000)
+        finally:
+            agent.close()
 
 
 @pytest.mark.parametrize('item',[

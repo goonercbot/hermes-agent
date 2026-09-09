@@ -17,6 +17,25 @@ def _messages(count: int) -> list[dict[str, str]]:
 
 
 
+def test_blocked_compression_explains_reason_without_exposing_secrets(monkeypatch):
+    messages = _messages(4)
+    secret = 'sk-proj-' + 'X' * 40
+    state = SimpleNamespace(_last_summary_error=f'native handoff unavailable OPENAI_API_KEY={secret}')
+    monkeypatch.setattr('agent.redact._REDACT_ENABLED', False, raising=False)
+    feedback = summarize_manual_compression(messages, list(messages), 1000, 1000, compression_state=state)
+    assert feedback['headline'] == 'Compression blocked: 4 messages preserved'
+    assert 'native handoff unavailable' in feedback['note']
+    assert secret not in feedback['note']
+    assert 'no messages were removed' in feedback['note']
+
+
+def test_unexplained_noop_remains_neutral():
+    messages = _messages(4)
+    feedback = summarize_manual_compression(messages, list(messages), 1000, 1000)
+    assert feedback['headline'] == 'No changes from compression: 4 messages'
+    assert feedback['note'] is None
+
+
 def test_failure_reason_redaction_is_forced_at_ui_boundary(monkeypatch):
     messages = _messages(12)
     fake_secret = "sk-proj-" + "X" * 40

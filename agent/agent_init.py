@@ -2353,7 +2353,7 @@ def init_agent(
     ).strip().lower()
     try:
         native_incremental_compact_threshold = int(
-            _compression_cfg.get("native_incremental_compact_threshold", 32000)
+            _compression_cfg.get("native_incremental_compact_threshold", 128000)
         )
     except (TypeError, ValueError):
         native_incremental_compact_threshold = 0

@@ -1601,6 +1601,9 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
 
     from agent import relay_llm
 
+    from agent.native_compaction_progress import current_native_compaction_request
+
+    native_request = current_native_compaction_request()
     active_client = client or agent._ensure_primary_openai_client(reason="codex_stream_direct")
     max_stream_retries = 1
     # Accumulate streamed text so callers / compat shims can read it.
@@ -1618,7 +1621,10 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
 
     def _on_event(event: Any) -> None:
         # TTFB watchdog and activity touch — runs once per SSE event.
-        agent._codex_stream_last_event_ts = time.time()
+        if native_request is not None:
+            native_request.on_event()
+        else:
+            agent._codex_stream_last_event_ts = time.time()
         agent._touch_activity("receiving stream response")
 
     for attempt in range(max_stream_retries + 1):

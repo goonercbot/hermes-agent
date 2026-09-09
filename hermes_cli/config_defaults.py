@@ -1010,7 +1010,7 @@ DEFAULT_CONFIG = {
                                       # native path and never invokes the active
                                       # agent model to make a handoff.
         "native_incremental_model": "gpt-5.6-luna",
-        "native_incremental_compact_threshold": 32000,
+        "native_incremental_compact_threshold": 128000,
         "in_place": True,             # When True, compaction rewrites the message
                                       # list and rebuilds the system prompt WITHOUT
                                       # rotating the session id — the conversation

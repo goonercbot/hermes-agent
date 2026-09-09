@@ -3148,6 +3148,7 @@ def run_conversation(
         finish_reason = "stop"
         response = None  # Guard against UnboundLocalError if all retries fail
         api_kwargs = None  # Guard against UnboundLocalError in except handler
+        _native_note_refresh_request = False
         api_request_id = f"{turn_id}:api:{api_call_count}"
         agent._current_api_request_id = api_request_id
 
@@ -3246,6 +3247,10 @@ def run_conversation(
                     api_kwargs["instructions"] = native_incremental_resume_instructions(
                         api_kwargs.get("instructions", ""), _native_continuity_source_messages
                     )
+                _native_note_refresh_request = False
+                if agent.api_mode == "codex_responses" and getattr(agent, "native_incremental_handoff_enabled", False):
+                    from agent.native_incremental_handoff import prepare_native_note_refresh_request
+                    _native_note_refresh_request = prepare_native_note_refresh_request(agent, messages, api_kwargs)
                 # Outbound-request surrogate chokepoint (#50959): the messages
                 # were scrubbed above, but the rest of the request body —
                 # tool/function descriptions (session_search's ±-heavy text is
@@ -7443,6 +7448,21 @@ def run_conversation(
             elif hasattr(agent, "_codex_incomplete_retries"):
                 agent._codex_incomplete_retries = 0
             
+            # Maintenance grants only this host-bound tool for this response,
+            # even when ordinary discovery defers it. Persistent permissions
+            # and the durable tool catalogue are never broadened.
+            _response_valid_tool_names = ({"continuity_note"} if _native_note_refresh_request else agent.valid_tool_names)
+            if _native_note_refresh_request and (
+                not assistant_message.tool_calls
+                or len(assistant_message.tool_calls) != 1
+                or assistant_message.tool_calls[0].function.name != "continuity_note"
+            ):
+                agent._persist_session(messages, conversation_history)
+                return {
+                    "final_response": "Continuity-note refresh did not complete; conversation preserved without running other work.",
+                    "messages": messages, "api_calls": api_call_count,
+                    "completed": False, "failed": True, "error": "native_note_refresh_failed",
+                }
             # Check for tool calls
             if assistant_message.tool_calls:
                 if not agent.quiet_mode:
@@ -7465,14 +7485,14 @@ def run_conversation(
                 # Validate tool call names - detect model hallucinations
                 # Repair mismatched tool names before validating
                 for tc in assistant_message.tool_calls:
-                    if tc.function.name not in agent.valid_tool_names:
+                    if tc.function.name not in _response_valid_tool_names:
                         repaired = agent._repair_tool_call(tc.function.name)
                         if repaired:
                             print(f"{agent.log_prefix}🔧 Auto-repaired tool name: '{tc.function.name}' -> '{repaired}'")
                             tc.function.name = repaired
                 invalid_tool_calls = [
                     tc.function.name for tc in assistant_message.tool_calls
-                    if tc.function.name not in agent.valid_tool_names
+                    if tc.function.name not in _response_valid_tool_names
                 ]
                 # Mixed batch: at least one valid call alongside the invalid
                 # one(s). Degrading models (observed with gpt-5.6 at very
@@ -7486,7 +7506,7 @@ def run_conversation(
                 # model still halts at 3 while a mostly-coherent one keeps
                 # working.
                 _mixed_invalid_batch = bool(invalid_tool_calls) and any(
-                    tc.function.name in agent.valid_tool_names
+                    tc.function.name in _response_valid_tool_names
                     for tc in assistant_message.tool_calls
                 )
                 if _mixed_invalid_batch:
@@ -7495,7 +7515,7 @@ def run_conversation(
                     invalid_preview = invalid_name[:80] + "..." if len(invalid_name) > 80 else invalid_name
                     _n_valid = sum(
                         1 for tc in assistant_message.tool_calls
-                        if tc.function.name in agent.valid_tool_names
+                        if tc.function.name in _response_valid_tool_names
                     )
                     agent._buffer_vprint(
                         f"⚠️  Unknown tool '{invalid_preview}' in batch — erroring that call, "
@@ -7534,11 +7554,11 @@ def run_conversation(
                     append_message(messages, assistant_msg)
                     for tc in assistant_message.tool_calls:
                         _tc_name = tc.function.name
-                        if _tc_name not in agent.valid_tool_names:
+                        if _tc_name not in _response_valid_tool_names:
                             # See _invalid_tool_name_error_content for the
                             # blank-name anti-priming rationale (#47967).
                             content = _invalid_tool_name_error_content(
-                                _tc_name, agent.valid_tool_names
+                                _tc_name, _response_valid_tool_names
                             )
                         else:
                             content = "Skipped: another tool call in this turn used an invalid name. Please retry this tool call."
@@ -7572,7 +7592,7 @@ def run_conversation(
                     except json.JSONDecodeError as e:
                         if (
                             _mixed_invalid_batch
-                            and tc.function.name not in agent.valid_tool_names
+                            and tc.function.name not in _response_valid_tool_names
                         ):
                             # This call never executes — it gets an
                             # invalid-name error result below. Don't let its
@@ -7674,7 +7694,7 @@ def run_conversation(
                 if _mixed_invalid_batch:
                     _invalid_batch_calls = [
                         tc for tc in assistant_message.tool_calls
-                        if tc.function.name not in agent.valid_tool_names
+                        if tc.function.name not in _response_valid_tool_names
                     ]
 
                 assistant_msg = agent._build_assistant_message(assistant_message, finish_reason)
@@ -7799,12 +7819,12 @@ def run_conversation(
                             "name": tc.function.name,
                             "tool_call_id": coalesce_tool_call_id(tc),
                             "content": _invalid_tool_name_error_content(
-                                tc.function.name, agent.valid_tool_names
+                                tc.function.name, _response_valid_tool_names
                             ),
                         })
                     assistant_message.tool_calls = [
                         tc for tc in assistant_message.tool_calls
-                        if tc.function.name in agent.valid_tool_names
+                        if tc.function.name in _response_valid_tool_names
                     ]
 
                 _tool_turn_persisted = None
@@ -8520,7 +8540,7 @@ def run_conversation(
                 # not a new parallel one — carries the recovery.
                 _stall_continue_intent = (
                     bool(getattr(agent, "_stall_guards", True))
-                    and agent.valid_tool_names
+                    and _response_valid_tool_names
                     and codex_ack_continuations < 2
                     and trailing_continue_intent(
                         agent._strip_think_blocks(final_response or "")
@@ -8528,7 +8548,7 @@ def run_conversation(
                 )
                 if _stall_continue_intent or (
                     _ack_mode != "off"
-                    and agent.valid_tool_names
+                    and _response_valid_tool_names
                     and codex_ack_continuations < 2
                     and agent._looks_like_codex_intermediate_ack(
                         user_message=user_message,

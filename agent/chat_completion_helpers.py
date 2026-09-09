@@ -1356,6 +1356,15 @@ def interruptible_api_call(agent, api_kwargs: dict):
     if should_use_direct_api_call(agent):
         return direct_api_call(agent, api_kwargs)
 
+    from agent.native_compaction_progress import current_native_compaction_request
+
+    native_request = current_native_compaction_request()
+
+    def _last_stream_event_ts():
+        if native_request is not None:
+            return native_request.last_event_ts
+        return getattr(agent, "_codex_stream_last_event_ts", None)
+
     result = {"response": None, "error": None}
 
     # Cross-turn stale-call circuit breaker (#58962) — non-streaming sibling
@@ -1598,8 +1607,12 @@ def interruptible_api_call(agent, api_kwargs: dict):
     if _codex_watchdog_enabled:
         # Reset before the worker starts so a marker left over from a previous
         # call on this agent can't be misread as first-byte for this one.
-        agent._codex_stream_last_event_ts = None
-        agent._codex_stream_last_progress_ts = None
+        if native_request is not None:
+            native_request.check_cancelled()
+            native_request.last_event_ts = None
+        else:
+            agent._codex_stream_last_event_ts = None
+            agent._codex_stream_last_progress_ts = None
 
     _call_start = time.time()
     agent._touch_activity("waiting for non-streaming API response")
@@ -1610,6 +1623,14 @@ def interruptible_api_call(agent, api_kwargs: dict):
     while t.is_alive():
         t.join(timeout=0.3)
         _poll_count += 1
+
+        if native_request is not None and native_request.cancelled:
+            # The host already fenced the timed-out compression. Abort only
+            # this request-local client, even if the agent has since started a
+            # normal request. Never let its reset timestamp cause a false TTFB.
+            _request_cancelled["value"] = True
+            _close_request_client_once("native_compression_cancel")
+            raise InterruptedError("Native compression request was cancelled")
 
         # Every ~30s: touch activity for the gateway inactivity monitor AND
         # rewrite the live spinner/status line so CLI/TUI/Desktop users see
@@ -1623,9 +1644,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
                     stale_timeout=_stale_timeout,
                     ttfb_enabled=_ttfb_enabled,
                     ttfb_timeout=_ttfb_timeout,
-                    last_event_ts=getattr(
-                        agent, "_codex_stream_last_event_ts", None
-                    ),
+                    last_event_ts=_last_stream_event_ts(),
                     call_start=_call_start,
                     idle_enabled=_codex_idle_enabled,
                     idle_timeout=_codex_idle_timeout,
@@ -1649,7 +1668,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
         if (
             _ttfb_enabled
             and _elapsed > _ttfb_timeout
-            and getattr(agent, "_codex_stream_last_event_ts", None) is None
+            and _last_stream_event_ts() is None
         ):
             _silent_hint: Optional[str] = None
             _hint_fn = getattr(agent, "_codex_silent_hang_hint", None)
@@ -1706,7 +1725,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
         # Stream-idle detector: the Codex backend emitted at least one SSE
         # frame, then stopped emitting events. Valid keepalive / in_progress
         # frames refresh _codex_stream_last_event_ts and should not be killed.
-        _last_codex_event_ts = getattr(agent, "_codex_stream_last_event_ts", None)
+        _last_codex_event_ts = _last_stream_event_ts()
         if (
             _codex_idle_enabled
             and _last_codex_event_ts is not None
@@ -1788,7 +1807,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 _elapsed,
                 response_started=(
                     _codex_watchdog_enabled
-                    and getattr(agent, "_codex_stream_last_event_ts", None) is not None
+                    and _last_stream_event_ts() is not None
                 ),
             )
             # Mark THIS request cancelled before force-closing so the worker's

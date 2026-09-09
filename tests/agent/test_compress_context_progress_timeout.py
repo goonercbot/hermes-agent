@@ -452,7 +452,9 @@ class TestCompressContextForwarderOwnsTimeout:
         )
         monkeypatch.setattr(
             "agent.conversation_compression.resolve_context_compression_timeouts",
-            lambda compression_cfg=None: (0.05, 0.2),
+            # Idle expiry is under test; leave headroom for cold imports and
+            # scheduling. The total-ceiling path is tested separately.
+            lambda compression_cfg=None: (0.05, 2.0),
         )
         monkeypatch.setattr(
             "agent.portal_tags.get_conversation_context",

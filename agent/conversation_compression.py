@@ -839,6 +839,16 @@ class CompressionCommitFence:
         """True after cancellation won before the commit boundary."""
         return self._cancelled or self._admission_revoked or self.deadline_exceeded
 
+    @property
+    def cancellation_requested(self) -> bool:
+        """Explicit host cancellation, separate from its deadline observation.
+
+        Stream workers use this to let the timeout owner classify and publish
+        a hard-ceiling failure before they unwind. Commit admission still uses
+        is_cancelled and can never admit a write after the deadline.
+        """
+        return self._cancelled or self._admission_revoked
+
     def retain_compression_lock_until_worker_done(self) -> None:
         """Prevent a timed-out live worker from overlapping a retry."""
         self._retain_cancelled_lock_until_worker_done = True
@@ -4153,9 +4163,15 @@ def compress_context(
                         # compaction request. It has no main-model handoff.
                         agent.context_compressor._last_compress_aborted = False
                         agent.context_compressor._last_summary_error = None
-                        compressed = native_incremental_compact_context(
-                            agent, messages, system_message
-                        )
+                        from agent.native_compaction_progress import native_compaction_request
+
+                        # Bind progress/cancellation before the native call
+                        # spawns its stream worker. An agent-global callback
+                        # would race the next ordinary request after timeout.
+                        with native_compaction_request(commit_fence):
+                            compressed = native_incremental_compact_context(
+                                agent, messages, system_message
+                            )
                     elif _use_native_compressor:
                         # Legacy native lifecycle remains unchanged.
                         agent.context_compressor._last_compress_aborted = False

@@ -29,6 +29,7 @@ import sqlite3
 import sys
 import threading
 import time
+import uuid
 import weakref
 from collections import deque
 from contextlib import contextmanager
@@ -93,6 +94,7 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     _PREVIEW_MAX_CHARS,
     _PREVIEW_SCAFFOLD_WINDOW,
     _PREVIEW_SCAFFOLDED_SQL,
+    sanitize_billing_base_url,
 )
 from hermes_state_portability import SessionPortabilityMixin
 from hermes_state_schema import SessionSchemaMixin
@@ -9081,7 +9083,37 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     _TOKEN_DELTA_ROUTE_FIELDS = (
         "model", "cost_status", "cost_source", "pricing_version",
         "billing_provider", "billing_base_url", "billing_mode",
+        "execution_role", "task_id",
     )
+
+    def _new_usage_event_part(self, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        """Capture a delta's identity and admission time before queue delay."""
+        return {
+            "event_id": "delta:" + hashlib.sha256(
+                f"{uuid.uuid4().hex}:{time.time_ns()}".encode("ascii")
+            ).hexdigest(),
+            "occurred_at": (
+                float(kwargs["occurred_at"])
+                if kwargs.get("occurred_at") is not None
+                else time.time()
+            ),
+            "execution_role": kwargs.get("execution_role"),
+            "task_id": kwargs.get("task_id"),
+            "model": kwargs.get("model"),
+            "billing_provider": kwargs.get("billing_provider"),
+            "billing_base_url": kwargs.get("billing_base_url"),
+            "billing_mode": kwargs.get("billing_mode"),
+            "cost_status": kwargs.get("cost_status"),
+            "cost_source": kwargs.get("cost_source"),
+            "api_call_count": kwargs.get("api_call_count", 0),
+            "input_tokens": kwargs.get("input_tokens", 0),
+            "output_tokens": kwargs.get("output_tokens", 0),
+            "cache_read_tokens": kwargs.get("cache_read_tokens", 0),
+            "cache_write_tokens": kwargs.get("cache_write_tokens", 0),
+            "reasoning_tokens": kwargs.get("reasoning_tokens", 0),
+            "estimated_cost_usd": kwargs.get("estimated_cost_usd"),
+            "actual_cost_usd": kwargs.get("actual_cost_usd"),
+        }
 
     def queue_token_counts(self, session_id: str, **kwargs) -> None:
         """Enqueue a token/cost delta for the background writer.
@@ -9092,6 +9124,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         API call.  After close() has stopped the writer, falls back to the
         synchronous path and may raise like :meth:`update_token_counts`.
         """
+        # The queued object is the admission boundary: retain each call's
+        # identity/timestamp even if the writer later coalesces its SQL update.
+        if "_usage_event_parts" not in kwargs:
+            kwargs = dict(kwargs)
+            kwargs["_usage_event_parts"] = [self._new_usage_event_part(kwargs)]
         with self._token_queue_cond:
             thread = self._token_writer_thread
             writer_stopped = self._token_writer_stop and (
@@ -9267,6 +9304,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         # None-preserving sum: an all-None run must stay
                         # None so COALESCE keeps the stored value untouched.
                         merged[f] = (merged.get(f) or 0.0) + value
+                # SQL may merge, but evidence never does: every admitted API
+                # call carries its own immutable event id and occurrence time.
+                merged.setdefault("_usage_event_parts", []).extend(
+                    kwargs.get("_usage_event_parts", [])
+                )
             else:
                 groups.append((key, session_id, dict(kwargs)))
         return [(sid, kw) for _, sid, kw in groups]
@@ -9348,8 +9390,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         billing_provider: Optional[str] = None,
         billing_base_url: Optional[str] = None,
         billing_mode: Optional[str] = None,
-        api_call_count: int = 0,
+        api_call_count: Optional[int] = None,
         absolute: bool = False,
+        execution_role: Optional[str] = None,
+        task_id: Optional[str] = None,
+        occurred_at: Optional[float] = None,
+        _usage_event_parts: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         """Update token counters and backfill model if not already set.
 
@@ -9384,7 +9430,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                    billing_base_url = COALESCE(billing_base_url, ?),
                    billing_mode = COALESCE(billing_mode, ?),
                    model = COALESCE(model, ?),
-                   api_call_count = ?
+                   api_call_count = CASE
+                       WHEN ? IS NULL THEN api_call_count
+                       ELSE ?
+                   END
                    WHERE id = ?"""
         else:
             sql = """UPDATE sessions SET
@@ -9407,12 +9456,18 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                    model = COALESCE(model, ?),
                    api_call_count = COALESCE(api_call_count, 0) + ?
                    WHERE id = ?"""
+        # Incremental callers historically omit this value to mean zero.  In
+        # absolute mode, omission means the cumulative caller supplied no API
+        # count at all, so keep the persisted count rather than resetting it.
+        effective_api_call_count = (
+            0 if api_call_count is None else int(api_call_count)
+        )
         has_accounted_usage = bool(
             input_tokens or output_tokens or cache_read_tokens
-            or cache_write_tokens or reasoning_tokens or api_call_count
-            or estimated_cost_usd or actual_cost_usd
+            or cache_write_tokens or reasoning_tokens or effective_api_call_count
+            or estimated_cost_usd or actual_cost_usd is not None
         )
-        params = (
+        params_prefix = (
             input_tokens,
             output_tokens,
             cache_read_tokens,
@@ -9428,8 +9483,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             billing_base_url if has_accounted_usage else None,
             billing_mode if has_accounted_usage else None,
             model if has_accounted_usage else None,
-            api_call_count,
-            session_id,
+        )
+        params = (
+            params_prefix + (api_call_count, api_call_count, session_id)
+            if absolute
+            else params_prefix + (effective_api_call_count, session_id)
         )
         # Per-model usage attribution.  ``update_token_counts`` is the single
         # chokepoint every per-API-call delta flows through (CLI, gateway, cron,
@@ -9441,18 +9499,43 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # session_model_usage keyed by the live model preserves an accurate
         # per-model breakdown regardless of how many times the user switches.
         #
-        # Only the incremental path records here. Absolute cumulative updates
-        # cannot be split back into routes; Insights reconciles any positive
-        # residual against the aggregate session row instead.
+        # Only the incremental path records per-model attribution here.
+        # Absolute cumulative updates cannot be split by route, so their
+        # aggregate reconciliation is appended separately with unknown timing.
         record_model_usage = (not absolute) and (
             input_tokens or output_tokens or cache_read_tokens
-            or cache_write_tokens or reasoning_tokens or api_call_count
-            or estimated_cost_usd
+            or cache_write_tokens or reasoning_tokens or effective_api_call_count
+            or estimated_cost_usd or actual_cost_usd is not None
         )
+
+        # Capture an idempotent direct event before entering _execute_write;
+        # retries invoke the same closure and therefore cannot mint a duplicate.
+        if _usage_event_parts is None:
+            _usage_event_parts = [self._new_usage_event_part({
+                "model": model,
+                "billing_provider": billing_provider,
+                "billing_base_url": billing_base_url,
+                "billing_mode": billing_mode,
+                "cost_status": cost_status,
+                "cost_source": cost_source,
+                "api_call_count": effective_api_call_count,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "cache_read_tokens": cache_read_tokens,
+                "cache_write_tokens": cache_write_tokens,
+                "reasoning_tokens": reasoning_tokens,
+                "estimated_cost_usd": estimated_cost_usd,
+                "actual_cost_usd": actual_cost_usd,
+                "execution_role": execution_role,
+                "task_id": task_id,
+                "occurred_at": occurred_at,
+            })]
 
         def _do(conn):
             row = conn.execute(
-                "SELECT model, billing_provider, api_call_count FROM sessions WHERE id = ?",
+                "SELECT model, billing_provider, api_call_count, input_tokens, "
+                "output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens, "
+                "estimated_cost_usd, actual_cost_usd FROM sessions WHERE id = ?",
                 (session_id,),
             ).fetchone()
             existing_model = row["model"] if row is not None else None
@@ -9496,7 +9579,48 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     actual_cost_usd=actual_cost_usd,
                     cost_status=cost_status,
                     cost_source=cost_source,
-                    api_call_count=api_call_count,
+                    api_call_count=effective_api_call_count,
+                )
+            event_parts = list(_usage_event_parts or [])
+            timing_kind = "point"
+            if absolute:
+                # Reconcile from the actual row transition.  The SQL update is
+                # authoritative for omitted optional values and any DB-level
+                # normalization; raw kwargs are not a ledger delta.
+                after = conn.execute(
+                    "SELECT api_call_count, input_tokens, output_tokens, "
+                    "cache_read_tokens, cache_write_tokens, reasoning_tokens, "
+                    "estimated_cost_usd, actual_cost_usd FROM sessions WHERE id = ?",
+                    (session_id,),
+                ).fetchone()
+                raw = event_parts[0] if event_parts else self._new_usage_event_part({})
+                fields = (
+                    "input_tokens", "output_tokens", "cache_read_tokens",
+                    "cache_write_tokens", "reasoning_tokens", "api_call_count",
+                    "estimated_cost_usd",
+                )
+                reconciled = dict(raw)
+                for field in fields:
+                    old_value = (row[field] if row is not None else 0) or 0
+                    new_value = (after[field] if after is not None else 0) or 0
+                    reconciled[field] = new_value - old_value
+                old_actual = row["actual_cost_usd"] if row is not None else None
+                new_actual = after["actual_cost_usd"] if after is not None else None
+                actual_changed = old_actual != new_actual
+                reconciled["actual_cost_usd"] = (
+                    float(new_actual or 0) - float(old_actual or 0)
+                    if actual_changed else None
+                )
+                if any(reconciled[field] for field in fields) or actual_changed:
+                    event_parts = [reconciled]
+                else:
+                    event_parts = []
+                # Cumulative totals do not identify when individual usage
+                # occurred, so reconciliation must never be week-attributed.
+                timing_kind = "unknown"
+            if event_parts and (has_accounted_usage or absolute):
+                self._record_usage_events(
+                    conn, session_id, event_parts, task="", timing_kind=timing_kind
                 )
         self._execute_write(_do)
 
@@ -9602,6 +9726,88 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             ),
         )
 
+    def _record_usage_events(
+        self,
+        conn,
+        session_id: str,
+        event_parts: List[Dict[str, Any]],
+        *,
+        task: str,
+        timing_kind: str = "point",
+        interval_start: Optional[float] = None,
+        interval_end: Optional[float] = None,
+    ) -> None:
+        """Append immutable evidence in the aggregate's write transaction."""
+        session = conn.execute(
+            """SELECT parent_session_id, source, model, billing_provider,
+                      billing_base_url, billing_mode
+                 FROM sessions WHERE id = ?""",
+            (session_id,),
+        ).fetchone()
+        for part in event_parts:
+            event_id = part.get("event_id")
+            if not event_id:
+                # This only serves internal/manual batch callers. Normal sync
+                # and queued paths create the id before transaction retries.
+                event_id = self._new_usage_event_part(part)["event_id"]
+            if task:
+                model = part.get("model") or "unknown"
+                provider = part.get("billing_provider") or ""
+                base_url = part.get("billing_base_url") or ""
+                billing_mode = part.get("billing_mode") or ""
+            else:
+                model = part.get("model") or (session["model"] if session else None) or "unknown"
+                provider = part.get("billing_provider") or (session["billing_provider"] if session else None) or ""
+                base_url = part.get("billing_base_url") or (session["billing_base_url"] if session else None) or ""
+                billing_mode = part.get("billing_mode") or (session["billing_mode"] if session else None) or ""
+            supplied_role = part.get("execution_role")
+            role = supplied_role if supplied_role in {
+                "controller", "implementation", "independent_review",
+                "auxiliary", "worker_unspecified", "unknown",
+            } else ("auxiliary" if task else "unknown")
+            event_timing_kind = timing_kind
+            occurred_at = part.get("occurred_at") if event_timing_kind == "point" else None
+            conn.execute(
+                """INSERT OR IGNORE INTO usage_events (
+                       event_id, schema_version, event_kind, session_id,
+                       parent_session_id, session_source, model, billing_provider,
+                       billing_base_url, billing_mode, task, execution_role, task_id,
+                       occurred_at, recorded_at, interval_start, interval_end, timing_kind,
+                       api_call_count, input_tokens, output_tokens, cache_read_tokens,
+                       cache_write_tokens, reasoning_tokens, estimated_cost_usd,
+                       actual_cost_usd, cost_status, cost_source
+                   ) VALUES (?, 1, 'delta', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                             ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    event_id,
+                    session_id,
+                    session["parent_session_id"] if session else None,
+                    (session["source"] if session else None) or "unknown",
+                    model,
+                    provider,
+                    sanitize_billing_base_url(base_url),
+                    billing_mode,
+                    task or "",
+                    role,
+                    part.get("task_id"),
+                    occurred_at,
+                    time.time(),
+                    interval_start,
+                    interval_end,
+                    event_timing_kind,
+                    int(part.get("api_call_count") or 0),
+                    int(part.get("input_tokens") or 0),
+                    int(part.get("output_tokens") or 0),
+                    int(part.get("cache_read_tokens") or 0),
+                    int(part.get("cache_write_tokens") or 0),
+                    int(part.get("reasoning_tokens") or 0),
+                    part.get("estimated_cost_usd"),
+                    part.get("actual_cost_usd"),
+                    part.get("cost_status"),
+                    part.get("cost_source"),
+                ),
+            )
+
     def ensure_session(
         self,
         session_id: str,
@@ -9627,7 +9833,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         cache_write_tokens: int = 0,
         reasoning_tokens: int = 0,
         estimated_cost_usd: Optional[float] = None,
+        actual_cost_usd: Optional[float] = None,
+        cost_status: Optional[str] = None,
+        cost_source: Optional[str] = None,
         api_call_count: int = 1,
+        execution_role: Optional[str] = None,
+        task_id: Optional[str] = None,
+        occurred_at: Optional[float] = None,
+        interval_start: Optional[float] = None,
+        interval_end: Optional[float] = None,
     ) -> None:
         """Record an auxiliary LLM call's usage against *session_id* (issue #23270).
 
@@ -9654,6 +9868,31 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # exists (same INSERT OR IGNORE guard update_token_counts uses — the
         # initial create_session() can fail under concurrent SQLite locking).
         self._insert_session_row(session_id, "unknown")
+        effective_api_call_count = 1 if api_call_count is None else int(api_call_count)
+        event_part = self._new_usage_event_part({
+            "model": model,
+            "billing_provider": billing_provider,
+            "billing_base_url": billing_base_url,
+            "api_call_count": effective_api_call_count,
+            "input_tokens": input_tokens or 0,
+            "output_tokens": output_tokens or 0,
+            "cache_read_tokens": cache_read_tokens or 0,
+            "cache_write_tokens": cache_write_tokens or 0,
+            "reasoning_tokens": reasoning_tokens or 0,
+            "estimated_cost_usd": estimated_cost_usd,
+            "actual_cost_usd": actual_cost_usd,
+            "cost_status": cost_status,
+            "cost_source": cost_source,
+            "execution_role": execution_role,
+            "task_id": task_id,
+            "occurred_at": occurred_at,
+        })
+        if interval_start is not None and interval_end is not None:
+            timing_kind = "interval"
+        elif occurred_at is not None or task != "background_review":
+            timing_kind = "point"
+        else:
+            timing_kind = "unknown"
 
         def _do(conn):
             self._record_model_usage(
@@ -9669,13 +9908,20 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 cache_write_tokens=cache_write_tokens or 0,
                 reasoning_tokens=reasoning_tokens or 0,
                 estimated_cost_usd=estimated_cost_usd,
-                actual_cost_usd=None,
-                cost_status=None,
-                cost_source=None,
-                api_call_count=(
-                    1 if api_call_count is None else int(api_call_count)
-                ),
+                actual_cost_usd=actual_cost_usd,
+                cost_status=cost_status,
+                cost_source=cost_source,
+                api_call_count=effective_api_call_count,
                 task=task,
+            )
+            self._record_usage_events(
+                conn,
+                session_id,
+                [event_part],
+                task=task,
+                timing_kind=timing_kind,
+                interval_start=interval_start,
+                interval_end=interval_end,
             )
         self._execute_write(_do)
 

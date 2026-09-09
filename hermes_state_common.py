@@ -12,6 +12,33 @@ import os
 import sys
 import time
 from typing import Any
+from urllib.parse import urlsplit
+
+
+def sanitize_billing_base_url(value: Any) -> str:
+    """Return only a URL origin suitable for retained usage evidence.
+
+    Billing routes can contain credentials in userinfo and provider keys in a
+    path or query. Ledger rows need a stable provider origin, never that
+    sensitive material. Unparseable or origin-less values are omitted rather
+    than retained verbatim.
+    """
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        parsed = urlsplit(raw)
+        scheme = parsed.scheme.lower()
+        host = parsed.hostname
+        port = parsed.port
+    except (TypeError, ValueError):
+        return ""
+    if not scheme or not host:
+        return ""
+    safe_host = host.lower()
+    if ":" in safe_host and not safe_host.startswith("["):
+        safe_host = f"[{safe_host}]"
+    return f"{scheme}://{safe_host}{f':{port}' if port is not None else ''}"
 
 from agent.skill_commands import (
     SKILL_EXCERPT_JOINT,
@@ -502,6 +529,57 @@ CREATE TABLE IF NOT EXISTS session_model_usage (
     PRIMARY KEY (session_id, model, billing_provider, billing_base_url, billing_mode, task)
 );
 
+CREATE TABLE IF NOT EXISTS usage_events (
+    event_id TEXT PRIMARY KEY,
+    schema_version INTEGER NOT NULL,
+    event_kind TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    parent_session_id TEXT,
+    session_source TEXT NOT NULL,
+    model TEXT NOT NULL,
+    billing_provider TEXT NOT NULL DEFAULT '',
+    billing_base_url TEXT NOT NULL DEFAULT '',
+    billing_mode TEXT NOT NULL DEFAULT '',
+    task TEXT NOT NULL DEFAULT '',
+    execution_role TEXT NOT NULL,
+    task_id TEXT,
+    occurred_at REAL,
+    recorded_at REAL NOT NULL,
+    interval_start REAL,
+    interval_end REAL,
+    timing_kind TEXT NOT NULL CHECK (
+        (timing_kind = 'point' AND occurred_at IS NOT NULL)
+        OR (timing_kind IN ('interval', 'unknown') AND occurred_at IS NULL)
+    ),
+    api_call_count INTEGER NOT NULL DEFAULT 0,
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+    reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+    estimated_cost_usd REAL,
+    actual_cost_usd REAL,
+    cost_status TEXT,
+    cost_source TEXT
+);
+
+CREATE TABLE IF NOT EXISTS usage_event_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT
+);
+
+-- Ledger evidence is append-only and deliberately survives session deletion.
+CREATE TRIGGER IF NOT EXISTS usage_events_no_update
+BEFORE UPDATE ON usage_events
+BEGIN
+    SELECT RAISE(ABORT, 'usage_events are immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS usage_events_no_delete
+BEFORE DELETE ON usage_events
+BEGIN
+    SELECT RAISE(ABORT, 'usage_events are immutable');
+END;
+
 CREATE TABLE IF NOT EXISTS state_meta (
     key TEXT PRIMARY KEY,
     value TEXT
@@ -590,6 +668,8 @@ CREATE INDEX IF NOT EXISTS idx_compression_locks_expires ON compression_locks(ex
 CREATE INDEX IF NOT EXISTS idx_session_turn_leases_expires ON session_turn_leases(expires_at);
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_session ON session_model_usage(session_id);
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_model ON session_model_usage(model);
+CREATE INDEX IF NOT EXISTS idx_usage_events_session ON usage_events(session_id);
+CREATE INDEX IF NOT EXISTS idx_usage_events_timing ON usage_events(timing_kind, occurred_at, interval_start, interval_end);
 CREATE INDEX IF NOT EXISTS idx_async_delegations_delivery
     ON async_delegations(delivery_state, completed_at);
 """

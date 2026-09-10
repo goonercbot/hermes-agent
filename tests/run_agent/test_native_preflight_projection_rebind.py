@@ -38,7 +38,7 @@ def _message(text):
     return NS(type="message", role="assistant", content=[NS(type="output_text", text=text)])
 
 
-def _agent_with_authenticated_history(tmp_path, monkeypatch):
+def _agent_with_authenticated_history(tmp_path, monkeypatch, *, toolsets=None, platform="cli", model="gpt-6-astra"):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     (tmp_path / "config.yaml").write_text(
         "compression:\n  enabled: true\n  codex_responses_native: true\n"
@@ -52,12 +52,13 @@ def _agent_with_authenticated_history(tmp_path, monkeypatch):
 
     db = SessionDB(db_path=tmp_path / "state.db")
     session_id = "native-preflight-projection"
-    db.create_session(session_id, "cli", model="gpt-6-astra")
+    db.create_session(session_id, platform, model=model)
     agent = AIAgent(
         api_key="fixture",
         base_url="https://chatgpt.com/backend-api/codex",
         api_mode="codex_responses",
-        model="gpt-6-astra",
+        model=model,
+        platform=platform,
         provider="openai-codex",
         session_db=db,
         session_id=session_id,
@@ -65,7 +66,7 @@ def _agent_with_authenticated_history(tmp_path, monkeypatch):
         skip_memory=True,
         skip_context_files=True,
         skip_background_review=True,
-        enabled_toolsets=[],
+        enabled_toolsets=toolsets or [],
     )
     agent._disable_streaming = True
     agent.compression_in_place = False
@@ -79,6 +80,7 @@ def _agent_with_authenticated_history(tmp_path, monkeypatch):
 
     db.append_message(session_id, "user", "old objective " * 2000)
     db.append_message(session_id, "assistant", "old evidence " * 2000)
+    db.append_message(session_id, "user", "Continue the verified objective.")
     db.append_message(
         session_id,
         "assistant",
@@ -133,11 +135,15 @@ def _run_preflight(agent, source, *, plugin_context, replies):
 
 
 @pytest.mark.parametrize("plugin_context", ["PLUGIN_CONTEXT", ""])
+@pytest.mark.parametrize("in_place", [False, True])
 def test_native_preflight_rebinds_only_to_persisted_source_and_rejects_tampering(
-    tmp_path, monkeypatch, plugin_context
+    tmp_path, monkeypatch, plugin_context, in_place
 ):
     """A real loop/DB replay stays authenticated after the published tail changes."""
-    agent, db, source = _agent_with_authenticated_history(tmp_path, monkeypatch)
+    agent, db, source = _agent_with_authenticated_history(
+        tmp_path, monkeypatch, platform="telegram"
+    )
+    agent.compression_in_place = in_place
     try:
         result, calls = _run_preflight(
             agent, source, plugin_context=plugin_context, replies=_fixture_replies()
@@ -190,7 +196,11 @@ def test_native_preflight_failed_sidecar_transaction_does_not_rebind_projection(
         rebinds.append((len(kwargs["source_messages"]), len(kwargs["replay_messages"])))
         return original_bind(*args, **kwargs)
 
+    transaction_state = {}
+
     def fail_transaction(*args, **kwargs):
+        transaction_state["rebind_count"] = len(rebinds)
+        transaction_state["projection"] = deepcopy(agent._native_incremental_replay_projection)
         raise RuntimeError("fixture transaction failure")
 
     monkeypatch.setattr(
@@ -211,9 +221,11 @@ def test_native_preflight_failed_sidecar_transaction_does_not_rebind_projection(
                     "Controlled fixture follow-up.", conversation_history=source
                 )
 
-        # Only native candidate construction ran; turn_context did not copy the
-        # projection from the persisted source after the rejected transaction.
-        assert len(rebinds) == 1
+        # Candidate + successful publication may bind; the rejected sidecar
+        # transaction must never reauthenticate or partly replace that state.
+        assert transaction_state["rebind_count"] == 2
+        assert len(rebinds) == transaction_state["rebind_count"]
+        assert agent._native_incremental_replay_projection == transaction_state["projection"]
     finally:
         agent.close()
         db.close()

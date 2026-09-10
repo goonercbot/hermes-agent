@@ -159,6 +159,46 @@ def _projection_source_for_messages(
     return deepcopy(source) + deepcopy(messages[len(replay):]), len(replay)
 
 
+def authenticate_native_compaction_publication(agent: Any, messages, attempt) -> None:
+    """Install replay state only from the exact published producer checkpoint.
+
+    Shared by every compression caller and the later preflight sidecar seam.
+    Validate on a detached probe so a failed readback cannot partly replace live
+    authentication state. Never discover/reseal a retained checkpoint here.
+    """
+    from types import SimpleNamespace
+
+    if not bool(getattr(agent, "native_incremental_handoff_enabled", False)):
+        return
+    db = getattr(agent, "_session_db", None)
+    if db is None or not isinstance(attempt, NativeCompactionAttempt):
+        raise ValueError("native compaction publication requires durable producer evidence")
+    source = db.get_messages_as_conversation(agent.session_id, repair_alternation=False)
+    validate_persisted_native_compaction_history(source)
+    validate_persisted_native_compaction_history(messages)
+    expected = attempt.carrier["codex_reasoning_items"][0]
+    carriers = [
+        item for row in source for item in (row.get("codex_reasoning_items") or [])
+        if isinstance(item, dict)
+        and item.get("encrypted_content") == expected.get("encrypted_content")
+        and item.get(NATIVE_COMPACTION_METADATA_KEY) == attempt.metadata
+        and attempt.metadata.get("identity") == attempt.identity
+    ]
+    if len(carriers) != 1 or _note_fence(source) != _note_fence(messages):
+        raise ValueError("native compaction persisted replay projection authentication failed")
+    probe = SimpleNamespace(session_id=agent.session_id)
+    if (
+        not bind_native_incremental_replay_projection(
+            probe, source_messages=source, replay_messages=messages
+        )
+        or restore_native_incremental_note(probe, messages) is None
+    ):
+        raise ValueError("native compaction persisted replay projection authentication failed")
+    agent._native_incremental_replay_projection = probe._native_incremental_replay_projection
+    agent._native_incremental_handoff_note = probe._native_incremental_handoff_note
+    agent._native_incremental_handoff_projection_cursor = probe._native_incremental_handoff_projection_cursor
+
+
 def _projection_cursor_for_source_cursor(
     source_cursor: int,
     *,

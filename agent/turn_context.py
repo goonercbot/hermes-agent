@@ -1629,39 +1629,9 @@ def build_turn_context(
         and _db is not None
         and isinstance(_finalized_native_attempt, NativeCompactionAttempt)
     ):
-        from agent.native_incremental_handoff import (
-            bind_native_incremental_replay_projection,
-            restore_native_incremental_note,
-        )
+        from agent.native_incremental_handoff import authenticate_native_compaction_publication
 
-        _persisted_native_source = _db.get_messages_as_conversation(
-            agent.session_id, repair_alternation=False
-        )
-        _persisted_carriers = [
-            item
-            for row in _persisted_native_source
-            if isinstance(row, dict)
-            for item in (row.get("codex_reasoning_items") or [])
-            if isinstance(item, dict)
-            and item.get("encrypted_content")
-            == _finalized_native_attempt.carrier["codex_reasoning_items"][0][
-                "encrypted_content"
-            ]
-            and item.get("_hermes_native_compaction")
-            == _finalized_native_attempt.metadata
-        ]
-        if (
-            len(_persisted_carriers) != 1
-            or not bind_native_incremental_replay_projection(
-                agent,
-                source_messages=_persisted_native_source,
-                replay_messages=messages,
-            )
-            or restore_native_incremental_note(agent, messages) is None
-        ):
-            raise ValueError(
-                "native compaction persisted replay projection authentication failed"
-            )
+        authenticate_native_compaction_publication(agent, messages, _finalized_native_attempt)
 
     # Crash-resilience: persist the inbound user turn before the first LLM
     # call. Runs after preflight compression (which rewrites history anyway)

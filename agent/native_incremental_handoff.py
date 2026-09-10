@@ -679,10 +679,14 @@ def native_note_refresh_required(agent: Any, messages: List[Dict[str, Any]]) -> 
     return _native_message_size(tail) > 128_000
 
 
-def prepare_native_note_refresh_request(agent: Any, messages: List[Dict[str, Any]], request: Dict[str, Any]) -> bool:
+def prepare_native_note_refresh_request(agent: Any, messages: List[Dict[str, Any]], request: Dict[str, Any]):
     """Use the next ordinary turn for a note, not an extra summary-model pass."""
     from agent.codex_responses_adapter import classify_responses_route
     from tools.continuity_note_tool import CONTINUITY_NOTE_SCHEMA
+    from agent.native_note_refresh import (
+        NativeNoteRefreshFailure, close_native_note_refresh, issue_native_note_refresh,
+    )
+    close_native_note_refresh(agent)
     route = classify_responses_route(agent)
     if not native_incremental_continuity_capable(
         agent, is_codex_backend=route.is_codex_backend,
@@ -695,7 +699,7 @@ def prepare_native_note_refresh_request(agent: Any, messages: List[Dict[str, Any
         identity = (request_id.partition(":api:")[0], note.get("source_prefix_fence"))
         previous = getattr(agent, "_native_note_refresh_request_guard", None)
         if previous and previous[0] == identity and previous[1] != request_id:
-            raise RuntimeError("Continuity-note refresh did not advance its authenticated cursor; stopping repeated maintenance requests")
+            raise NativeNoteRefreshFailure("did not advance its authenticated cursor; stopping repeated maintenance requests")
         agent._native_note_refresh_request_guard = (identity, request_id)
     # The note is a registered, host-bound maintenance tool. No executable
     # user tools can run in this maintenance response; normal tools return on
@@ -710,7 +714,7 @@ def prepare_native_note_refresh_request(agent: Any, messages: List[Dict[str, Any
         "Do not perform other work or answer the user in this maintenance step. "
         "The ordinary task continues immediately after the note is recorded."
     )
-    return True
+    return issue_native_note_refresh(agent, messages)
 
 
 def native_incremental_compact_context(

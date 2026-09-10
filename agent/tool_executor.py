@@ -592,6 +592,7 @@ def _run_agent_tool_execution_middleware(
     middleware_trace: list[dict[str, Any]] | None = None,
     begin_execution=None,
     authorization_gate: _ConcurrentToolAuthorizationGate | None = None,
+    maintenance_capability=None,
 ) -> _ManagedToolResult:
     """Run Relay rewrites before Hermes policy and dispatch exactly once."""
     from agent import relay_tools
@@ -638,6 +639,11 @@ def _run_agent_tool_execution_middleware(
 
         block_message = scope_block
         block_error_type = "tool_scope_block"
+        if maintenance_capability is not None:
+            from agent.native_note_refresh import consume_native_note_refresh_capability
+            consume_native_note_refresh_capability(
+                maintenance_capability, agent, function_name, final_args, tool_call_id,
+            )
         if block_message is None:
             block_error_type = "plugin_block"
 
@@ -656,6 +662,7 @@ def _run_agent_tool_execution_middleware(
                         api_request_id=getattr(agent, "_current_api_request_id", "")
                         or "",
                         middleware_trace=list(state["middleware_trace"]),
+                        **({"maintenance_context": maintenance_capability} if maintenance_capability is not None else {}),
                     )
                     if modified_args is not None:
                         final_args = modified_args
@@ -827,6 +834,7 @@ def _run_sequential_tool_execution_middleware(
     scope_block: str | None = None,
     display_index: int | None = None,
     middleware_trace: list[dict[str, Any]] | None = None,
+    maintenance_capability=None,
 ) -> _ManagedToolResult:
     """Run one sequential call with the concurrent executor's deadline.
 
@@ -845,6 +853,7 @@ def _run_sequential_tool_execution_middleware(
         "scope_block": scope_block,
         "display_index": display_index,
         "middleware_trace": middleware_trace,
+        "maintenance_capability": maintenance_capability,
     }
     if function_name in _NEVER_PARALLEL_TOOLS:
         return _run_agent_tool_execution_middleware(agent, **kwargs)

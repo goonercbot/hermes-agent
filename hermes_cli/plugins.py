@@ -6736,6 +6736,7 @@ def _get_pre_tool_call_directive_details(
     turn_id: str = "",
     api_request_id: str = "",
     middleware_trace: Optional[List[Dict[str, Any]]] = None,
+    maintenance_context: Any = None,
 ) -> _PreToolCallDirective:
     """Check ``pre_tool_call`` hooks for a blocking or approval directive.
 
@@ -6783,6 +6784,7 @@ def _get_pre_tool_call_directive_details(
         turn_id=turn_id,
         api_request_id=api_request_id,
         middleware_trace=list(middleware_trace or []),
+        **({"maintenance_context": maintenance_context} if maintenance_context is not None else {}),
     )
 
     block_msg: Optional[str] = None
@@ -6978,6 +6980,7 @@ def _dispatch_pre_tool_call_hooks(
     turn_id: str = "",
     api_request_id: str = "",
     middleware_trace: Optional[List[Dict[str, Any]]] = None,
+    maintenance_context: Any = None,
 ) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
     """Invoke ``pre_tool_call`` hooks once and process all response types.
 
@@ -7001,6 +7004,7 @@ def _dispatch_pre_tool_call_hooks(
         tool_name, args, task_id=task_id, session_id=session_id,
         tool_call_id=tool_call_id, turn_id=turn_id,
         api_request_id=api_request_id, middleware_trace=middleware_trace,
+        maintenance_context=maintenance_context,
     )
     block_msg = _resolve_block_from_details(
         details, tool_name,

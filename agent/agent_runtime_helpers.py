@@ -4963,6 +4963,19 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
             agent._pending_steer = (existing + "\n" + steer_text) if existing else steer_text
         return
     marker = format_steer_marker(steer_text)
+    if getattr(agent, "native_incremental_handoff_enabled", False) is True:
+        # Tool results are already durable when this hook runs. Rewriting
+        # one here makes the next continuity note authenticate an in-memory
+        # prefix that cannot survive DB readback. Append the instruction as
+        # its own durable user event instead; this also leaves any sealed
+        # checkpoint or host-bound budget projection unchanged.
+        messages.append({"role": "user", "content": marker.strip()})
+        if agent._flush_messages_to_session_db(messages) is False:
+            raise RuntimeError("Native steering message persistence failed")
+        _ra().logger.info(
+            "Delivered /steer as a durable user message (%d chars)", len(steer_text)
+        )
+        return
     existing_content = messages[target_idx].get("content", "")
     if not isinstance(existing_content, str):
         # Anthropic multimodal content blocks — preserve them and append

@@ -2395,10 +2395,23 @@ def run_conversation(
         if _native_boundary_request:
             from agent.agent_runtime_helpers import repair_message_sequence
 
-            _prefix = messages[:_request_current_turn_user_idx]
+            from agent.native_compaction import native_compaction_protected_message_indices
+
+            # The latest user may itself be in the authenticated native tail.
+            # Never hand the repair helper a sliced/incomplete checkpoint.
+            _current_user = (
+                messages[_request_current_turn_user_idx]
+                if _request_current_turn_user_idx < len(messages) else None
+            )
+            _sealed = native_compaction_protected_message_indices(messages)
+            _repair_end = max(_request_current_turn_user_idx, max(_sealed, default=-1) + 1)
+            _prefix = messages[:_repair_end]
             repaired_seq = repair_message_sequence(agent, _prefix)
-            messages = _prefix + messages[_request_current_turn_user_idx:]
-            _request_current_turn_user_idx = len(_prefix)
+            messages = _prefix + messages[_repair_end:]
+            _request_current_turn_user_idx = next(
+                (index for index, row in enumerate(messages) if row is _current_user),
+                len(messages),  # Current user was already covered by the note.
+            )
         else:
             from agent.agent_runtime_helpers import repair_message_sequence_with_cursor
 
@@ -4818,6 +4831,14 @@ def run_conversation(
                 break
 
             except NativeNoteRefreshFailure as maintenance_error:
+                # Log only host-controlled labels, never exception/provider text.
+                safe_reason = {
+                    "durable note readback failed authentication": "durable_note_authentication_failed",
+                    "canonical maintenance source unauthenticated": "canonical_source_unauthenticated",
+                    "canonical maintenance source changed": "canonical_source_changed",
+                    "maintenance source changed during dispatch": "source_changed_during_dispatch",
+                }.get(maintenance_error.reason, "maintenance_failed")
+                logger.warning("Native continuity maintenance failed: reason=%s", safe_reason)
                 if thinking_spinner:
                     thinking_spinner.stop("")
                     thinking_spinner = None

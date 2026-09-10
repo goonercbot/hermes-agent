@@ -621,6 +621,19 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
     if not messages:
         return 0
 
+    # A validated native checkpoint seals its carrier, handoff, and exact tail.
+    # Alternation repair is normally a lossy-in-shape projection (it merges or
+    # removes rows), so it must never cross into that span.  Validate before
+    # collecting identities: malformed native state still raises rather than
+    # being silently repaired into a different, apparently valid history.
+    from agent.native_compaction import native_compaction_protected_message_indices
+
+    protected_indices = native_compaction_protected_message_indices(messages)
+    protected_message_ids = {id(messages[index]) for index in protected_indices}
+
+    def _is_protected(message: Any) -> bool:
+        return isinstance(message, dict) and id(message) in protected_message_ids
+
     repairs = 0
 
     # Pass 0: merge consecutive assistant messages. Runs BEFORE Pass 1 so
@@ -658,6 +671,8 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
             and msg.get("role") == "assistant"
             and isinstance(collapsed[-1], dict)
             and collapsed[-1].get("role") == "assistant"
+            and not _is_protected(msg)
+            and not _is_protected(collapsed[-1])
             and not _is_codex_interim(msg)
             and not _is_codex_interim(collapsed[-1])
         ):
@@ -782,7 +797,7 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
                 if tc_id in known_tool_ids
                 and known_tool_ids[tc_id] not in matched_tool_groups
             }
-            if not result_variants:
+            if _is_protected(msg) or not result_variants:
                 filtered.append(msg)
             elif candidate_groups:
                 # Consume the whole alias group so a SECOND result replaying
@@ -838,6 +853,7 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
             isinstance(msg, dict)
             and msg.get("role") == "assistant"
             and msg.get("tool_calls")
+            and not _is_protected(msg)
             and not _is_codex_interim(msg)
         ):
             pruned.append(msg)
@@ -889,6 +905,8 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
             and msg.get("role") == "user"
             and isinstance(merged[-1], dict)
             and merged[-1].get("role") == "user"
+            and not _is_protected(msg)
+            and not _is_protected(merged[-1])
         ):
             prev = merged[-1]
             # v2 native compaction deliberately places its explicit handoff

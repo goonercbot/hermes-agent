@@ -13,6 +13,7 @@ extracted functions reach back through the ``run_agent`` module via
 from __future__ import annotations
 
 import concurrent.futures
+from copy import deepcopy
 import json
 from pathlib import Path
 import logging
@@ -54,6 +55,41 @@ from tools.tool_result_storage import (
 from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context_window
 
 logger = logging.getLogger(__name__)
+
+
+def _enforce_turn_budget_with_native_projection(
+    agent, messages: list, num_tools: int, *, env=None, config=DEFAULT_BUDGET,
+) -> None:
+    """Fence only the known budget transformation, never a later /steer edit.
+
+    Tool rows have already been flushed individually. Their durable contents
+    must remain the source of note authentication even when replay is shortened.
+    An invalid existing projection must not be repaired by this transformation.
+    """
+    if num_tools <= 0:
+        return
+    tool_messages = messages[-num_tools:]
+    source = None
+    before = None
+    if (
+        getattr(agent, "native_incremental_handoff_enabled", False) is True
+        and sum(len(row.get("content", "")) for row in tool_messages) > config.turn_budget
+    ):
+        from agent.native_incremental_handoff import _projection_source_for_messages
+
+        source, _ = _projection_source_for_messages(agent, messages)
+        if source is not None:
+            # With no prior projection the helper returns a shallow list.
+            # Freeze before the budget mutates the shared message dictionaries.
+            source = deepcopy(source)
+            before = deepcopy(tool_messages)
+    enforce_turn_budget(tool_messages, env=env, config=config)
+    if source is not None and tool_messages != before:
+        from agent.native_incremental_handoff import bind_native_incremental_replay_projection
+
+        bind_native_incremental_replay_projection(
+            agent, source_messages=source, replay_messages=messages,
+        )
 
 
 def _pairing_tool_call_id(tool_call: Any) -> str:
@@ -1926,8 +1962,9 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     # when aggregate budget enforcement replaces that tool result.
     num_tools = len(parsed_calls)
     if finalize and num_tools > 0:
-        turn_tool_msgs = messages[-num_tools:]
-        enforce_turn_budget(turn_tool_msgs, env=get_active_env(effective_task_id), config=_tool_budget)
+        _enforce_turn_budget_with_native_projection(
+            agent, messages, num_tools, env=get_active_env(effective_task_id), config=_tool_budget,
+        )
 
     # ── /steer injection ──────────────────────────────────────────────
     # Append any pending user steer text to the last tool result so the
@@ -2879,7 +2916,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
     # be discarded when aggregate budget enforcement replaces a tool result.
     num_tools_seq = len(assistant_message.tool_calls)
     if finalize and num_tools_seq > 0:
-        enforce_turn_budget(messages[-num_tools_seq:], env=get_active_env(effective_task_id), config=_tool_budget)
+        _enforce_turn_budget_with_native_projection(
+            agent, messages, num_tools_seq, env=get_active_env(effective_task_id), config=_tool_budget,
+        )
 
     # ── /steer injection ──────────────────────────────────────────────
     # See _execute_tool_calls_parallel for the rationale. Same hook,
@@ -2942,8 +2981,8 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
     total_tools = len(assistant_message.tool_calls)
     if total_tools > 0:
         _tool_budget = _budget_for_agent(agent)
-        enforce_turn_budget(
-            messages[-total_tools:],
+        _enforce_turn_budget_with_native_projection(
+            agent, messages, total_tools,
             env=get_active_env(effective_task_id),
             config=_tool_budget,
         )

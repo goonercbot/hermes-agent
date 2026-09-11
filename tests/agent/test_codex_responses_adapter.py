@@ -72,15 +72,24 @@ def _harmony_token(name: str) -> str:
 
 
 def test_codex_preflight_gate_off_preserves_harmony_tokens_byte_for_byte():
-    raw = [{
-        "type": "function_call_output",
-        "call_id": "call_1",
-        "output": _HARMONY_SOURCE_SNIPPET,
-    }]
+    raw = [
+        {
+            "type": "function_call",
+            "call_id": "call_1",
+            "name": "terminal",
+            "arguments": "{}",
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call_1",
+            "output": _HARMONY_SOURCE_SNIPPET,
+        },
+    ]
 
     normalized = _preflight_codex_input_items(raw)
 
-    assert normalized[0]["output"] == _HARMONY_SOURCE_SNIPPET
+    output = next(item for item in normalized if item["type"] == "function_call_output")
+    assert output["output"] == _HARMONY_SOURCE_SNIPPET
 
 
 def test_harmony_neutralizer_defangs_only_reserved_control_tokens():
@@ -179,6 +188,12 @@ def test_codex_api_preflight_defangs_every_outbound_text_carrier():
             "call_id": "call_args",
             "name": "terminal",
             "arguments": '{"command":"echo ' + _harmony_token("channel") + '"}',
+        },
+        {
+            "type": "function_call",
+            "call_id": "call_output_parts",
+            "name": "terminal",
+            "arguments": "{}",
         },
         {
             "type": "function_call_output",
@@ -468,6 +483,94 @@ def test_preflight_codex_input_items_sanitizes_replayed_fn_name():
     )
     call = next(i for i in normalized if i.get("type") == "function_call")
     assert call["name"] == "bad_name"
+
+
+@pytest.mark.parametrize(
+    ("scope", "with_checkpoint"),
+    [("main", False), ("subagent", True)],
+)
+def test_responses_replay_preserves_historical_deferred_tool_pair(
+    scope, with_checkpoint,
+):
+    """Current tools may change after a deferred ``tool_call`` was executed.
+
+    Main and child histories must keep the completed historical call/output pair
+    even when the current request exposes only the maintenance tool.  The child
+    variant includes a checkpoint to cover the native post-checkpoint tail.
+    """
+    call_id = f"call_deferred_{scope}"
+    messages = []
+    if with_checkpoint:
+        messages.append(
+            {
+                "role": "assistant",
+                "content": "",
+                "codex_reasoning_items": [
+                    {"type": "compaction", "encrypted_content": "opaque-checkpoint"}
+                ],
+            }
+        )
+    messages.extend(
+        [
+            {"role": "user", "content": "continue"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": call_id,
+                        "call_id": call_id,
+                        "function": {"name": "tool_call", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": call_id, "content": "completed"},
+        ]
+    )
+
+    request = _preflight_codex_api_kwargs(
+        {
+            "model": "gpt-5.6",
+            "instructions": "test",
+            "input": _chat_messages_to_responses_input(
+                messages,
+                native_compaction_eligible=with_checkpoint,
+            ),
+            # Simulates the deferred-tool transition: the historical bridge is
+            # no longer live, but its completed replay pair remains authentic.
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "continuity_note",
+                    "description": "maintenance",
+                    "parameters": {"type": "object", "properties": {}},
+                }
+            ],
+        }
+    )
+
+    pair = [item for item in request["input"] if item.get("call_id") == call_id]
+    assert [(item["type"], item.get("name")) for item in pair] == [
+        ("function_call", "tool_call"),
+        ("function_call_output", None),
+    ]
+    assert [tool["name"] for tool in request["tools"]] == ["continuity_note"]
+
+
+def test_preflight_codex_input_items_fails_closed_on_orphaned_output():
+    with pytest.raises(
+        ValueError,
+        match=r"function_call_output has no matching function_call for call_id 'call_orphan'",
+    ):
+        _preflight_codex_input_items(
+            [
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_orphan",
+                    "output": "must not be sent alone",
+                }
+            ]
+        )
 
 
 def test_preflight_codex_api_kwargs_leaves_tool_definition_names_alone():

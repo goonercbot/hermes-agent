@@ -2395,19 +2395,22 @@ def run_conversation(
         if _native_boundary_request:
             from agent.agent_runtime_helpers import repair_message_sequence
 
-            from agent.native_compaction import native_compaction_protected_message_indices
-
-            # The latest user may itself be in the authenticated native tail.
-            # Never hand the repair helper a sliced/incomplete checkpoint.
-            _current_user = (
+            # Native request messages are already a disposable deep copy.  The
+            # repair helper protects the validated carrier/handoff/tail itself,
+            # but it must see the entire copy: a stale current-user cursor can
+            # otherwise cut between an unsealed assistant tool call and its
+            # matching result, prune the call, and leave an outgoing orphan.
+            _cursor_row = (
                 messages[_request_current_turn_user_idx]
-                if _request_current_turn_user_idx < len(messages) else None
+                if _request_current_turn_user_idx < len(messages)
+                else None
             )
-            _sealed = native_compaction_protected_message_indices(messages)
-            _repair_end = max(_request_current_turn_user_idx, max(_sealed, default=-1) + 1)
-            _prefix = messages[:_repair_end]
-            repaired_seq = repair_message_sequence(agent, _prefix)
-            messages = _prefix + messages[_repair_end:]
+            _current_user = (
+                _cursor_row
+                if isinstance(_cursor_row, dict) and _cursor_row.get("role") == "user"
+                else None
+            )
+            repaired_seq = repair_message_sequence(agent, messages)
             _request_current_turn_user_idx = next(
                 (index for index, row in enumerate(messages) if row is _current_user),
                 len(messages),  # Current user was already covered by the note.

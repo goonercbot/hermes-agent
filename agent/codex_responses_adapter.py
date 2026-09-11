@@ -1356,6 +1356,29 @@ def _preflight_codex_input_items(
             f"Codex Responses input[{idx}] has unsupported item shape (type={item_type!r}, role={role!r})."
         )
 
+    # Responses replays tool results as standalone typed items.  Unlike the
+    # Chat Completions shape, their parent calls are not structurally nested,
+    # so validating each item independently can emit an output whose declaring
+    # function_call was omitted by an earlier request-side projection. The API
+    # rejects that payload remotely with an unrecoverable 400. Reject it here
+    # instead: never delete the authentic output to make a malformed request
+    # look valid, and never send a partial tool exchange.
+    declared_call_ids = {
+        item["call_id"]
+        for item in normalized
+        if item.get("type") == "function_call"
+    }
+    for idx, item in enumerate(normalized):
+        if (
+            item.get("type") == "function_call_output"
+            and item["call_id"] not in declared_call_ids
+        ):
+            raise ValueError(
+                "Codex Responses input[%d] function_call_output has no matching "
+                "function_call for call_id %r."
+                % (idx, item["call_id"])
+            )
+
     return normalized
 
 

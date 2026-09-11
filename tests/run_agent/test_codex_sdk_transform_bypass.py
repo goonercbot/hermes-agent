@@ -18,6 +18,10 @@ sys.modules.setdefault("fire", types.SimpleNamespace(Fire=lambda *a, **k: None))
 sys.modules.setdefault("firecrawl", types.SimpleNamespace(Firecrawl=object))
 sys.modules.setdefault("fal_client", types.SimpleNamespace())
 
+from agent.codex_responses_adapter import (
+    _chat_messages_to_responses_input,
+    _preflight_codex_api_kwargs,
+)
 from agent.codex_runtime import (
     _bypass_sdk_request_transform,
     _is_plain_json_data,
@@ -155,3 +159,63 @@ class TestRunCodexStreamRoutesPayloadViaExtraBody:
         assert create_kwargs["stream"] is True
         assert create_kwargs["extra_body"]["input"][0]["role"] == "user"
         assert create_kwargs["extra_body"]["tools"][0]["name"] == "terminal"
+
+    def test_create_receives_complete_deferred_tool_pair_for_main_and_subagent(self):
+        """The final SDK payload retains historical calls after tool-set changes."""
+        from agent.codex_runtime import run_codex_stream
+
+        for scope, is_subagent in (("main", False), ("subagent", True)):
+            call_id = f"call_{scope}_deferred"
+            history = [
+                {"role": "user", "content": "continue"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": call_id,
+                            "call_id": call_id,
+                            "function": {"name": "tool_call", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": call_id, "content": "completed"},
+            ]
+            request = _preflight_codex_api_kwargs(
+                {
+                    "model": "gpt-5.6-sol",
+                    "instructions": "You are Hermes.",
+                    "input": _chat_messages_to_responses_input(history),
+                    # The historical deferred bridge is intentionally absent
+                    # from the current live tool set.
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "continuity_note",
+                            "parameters": {"type": "object", "properties": {}},
+                        }
+                    ],
+                    "store": False,
+                }
+            )
+            agent = self._make_agent()
+            setattr(agent, "is_subagent", is_subagent)
+            events = [
+                SimpleNamespace(
+                    type="response.completed",
+                    response=SimpleNamespace(
+                        id="r1", status="completed", output=[], usage=None,
+                    ),
+                )
+            ]
+            mock_client = MagicMock()
+            mock_client.responses.create.return_value = iter(events)
+
+            run_codex_stream(agent, request, client=mock_client)
+
+            wire_input = mock_client.responses.create.call_args.kwargs["extra_body"]["input"]
+            pair = [item for item in wire_input if item.get("call_id") == call_id]
+            assert [(item["type"], item.get("name")) for item in pair] == [
+                ("function_call", "tool_call"),
+                ("function_call_output", None),
+            ]

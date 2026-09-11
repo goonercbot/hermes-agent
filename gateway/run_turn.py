@@ -1880,7 +1880,12 @@ class GatewayTurnMixin:
         # An unreadable store is not an empty conversation: stop before the agent invents continuity
         # from []. Restore task-local context here (before the broad cleanup finally).
         try:
-            history = await self.async_session_store.load_transcript(session_entry.session_id)
+            # Native note authentication is against canonical stored rows.  Do
+            # not merge a resumed user/user boundary while loading it: the
+            # final request projection repairs that disposable provider input.
+            history = await self.async_session_store.load_transcript(
+                session_entry.session_id, repair_alternation=False,
+            )
             history = await self._hmwa_run_session_hygiene(
                 event, source, session_entry, session_key, history, _quick_key, run_generation,
             )

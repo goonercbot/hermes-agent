@@ -1407,6 +1407,12 @@ def _run_api_retry_loop(agent, s: _LoopState) -> Optional[Dict[str, Any]]:
     def _maintenance_failure(
         error: NativeNoteRefreshFailure, *, account_usage: bool = True,
     ) -> Dict[str, Any]:
+        # Reasons are fixed host-side failure classes; retain them in the local
+        # log so a generic user-facing preservation response remains diagnosable.
+        logger.warning(
+            "Native continuity-note refresh failed (session=%s): %s",
+            getattr(agent, "session_id", None) or "-", error.reason,
+        )
         if account_usage:
             try:
                 account_failed_native_note_refresh(agent, s.response)

@@ -148,7 +148,15 @@ def prepare_iteration(agent: Any,*, messages: Any, api_call_count: Any) -> Itera
     # cursor can separate a trailing assistant tool call from its tool result.
     from agent.native_compaction import validate_persisted_native_compaction_history
     native_boundary_request = bool(validate_persisted_native_compaction_history(messages))
+    native_request_source = None
     if native_boundary_request:
+        from agent.native_incremental_handoff import _projection_source_for_messages
+
+        # Capture canonical evidence before repair.  A resumed gateway replay
+        # may be a cleaned projection and this turn's user row may already be
+        # durable, so the authenticated source can have a different shape from
+        # the outgoing repaired request.
+        native_request_source, _ = _projection_source_for_messages(agent, messages)
         messages = deepcopy(messages)
     # Per-agent validation cursor skips re-parsing tool_call args already validated.
     # Identity-keyed; a rewritten list breaks the prefix match and forces a re-scan.
@@ -196,33 +204,39 @@ def prepare_iteration(agent: Any,*, messages: Any, api_call_count: Any) -> Itera
     if native_boundary_request:
         from agent.agent_runtime_helpers import repair_message_sequence
 
-        # The helper is native-aware in the migrated runtime.  Keep a pristine
-        # request copy nevertheless: mixed-version process reloads can briefly
-        # expose the old generic helper, which merges the deliberate handoff /
-        # user adjacency.  Fail closed on that proof and repair both unsealed
-        # sides instead; the suffix is always included as one unit, so a stale
-        # cursor cannot split an assistant tool call from its result.
-        native_request_source = deepcopy(messages)
-        repaired_seq = repair_message_sequence(agent, messages)
-        try:
-            validate_persisted_native_compaction_history(messages)
-        except ValueError:
-            from agent.native_compaction import native_compaction_protected_message_indices
+        # Repair each unsealed side as a whole.  Do not use a stale flush/user
+        # cursor: it can split a trailing assistant tool call from its result.
+        # The sealed carrier/handoff/tail remains byte-identical, including its
+        # deliberate user/user adjacency.
+        from agent.native_compaction import native_compaction_protected_message_indices
 
-            protected_indices = native_compaction_protected_message_indices(
-                native_request_source
-            )
-            protected_start = min(protected_indices)
-            protected_end = max(protected_indices) + 1
-            prefix = native_request_source[:protected_start]
-            sealed = native_request_source[protected_start:protected_end]
-            suffix = native_request_source[protected_end:]
-            repaired_seq = (
-                repair_message_sequence(agent, prefix)
-                + repair_message_sequence(agent, suffix)
-            )
-            messages[:] = [*prefix, *sealed, *suffix]
-            validate_persisted_native_compaction_history(messages)
+        native_request_copy = deepcopy(messages)
+        protected_indices = native_compaction_protected_message_indices(messages)
+        protected_start = min(protected_indices)
+        protected_end = max(protected_indices) + 1
+        prefix = messages[:protected_start]
+        sealed = messages[protected_start:protected_end]
+        suffix = messages[protected_end:]
+        repaired_seq = (
+            repair_message_sequence(agent, prefix)
+            + repair_message_sequence(agent, suffix)
+        )
+        messages[:] = [*prefix, *sealed, *suffix]
+        validate_persisted_native_compaction_history(messages)
+        if repaired_seq:
+            from agent.native_incremental_handoff import bind_native_incremental_request_projection
+
+            if native_request_source is None or not bind_native_incremental_request_projection(
+                agent,
+                source_messages=native_request_source,
+                replay_messages=messages,
+            ):
+                messages[:] = native_request_copy
+                logger.warning(
+                    "Rejected native request sequence repair without authenticated source "
+                    "(session=%s)", agent.session_id or "-"
+                )
+                raise ValueError("native request sequence repair source unauthenticated")
     else:
         from agent.agent_runtime_helpers import repair_message_sequence_with_cursor
 

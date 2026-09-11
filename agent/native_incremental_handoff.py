@@ -134,6 +134,39 @@ def bind_native_incremental_replay_projection(
         "replay": deepcopy(replay_messages),
         "replay_fence": _note_fence(replay_messages),
     }
+    # A fresh host replay supersedes a one-request alternation repair.
+    agent._native_incremental_request_projection = None
+    return True
+
+
+def bind_native_incremental_request_projection(
+    agent: Any,
+    *,
+    source_messages: List[Dict[str, Any]],
+    replay_messages: List[Dict[str, Any]],
+) -> bool:
+    """Bind one deterministic request-only repair to canonical source evidence.
+
+    The durable transcript can legally end with a user row when a resumed turn
+    appends its next user row.  Sequence repair must merge that pair for the
+    provider, but it must never rewrite the authenticated source that is later
+    used to refresh a continuity note.  This short-lived binding accepts only
+    the exact repaired request prefix produced by the host and reconstructs
+    canonical source plus any rows appended after that request.
+    """
+    if not isinstance(source_messages, list) or not isinstance(replay_messages, list):
+        return False
+    try:
+        validate_persisted_native_compaction_history(source_messages)
+        validate_persisted_native_compaction_history(replay_messages)
+    except ValueError:
+        return False
+    agent._native_incremental_request_projection = {
+        "source": deepcopy(source_messages),
+        "source_fence": _note_fence(source_messages),
+        "replay": deepcopy(replay_messages),
+        "replay_fence": _note_fence(replay_messages),
+    }
     return True
 
 
@@ -147,6 +180,21 @@ def _projection_source_for_messages(
     source and projection, so a newly minted note can be authenticated against
     the canonical source and still compact the replay list on the next turn.
     """
+    request_state = getattr(agent, "_native_incremental_request_projection", None)
+    if isinstance(request_state, dict):
+        source = request_state.get("source")
+        replay = request_state.get("replay")
+        if not isinstance(source, list) or not isinstance(replay, list):
+            return None, None
+        if (
+            request_state.get("source_fence") != _note_fence(source)
+            or request_state.get("replay_fence") != _note_fence(replay)
+            or len(messages) < len(replay)
+            or _note_fence(messages[:len(replay)]) != request_state.get("replay_fence")
+        ):
+            return None, None
+        return deepcopy(source) + deepcopy(messages[len(replay):]), len(replay)
+
     state = getattr(agent, "_native_incremental_replay_projection", None)
     if not isinstance(state, dict):
         return list(messages), None
@@ -200,6 +248,7 @@ def authenticate_native_compaction_publication(agent: Any, messages, attempt) ->
     ):
         raise ValueError("native compaction persisted replay projection authentication failed")
     agent._native_incremental_replay_projection = probe._native_incremental_replay_projection
+    agent._native_incremental_request_projection = None
     agent._native_incremental_handoff_note = probe._native_incremental_handoff_note
     agent._native_incremental_handoff_projection_cursor = probe._native_incremental_handoff_projection_cursor
 

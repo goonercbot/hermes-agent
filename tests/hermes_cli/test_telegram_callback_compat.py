@@ -74,6 +74,32 @@ def test_register_callback_prefix_wires_authorized_handler(monkeypatch):
     )
 
 
+@pytest.mark.parametrize("allowed", [True, False])
+def test_nontopic_callback_legacy_authorization(monkeypatch, allowed):
+    from gateway.config import Platform
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+
+    manager, context = _context()
+    callback = AsyncMock()
+    context.register_telegram_callback_handler("tx:", callback)
+    adapter = object.__new__(TelegramAdapter)
+    adapter.platform = Platform.TELEGRAM
+    calls = []
+
+    def authorize(user_id, chat_type, chat_id):
+        calls.append((user_id, chat_type, chat_id))
+        return allowed
+
+    adapter._authorization_check = authorize
+    handler = _wired_handler(manager, adapter, monkeypatch)
+    update, query = _update()
+    query.message.message_thread_id = None
+    asyncio.run(handler.callback(update, None))
+    assert calls == [("123", "group", "-1001")]
+    assert callback.await_count == int(allowed)
+    assert query.answer.await_count == int(not allowed)
+
+
 def test_callback_prefix_denies_unauthorized_user(monkeypatch):
     manager, context = _context()
     callback = AsyncMock()

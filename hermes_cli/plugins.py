@@ -883,10 +883,11 @@ class PluginContext:
                     message = getattr(query, "message", None)
                     chat = getattr(message, "chat", None)
                     user = getattr(query, "from_user", None)
+                    raw_thread_id = getattr(message, "message_thread_id", None)
                     if not adapter._is_callback_user_authorized(
                         str(getattr(user, "id", "")), chat_id=getattr(message, "chat_id", None),
                         chat_type=str(getattr(chat, "type", "")) or None,
-                        thread_id=(str(getattr(message, "message_thread_id", "")) or None),
+                        thread_id=(str(raw_thread_id) if raw_thread_id is not None else None),
                         user_name=getattr(user, "first_name", None),
                     ):
                         await query.answer(text="⛔ You are not authorized to use this button.", show_alert=True)

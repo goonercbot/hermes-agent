@@ -25,6 +25,7 @@ from hermes_state_common import (
     FTS_STORAGE_VERSION, FTS_TOOL_FULL_CONTENT_HIGH_WATER_KEY, FTS_TRIGRAM_SQL, LEGACY_FTS_SQL,
     LEGACY_FTS_TRIGRAM_SQL, SCHEMA_SQL,
     SCHEMA_VERSION, _FTS_CJK_TRIGGERS, _FTS_TRIGGERS, _ephemeral_child_sql, fts_rebuild_admission,
+    sanitize_billing_base_url,
 )
 
 # Pre-split logger identity so log filtering/capture is unchanged.
@@ -162,6 +163,57 @@ def schema_read_probe_statements() -> tuple:
 
 class SessionSchemaMixin:
     """See module docstring — mixin for SessionDB (Schema cluster)."""
+
+    def _initialize_usage_event_ledger(self, cursor: sqlite3.Cursor) -> None:
+        """Atomically seed a legacy aggregate baseline once before appending deltas."""
+        if cursor.execute(
+            "SELECT 1 FROM usage_event_meta WHERE key = 'schema_version'"
+        ).fetchone() is not None:
+            return
+        initialized_at = time.time()
+        rows = cursor.execute(
+            """SELECT u.session_id, u.model, u.billing_provider, u.billing_base_url,
+                      u.billing_mode, u.task, u.api_call_count, u.input_tokens,
+                      u.output_tokens, u.cache_read_tokens, u.cache_write_tokens,
+                      u.reasoning_tokens, u.estimated_cost_usd, u.actual_cost_usd,
+                      u.cost_status, u.cost_source, u.first_seen, u.last_seen,
+                      s.parent_session_id, s.source AS session_source
+                 FROM session_model_usage AS u LEFT JOIN sessions AS s ON s.id = u.session_id"""
+        ).fetchall()
+        for row in rows:
+            values = dict(row)
+            identity = json.dumps(
+                [values[k] for k in ("session_id", "model", "billing_provider", "billing_base_url", "billing_mode", "task")],
+                separators=(",", ":"), ensure_ascii=True,
+            )
+            first_seen, last_seen = values["first_seen"], values["last_seen"]
+            timing_kind = "interval" if first_seen is not None and last_seen is not None else "unknown"
+            cursor.execute(
+                """INSERT OR IGNORE INTO usage_events (
+                       event_id, schema_version, event_kind, session_id, parent_session_id,
+                       session_source, model, billing_provider, billing_base_url, billing_mode,
+                       task, execution_role, task_id, occurred_at, recorded_at, interval_start,
+                       interval_end, timing_kind, api_call_count, input_tokens, output_tokens,
+                       cache_read_tokens, cache_write_tokens, reasoning_tokens, estimated_cost_usd,
+                       actual_cost_usd, cost_status, cost_source
+                   ) VALUES (?, 1, 'baseline', ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    "baseline:" + hashlib.sha256(identity.encode("utf-8")).hexdigest(), values["session_id"],
+                    values["parent_session_id"], values["session_source"] or "unknown", values["model"] or "unknown",
+                    values["billing_provider"] or "", sanitize_billing_base_url(values["billing_base_url"]),
+                    values["billing_mode"] or "", values["task"] or "", "auxiliary" if values["task"] else "unknown",
+                    initialized_at, first_seen if timing_kind == "interval" else None,
+                    last_seen if timing_kind == "interval" else None, timing_kind,
+                    int(values["api_call_count"] or 0), int(values["input_tokens"] or 0),
+                    int(values["output_tokens"] or 0), int(values["cache_read_tokens"] or 0),
+                    int(values["cache_write_tokens"] or 0), int(values["reasoning_tokens"] or 0),
+                    values["estimated_cost_usd"], values["actual_cost_usd"], values["cost_status"], values["cost_source"],
+                ),
+            )
+        cursor.executemany(
+            "INSERT INTO usage_event_meta (key, value) VALUES (?, ?)",
+            (("schema_version", "1"), ("initialized_at", str(initialized_at))),
+        )
 
     def _dedupe_legacy_system_prompts(self, cursor: sqlite3.Cursor) -> None:
         """Move inline prompt snapshots into the shared content-addressed table. Any
@@ -859,6 +911,8 @@ class SessionSchemaMixin:
         self._ensure_unique_title_index(cursor)
         if fts5_available:
             self._init_fts(cursor)
+        # Runs after the legacy per-model migration; marker and baseline commit together.
+        self._initialize_usage_event_ledger(cursor)
         self._conn.commit()
 
     def _run_data_migrations(self, cursor: sqlite3.Cursor, current_version: int, fts5_available: bool) -> None:

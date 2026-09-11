@@ -583,6 +583,62 @@ class SessionMessagesMixin:
             ") AND content IS ?",
             (_scrub_surrogates(api_content), session_id, self._encode_content(content)))
 
+    def set_in_place_native_compaction_api_content(
+        self, session_id: str, *, user_content: Any, api_content: str, identity: str,
+        encrypted_content: str, old_metadata: Dict[str, Any], new_metadata: Dict[str, Any],
+    ) -> None:
+        """Atomically bind a native checkpoint tail and current user sidecar.
+
+        Validate both unique rows before mutating either one; a mismatched or
+        concurrent rewrite must leave the database byte-identical.
+        """
+        encoded_user = self._encode_content(user_content)
+        encoded_api = _sanitize_surrogates(api_content)
+
+        def _do(conn):
+            users = conn.execute(
+                "SELECT id FROM messages WHERE session_id = ? AND active = 1 "
+                "AND role = 'user' AND content IS ? ORDER BY id", (session_id, encoded_user)
+            ).fetchall()
+            if len(users) != 1:
+                raise ValueError("native compaction api_content user row is missing or ambiguous")
+            matches = []
+            for row in conn.execute(
+                "SELECT id, codex_reasoning_items FROM messages WHERE session_id = ? "
+                "AND active = 1 AND role = 'assistant'", (session_id,)
+            ).fetchall():
+                try:
+                    items = json.loads(row["codex_reasoning_items"])
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                if not isinstance(items, list) or len(items) != 1 or not isinstance(items[0], dict):
+                    continue
+                item = items[0]
+                metadata = item.get("_hermes_native_compaction")
+                if (
+                    item.get("type") == "compaction" and item.get("encrypted_content") == encrypted_content
+                    and isinstance(metadata, dict) and metadata.get("identity") == identity
+                ):
+                    matches.append((row["id"], item))
+            if len(matches) != 1:
+                raise ValueError("native compaction api_content carrier is missing or ambiguous")
+            carrier_id, checkpoint = matches[0]
+            if checkpoint.get("_hermes_native_compaction") != old_metadata:
+                raise ValueError("native compaction api_content carrier metadata mismatch")
+            rewritten = dict(checkpoint)
+            rewritten["_hermes_native_compaction"] = new_metadata
+            user_update = conn.execute(
+                "UPDATE messages SET api_content = ? WHERE id = ? AND active = 1", (encoded_api, users[0]["id"])
+            )
+            carrier_update = conn.execute(
+                "UPDATE messages SET codex_reasoning_items = ? WHERE id = ? AND active = 1",
+                (json.dumps([rewritten], ensure_ascii=False, separators=(",", ":")), carrier_id),
+            )
+            if user_update.rowcount != 1 or carrier_update.rowcount != 1:
+                raise ValueError("native compaction api_content update failed")
+
+        self._execute_write(_do)
+
     def _dedupe_display_generations(self, rows):
         """Collapse compaction generations so each logical message appears once (the protected tail is copied
         into each generation: same role/content/timestamp, different ``active``/id); prefer the live row, then
@@ -737,6 +793,41 @@ class SessionMessagesMixin:
             f"FROM messages WHERE session_id IN ({_placeholders(session_ids)})"
             f"{active_clause} ORDER BY id", tuple(session_ids))
 
+    @staticmethod
+    def _native_compaction_protected_following_count(carrier: Any, remaining_rows: int) -> int:
+        """Return the exact handoff and tail span sealed by a valid native v2 checkpoint.
+
+        Normal resume sanitization remains correct for ordinary transcript rows,
+        but native compaction's authenticated handoff is byte-sensitive and must
+        retain the carrier's immediately following sealed rows verbatim.
+        """
+        if not isinstance(carrier, dict) or carrier.get("role") != "assistant":
+            return 0
+        items = carrier.get("codex_reasoning_items")
+        if not isinstance(items, list) or len(items) != 1 or not isinstance(items[0], dict):
+            return 0
+        checkpoint = items[0]
+        metadata = checkpoint.get("_hermes_native_compaction")
+        if not (
+            checkpoint.get("type") == "compaction"
+            and isinstance(checkpoint.get("encrypted_content"), str)
+            and checkpoint["encrypted_content"].strip()
+            and isinstance(metadata, dict)
+            and set(metadata) == {"version", "identity", "handoff", "tail_count", "tail_fence"}
+            and metadata.get("version") == 2
+            and isinstance(metadata.get("identity"), str)
+            and metadata["identity"].strip()
+            and isinstance(metadata.get("handoff"), str)
+            and metadata["handoff"].strip()
+            and isinstance(metadata.get("tail_count"), int)
+            and not isinstance(metadata.get("tail_count"), bool)
+            and metadata["tail_count"] >= 0
+            and isinstance(metadata.get("tail_fence"), str)
+        ):
+            return 0
+        protected_count = 1 + metadata["tail_count"]
+        return protected_count if protected_count <= remaining_rows else 0
+
     def get_messages_as_conversation(self, session_id: str, include_ancestors: bool = False,
                                      include_inactive: bool = False, repair_alternation: bool = False,
                                      include_row_ids: bool = False,
@@ -785,9 +876,15 @@ class SessionMessagesMixin:
         from hermes_state import _strip_background_review_harness, _strip_stale_tool_call_markers
         messages = []
         exact_user_clones: Dict[Tuple[Any, str], Dict[str, Any]] = {}
-        for row in rows:
+        protected_native_rows_remaining = 0
+        protected_native_message_ids = set()
+        for row_index, row in enumerate(rows):
             content = self._decode_content(row["content"])
-            if row["role"] in {"user", "assistant"} and isinstance(content, str):
+            preserve_exact_native_content = protected_native_rows_remaining > 0
+            if preserve_exact_native_content:
+                protected_native_rows_remaining -= 1
+            if (row["role"] in {"user", "assistant"} and isinstance(content, str)
+                    and not preserve_exact_native_content):
                 content = sanitize_context(content).strip()
             # Underscore-prefixed like ``_row_id``: transports strip it before the wire; compression's
             # assembly copies strip it so rotated child handoffs still flush (_fresh_compaction_message_copy).
@@ -827,12 +924,40 @@ class SessionMessagesMixin:
                 if exact_clone_key is not None:
                     exact_user_clones[exact_clone_key] = msg
             messages.append(msg)
+            if preserve_exact_native_content:
+                protected_native_message_ids.add(id(msg))
+            protected_following_count = self._native_compaction_protected_following_count(
+                msg, len(rows) - row_index - 1)
+            if protected_following_count:
+                protected_native_message_ids.add(id(msg))
+                protected_native_rows_remaining = protected_following_count
         # Defense-in-depth: strip a background-review harness turn (older builds shared the parent's
         # session_id) plus its curator reply, and bare tool-call marker content ("[memory]") persisted as an answer.
         messages = _strip_stale_tool_call_markers(_strip_background_review_harness(messages))
         if repair_alternation and messages:
             from agent.agent_runtime_helpers import repair_message_sequence
-            repaired = repair_message_sequence(None, messages)
+            if protected_native_message_ids:
+                # Repair ordinary spans independently: generic alternation
+                # repair is intentionally lossy in shape, while a v2 native
+                # carrier and its exact following handoff/tail are sealed.
+                repaired = 0
+                repaired_messages = []
+                ordinary_span = []
+                for message in messages:
+                    if id(message) in protected_native_message_ids:
+                        if ordinary_span:
+                            repaired += repair_message_sequence(None, ordinary_span)
+                            repaired_messages.extend(ordinary_span)
+                            ordinary_span = []
+                        repaired_messages.append(message)
+                    else:
+                        ordinary_span.append(message)
+                if ordinary_span:
+                    repaired += repair_message_sequence(None, ordinary_span)
+                    repaired_messages.extend(ordinary_span)
+                messages = repaired_messages
+            else:
+                repaired = repair_message_sequence(None, messages)
             if repaired:
                 logger.info("Repaired %d message-alternation violation(s) while "
                     "restoring session %s — durable transcript kept them, "

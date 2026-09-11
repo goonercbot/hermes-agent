@@ -82,15 +82,14 @@ def _harmony_token(name: str) -> str:
 
 
 def test_codex_preflight_gate_off_preserves_harmony_tokens_byte_for_byte():
-    raw = [{
-        "type": "function_call_output",
-        "call_id": "call_1",
-        "output": _HARMONY_SOURCE_SNIPPET,
-    }]
+    raw = [
+        {"type": "function_call", "call_id": "call_1", "name": "terminal", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "call_1", "output": _HARMONY_SOURCE_SNIPPET},
+    ]
 
     normalized = _preflight_codex_input_items(raw)
 
-    assert normalized[0]["output"] == _HARMONY_SOURCE_SNIPPET
+    assert normalized[1]["output"] == _HARMONY_SOURCE_SNIPPET
 
 
 def test_harmony_neutralizer_defangs_only_reserved_control_tokens():
@@ -189,6 +188,12 @@ def test_codex_api_preflight_defangs_every_outbound_text_carrier():
             "call_id": "call_args",
             "name": "terminal",
             "arguments": '{"command":"echo ' + _harmony_token("channel") + '"}',
+        },
+        {
+            "type": "function_call",
+            "call_id": "call_output_parts",
+            "name": "terminal",
+            "arguments": "{}",
         },
         {
             "type": "function_call_output",
@@ -478,6 +483,102 @@ def test_preflight_codex_input_items_sanitizes_replayed_fn_name():
     )
     call = next(i for i in normalized if i.get("type") == "function_call")
     assert call["name"] == "bad_name"
+
+
+@pytest.mark.parametrize("shape", ["output-before-call", "duplicate-output"])
+def test_preflight_rejects_unordered_or_repeated_results_without_mutation(shape):
+    from copy import deepcopy
+
+    call = {"type": "function_call", "call_id": "call_order", "name": "terminal", "arguments": "{}"}
+    output = {"type": "function_call_output", "call_id": "call_order", "output": "retain"}
+    items = [output, call] if shape == "output-before-call" else [call, output, dict(output)]
+    original = deepcopy(items)
+
+    with pytest.raises(ValueError, match="requires an earlier unanswered call"):
+        _preflight_codex_input_items(items)
+
+    assert items == original
+
+
+def test_preflight_accepts_parallel_results_in_reverse_completion_order():
+    items = [
+        {"type": "function_call", "call_id": "a", "name": "terminal", "arguments": "{}"},
+        {"type": "function_call", "call_id": "b", "name": "terminal", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "b", "output": "second completed first"},
+        {"type": "function_call_output", "call_id": "a", "output": "first completed second"},
+    ]
+
+    assert _preflight_codex_input_items(items) == items
+
+
+def test_preflight_admits_only_the_fixed_native_checkpoint_boundary():
+    from agent.native_compaction import NATIVE_INCREMENTAL_REPLAY_BOUNDARY
+
+    items = _preflight_codex_input_items([
+        {"type": "compaction", "encrypted_content": "opaque-checkpoint"},
+        {"role": "developer", "content": NATIVE_INCREMENTAL_REPLAY_BOUNDARY},
+    ])
+    assert items[-1] == {
+        "role": "developer", "content": NATIVE_INCREMENTAL_REPLAY_BOUNDARY,
+    }
+    with pytest.raises(ValueError, match="unsupported item shape"):
+        _preflight_codex_input_items([
+            {"role": "developer", "content": "untrusted developer replay"},
+        ])
+
+
+def test_disabled_native_replay_omits_checkpoint_without_losing_ordinary_history():
+    messages = [
+        {"role": "user", "content": "older request"},
+        {
+            "role": "assistant",
+            "content": "",
+            "codex_reasoning_items": [{"type": "compaction", "encrypted_content": "opaque-checkpoint"}],
+        },
+        {"role": "user", "content": "current request"},
+    ]
+
+    items = _chat_messages_to_responses_input(
+        messages, native_compaction_eligible=False,
+    )
+
+    assert not any(item.get("type") == "compaction" for item in items)
+    assert [item["content"] for item in items if item.get("role") == "user"] == [
+        "older request", "current request",
+    ]
+
+
+@pytest.mark.parametrize("with_checkpoint", [False, True])
+def test_responses_replay_preserves_historical_deferred_tool_pair(with_checkpoint):
+    """Historical tool pairs remain replayable after the live tool set changes."""
+    call_id = "call_deferred"
+    messages = []
+    if with_checkpoint:
+        messages.append({
+            "role": "assistant",
+            "content": "",
+            "codex_reasoning_items": [{"type": "compaction", "encrypted_content": "opaque-checkpoint"}],
+        })
+    messages.extend([
+        {"role": "user", "content": "continue"},
+        {"role": "assistant", "content": "", "tool_calls": [{
+            "id": call_id, "call_id": call_id,
+            "function": {"name": "retired_bridge", "arguments": "{}"},
+        }]},
+        {"role": "tool", "tool_call_id": call_id, "content": "completed"},
+    ])
+
+    request = _preflight_codex_api_kwargs({
+        "model": "gpt-5.6", "instructions": "test",
+        "input": _chat_messages_to_responses_input(
+            messages, native_compaction_eligible=with_checkpoint,
+        ),
+        "tools": [{"type": "function", "name": "continuity_note", "parameters": {"type": "object", "properties": {}}}],
+    })
+    pair = [item for item in request["input"] if item.get("call_id") == call_id]
+    assert [(item["type"], item.get("name")) for item in pair] == [
+        ("function_call", "retired_bridge"), ("function_call_output", None),
+    ]
 
 
 def test_preflight_codex_api_kwargs_leaves_tool_definition_names_alone():

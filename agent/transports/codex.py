@@ -486,7 +486,13 @@ class ResponsesApiTransport(ProviderTransport):
             is_github_responses=kwargs.get("is_github_responses") is True,
             replay_encrypted_reasoning=bool(kwargs.get("replay_encrypted_reasoning", True)),
             current_issuer_kind=self._resolve_issuer_kind(kwargs),
-            native_compaction_eligible=_native_compaction_active(kwargs.get("context_management")),
+            native_compaction_eligible=(
+                _native_compaction_active(kwargs.get("context_management"))
+                or bool(kwargs.get("native_continuity_replay", False))
+            ),
+            native_continuity_source_messages=kwargs.get(
+                "native_continuity_source_messages"
+            ),
         )
 
     def convert_tools(self, tools: Optional[list[dict[str, Any]]]) -> Any:
@@ -553,6 +559,8 @@ class ResponsesApiTransport(ProviderTransport):
                 payload_messages, is_xai_responses=is_xai_responses, is_github_responses=is_github_responses,
                 replay_encrypted_reasoning=replay_encrypted_reasoning, base_url=params.get("base_url"),
                 is_codex_backend=is_codex_backend, context_management=context_management,
+                native_continuity_replay=bool(params.get("native_continuity_replay", False)),
+                native_continuity_source_messages=params.get("native_continuity_source_messages"),
             ),
             "store": False,
         }

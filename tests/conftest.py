@@ -31,6 +31,12 @@ from pathlib import Path
 
 import pytest
 
+def pytest_addoption(parser):
+    parser.addoption(
+        "--native-router-source", action="store", default=None,
+        help="Explicit native-maintenance router source; otherwise use the verified repository fixture.",
+    )
+
 # Ensure project root is importable
 PROJECT_ROOT = Path(__file__).parent.parent
 if str(PROJECT_ROOT) not in sys.path:

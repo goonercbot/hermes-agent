@@ -11,7 +11,10 @@ class _NonStreamRequest:
     """
 
     def __init__(self, agent, api_kwargs: dict):
+        from agent.native_compaction_progress import current_native_compaction_request
+
         self.agent = agent
+        self.native_request = current_native_compaction_request()
         self.api_kwargs = api_kwargs
         self.result = {"response": None, "error": None}
         self.clients = h._RequestClientRegistry(agent)
@@ -237,6 +240,8 @@ class _NonStreamRequest:
 
     def run(self):
         agent, wd = self.agent, self.wd
+        if self.native_request is not None:
+            self.native_request.check_cancelled()
         if wd.codex:
             # Reset before the worker starts so a marker left over from a previous
             # call on this agent can't be misread as the first event for this one.
@@ -256,6 +261,13 @@ class _NonStreamRequest:
             # Resumed events clear our notice on the next poll, not 30s later.
             now = h.time.time()
             elapsed = now - self.call_start
+            if self.native_request is not None and self.native_request.cancelled:
+                # The compression owner can cancel while this stream is silent.
+                # Retire only this request's client/token, not the next user turn.
+                self.cancelled = True
+                self._abort_request("native_compression_cancel")
+                h._join_worker_for_relay_teardown(self.thread, label="Native compression")
+                raise InterruptedError("Native compression request was cancelled")
             self._emit_wait_notice(elapsed, heartbeat=poll_count % 100 == 0)
             last_event_ts, last_progress_ts, retry_started_ts = self._codex_watchdog_snapshot()
             retry_ttfb_elapsed = now - retry_started_ts if retry_started_ts is not None else None

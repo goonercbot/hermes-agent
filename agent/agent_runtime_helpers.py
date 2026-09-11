@@ -2184,6 +2184,42 @@ def _pre_tool_block_message(agent, function_name, function_args, effective_task_
         return None, function_args
 
 
+def emit_terminal_post_tool_call_with_maintenance_context(
+    agent, *, function_name, function_args, result, effective_task_id, tool_call_id,
+    maintenance_capability, duration_ms: int = 0, status: Optional[str] = None,
+    error_type: Optional[str] = None, error_message: Optional[str] = None,
+    middleware_trace: Optional[List[Dict[str, Any]]] = None,
+) -> None:
+    """Emit the normal terminal observer exactly once with host-only maintenance proof.
+
+    ``model_tools._emit_post_tool_call_hook`` deliberately has a narrow public
+    payload. Native maintenance needs the opaque capability only while policy
+    hooks observe this one terminal dispatch, so keep it out of tool arguments,
+    results and persistence while preserving the normal status derivation.
+    """
+    try:
+        from hermes_cli.lifecycle import has_hook, invoke_hook
+        from model_tools import _CallIds, _post_tool_call_hook_suppressed, _tool_result_observer_fields
+
+        if _post_tool_call_hook_suppressed.get() or not has_hook("post_tool_call"):
+            return
+        if status is None:
+            status, error_type, error_message = _tool_result_observer_fields(function_name, result)
+        invoke_hook(
+            "post_tool_call", tool_name=function_name, args=function_args, result=result,
+            **_CallIds(
+                effective_task_id, getattr(agent, "session_id", "") or "", tool_call_id,
+                getattr(agent, "_current_turn_id", "") or "",
+                getattr(agent, "_current_api_request_id", "") or "",
+            ).hook_kwargs(),
+            duration_ms=duration_ms, status=status, error_type=error_type,
+            error_message=error_message, middleware_trace=list(middleware_trace or []),
+            maintenance_context=maintenance_capability,
+        )
+    except Exception as hook_error:
+        logger.debug("maintenance post_tool_call hook error: %s", hook_error)
+
+
 def invoke_tool(agent, function_name: str, function_args: dict, effective_task_id: str,
                  tool_call_id: Optional[str] = None, messages: list = None,
                  pre_tool_block_checked: bool = False,
@@ -2224,7 +2260,11 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
         return result
     tool_start_time = time.monotonic()
     inline_executor = resolve_invoke_tool_executor(agent, function_name)
-    if inline_executor is not None:
+    if function_name == "continuity_note":
+        def _execute(next_args: dict) -> Any:
+            from agent.native_incremental_handoff import record_native_incremental_note_from_tool_call
+            return record_native_incremental_note_from_tool_call(agent, next_args, messages or [])
+    elif inline_executor is not None:
         inline_ctx = InlineToolContext(
             effective_task_id=effective_task_id, tool_call_id=tool_call_id, messages=messages
         )
@@ -3163,6 +3203,15 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
         _requeue_pending_steer(agent, steer_text)
         return
     marker = format_steer_marker(steer_text)
+    if getattr(agent, "native_incremental_handoff_enabled", False) is True:
+        # Tool results were individually persisted before this finalizer runs.
+        # A separate durable user event keeps authenticated native replay bound
+        # to canonical bytes rather than a rewritten in-memory tool row.
+        messages.append({"role": "user", "content": marker.strip()})
+        if agent._flush_messages_to_session_db(messages) is False:
+            raise RuntimeError("Native steering message persistence failed")
+        _ra().logger.info("Delivered /steer as a durable user message (%d chars)", len(steer_text))
+        return
     existing_content = target.get("content", "")
     if isinstance(existing_content, str):
         target["content"] = existing_content + marker

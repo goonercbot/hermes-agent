@@ -11,6 +11,7 @@ from agent.chat_completion_nonstream import _NonStreamRequest
 
 def _request():
     request = _NonStreamRequest.__new__(_NonStreamRequest)
+    request.native_request = None
     notices, touches = [], []
     request.agent = SimpleNamespace(
         _emit_wait_notice=notices.append,

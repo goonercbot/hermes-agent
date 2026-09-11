@@ -226,6 +226,39 @@ def _codex_native_auto_compaction(agent: Any) -> bool:
     )
 
 
+def _native_note_refresh_pending(agent: Any, messages: Any) -> bool:
+    """True only when an authenticated native tail needs bounded note maintenance.
+
+    This mirrors the mid-turn gate without importing ``turn_preflight`` (which
+    already imports helpers from this module). Capability issuance rechecks this
+    condition; uncertainty stays on the ordinary compression path.
+    """
+    if (
+        getattr(agent, "api_mode", None) != "codex_responses"
+        or not bool(getattr(agent, "native_incremental_handoff_enabled", False))
+    ):
+        return False
+    try:
+        from agent.codex_responses_adapter import classify_responses_route
+        from agent.native_incremental_handoff import (
+            _staged_note,
+            native_incremental_continuity_capable,
+            native_note_refresh_required,
+        )
+
+        route = classify_responses_route(agent)
+        if not native_incremental_continuity_capable(
+            agent,
+            is_codex_backend=route.is_codex_backend,
+            is_xai_responses=route.is_xai_responses,
+            is_github_responses=route.is_github_responses,
+        ):
+            return False
+        return _staged_note(agent, messages) is None or native_note_refresh_required(agent, messages)
+    except Exception:
+        return False
+
+
 def _preflight_compression(
     agent: Any, out: CompactionOutcome, system_message: Optional[str], user_message: Any,
     effective_task_id: str,
@@ -249,6 +282,11 @@ def _preflight_compression(
     _preflight_tokens = _tc._preflight_request_tokens(
         agent, out.messages, out.active_system_prompt or ""
     )
+    if _native_note_refresh_pending(agent, out.messages):
+        # The request loop must issue the one authenticated note refresh before
+        # spending generic compression or warning about the intentionally stale tail.
+        logger.info("Deferring turn-start compression for pending native continuity-note maintenance")
+        return
     # getattr guard: compressor doubles and plugin engines lack this method — absence
     # means no snapshot and the finalizer's rollback stays disarmed.
     _snapshot_fn = getattr(_compressor, "snapshot_preflight_display_tokens", None)

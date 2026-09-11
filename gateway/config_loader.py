@@ -209,7 +209,7 @@ _SHARED_KEYS: tuple = (
     ),
     ("channel_skill_bindings", _DISCORD_SLACK, None),
     ("channel_prompts", None, _str_keyed),
-    *_plain("gateway_restart_notification", "typing_indicator", "typing_status_text"),
+    *_plain("gateway_restart_notification", "home_channel_startup_notification", "typing_indicator", "typing_status_text"),
 )
 
 # Top-level port/host/secret bridged into ``extra`` for adapters that read them from config.extra

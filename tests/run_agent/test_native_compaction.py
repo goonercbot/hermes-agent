@@ -77,6 +77,22 @@ class TestRouteGate:
 
 
 class TestRequestGate:
+    @pytest.mark.parametrize("is_codex_backend", [False, True])
+    def test_incremental_common_compressor_owns_compaction(self, is_codex_backend):
+        agent = _agent(base_url=("https://chatgpt.com/backend-api/codex"
+                                if is_codex_backend else "https://api.openai.com/v1"))
+        agent.native_incremental_handoff_enabled = True
+        agent.runtime_capabilities = {"native_compaction": True}
+        # Both ordinary continuation and forced note maintenance use this gate.
+        assert native_compaction_context_management(
+            agent, is_codex_backend=is_codex_backend
+        ) is None
+        # Switching incremental mode off preserves upstream generic behavior.
+        agent.native_incremental_handoff_enabled = False
+        assert native_compaction_context_management(
+            agent, is_codex_backend=is_codex_backend
+        ) == [{"type": "compaction", "compact_threshold": DEFAULT_COMPACT_THRESHOLD}]
+
     def test_eligible_route_gets_payload(self):
         payload = native_compaction_context_management(
             _agent(), is_codex_backend=False

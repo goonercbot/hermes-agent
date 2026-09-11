@@ -116,6 +116,13 @@ def assemble_api_request(
         _midturn_request_pressure_tokens, _pressure_with_real_floor,
     )
     from agent.model_metadata import estimate_messages_tokens_rough
+    from agent.native_compaction import (
+        has_compaction_checkpoint, native_compaction_protected_message_indices,
+        validate_persisted_native_compaction_history,
+    )
+
+    native_boundary = bool(validate_persisted_native_compaction_history(messages))
+    native_responses = native_boundary and agent.api_mode == "codex_responses"
 
     api_messages, effective_system = build_api_messages(
         agent, messages, current_turn_user_idx=current_turn_user_idx,
@@ -145,14 +152,23 @@ def assemble_api_request(
 
     # Runs unconditionally (not gated on context_compressor) so orphaned tool
     # results from session loading or manual message edits are always caught.
-    api_messages = agent._sanitize_api_messages(api_messages)
+    if native_boundary and not native_responses:
+        api_messages = [
+            {key: value for key, value in row.items() if key != "codex_reasoning_items"}
+            for row in api_messages
+            if not has_compaction_checkpoint(row.get("codex_reasoning_items"))
+        ]
+    if not native_responses:
+        api_messages = agent._sanitize_api_messages(api_messages)
     # Send-path vision eviction (#89296): compression only strips stale screenshots
     # when prune fires, and the Anthropic adapter's keep-window never sees
     # OpenAI-style tool-result image_url parts. The per-call clone is rewritten in
     # place; persisted history is untouched.
     from agent.context_compressor import evict_stale_outbound_tool_images
 
-    evict_stale_outbound_tool_images(api_messages)
+    protected_indices = native_compaction_protected_message_indices(api_messages) if native_responses else set()
+    mutable_rows = [row for index, row in enumerate(api_messages) if index not in protected_indices]
+    evict_stale_outbound_tool_images(mutable_rows)
 
     # One-time repeated-heal notice goes out via the status/warning callback, NEVER
     # appended to messages: the cached prompt prefix stays byte-identical.
@@ -167,20 +183,22 @@ def assemble_api_request(
 
     # Drop thinking-only assistant turns + merge adjacent users, API copy only:
     # Anthropic-style backends 400 on a trailing `thinking` block; history keeps it.
-    api_messages = agent._drop_thinking_only_and_merge_users(
-        api_messages, drop_codex_reasoning_items=agent.api_mode != "codex_responses"
-    )
+    if not native_responses:
+        api_messages = agent._drop_thinking_only_and_merge_users(
+            api_messages, drop_codex_reasoning_items=agent.api_mode != "codex_responses"
+        )
 
     # Normalize whitespace and tool-call JSON for bit-perfect prefixes across turns
     # (KV-cache reuse on local servers, better cloud cache hits); API copy only.
-    for am in api_messages:
-        if isinstance(am.get("content"), str):
+    for index, am in enumerate(api_messages):
+        if index not in protected_indices and isinstance(am.get("content"), str):
             am["content"] = am["content"].strip()
-    _canonicalize_api_tool_calls(api_messages)
+    mutable_rows = [row for index, row in enumerate(api_messages) if index not in protected_indices]
+    _canonicalize_api_tool_calls(mutable_rows)
 
     # Strip lone surrogates (U+D800-U+DFFF) that some Ollama-served models emit;
     # they crash json.dumps() inside the OpenAI SDK and trigger the 3-retry cycle.
-    _sanitize_messages_surrogates(api_messages)
+    _sanitize_messages_surrogates(mutable_rows)
 
     # No send-time pad loop here: ``repair_empty_non_final_messages`` (inside
     # ``_sanitize_api_messages``) is the single owner of empty-turn repair.

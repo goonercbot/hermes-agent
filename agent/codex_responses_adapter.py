@@ -330,6 +330,7 @@ def _assistant_message_item(raw: Dict[str, Any], content: List[Dict[str, Any]], 
 
 def _replay_reasoning_items(
     msg: Dict[str, Any], *, seen_item_ids: set, current_issuer_kind: Optional[str], native_compaction_eligible: bool,
+    protected_native_handoffs: Optional[Dict[int, str]] = None,
 ) -> List[Dict[str, Any]]:
     """Replay persisted encrypted reasoning/compaction items for one assistant turn. Skips duplicate
     ids, ``compaction`` checkpoints unless THIS request carries ``context_management`` (else a persisted
@@ -354,6 +355,21 @@ def _replay_reasoning_items(
                 )
                 _CROSS_ISSUER_WARN_EMITTED = True
             continue
+        if ri.get("type") == "compaction" and protected_native_handoffs:
+            # A v2 checkpoint is a protected carrier: retain only the provider
+            # fields plus its already-authenticated handoff until the native
+            # pruner positions the matching replay boundary.  Metadata must
+            # never reach the Responses API itself.
+            handoff = protected_native_handoffs.get(id(ri))
+            if handoff is not None:
+                replayed.append({
+                    "type": "compaction",
+                    "encrypted_content": ri["encrypted_content"],
+                    "_hermes_native_handoff": handoff,
+                })
+                if item_id:
+                    seen_item_ids.add(item_id)
+                continue
         replayed.append({k: v for k, v in ri.items() if k not in ("id", "_issuer_kind")})
         if item_id:
             seen_item_ids.add(item_id)
@@ -418,6 +434,7 @@ def _chat_messages_to_responses_input(
     messages: List[Dict[str, Any]], *, is_xai_responses: bool = False, is_github_responses: bool = False,
     replay_encrypted_reasoning: bool = True, current_issuer_kind: Optional[str] = None,
     native_compaction_eligible: bool = False,
+    native_continuity_source_messages: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """Convert internal chat-style messages to Responses input items.
 
@@ -455,6 +472,50 @@ def _chat_messages_to_responses_input(
     Hermes' local history is never truncated by native compaction, so the full conversation is still on the
     wire.
     """
+    from agent.native_compaction import validate_persisted_native_compaction_history
+
+    # Validate before conversion/pruning.  Projection cleanup may supply a
+    # distinct immutable source; it is the authority for the sealed checkpoint
+    # while the replay list remains the exact outbound transcript.
+    protected_native_handoffs = validate_persisted_native_compaction_history(messages)
+    if native_continuity_source_messages is not None:
+        source_handoffs = validate_persisted_native_compaction_history(
+            native_continuity_source_messages
+        )
+        # A gateway-cleaned projection is allowed to change ordinary tool
+        # recovery text, not the authenticated checkpoint carrier.  Rebind each
+        # replayed protected carrier to exactly one source carrier rather than
+        # using object identity across the two lists.
+        from agent.native_compaction import NATIVE_COMPACTION_METADATA_KEY
+
+        source_checkpoints = [
+            item
+            for message in native_continuity_source_messages
+            if isinstance(message, dict)
+            for item in (message.get("codex_reasoning_items") or [])
+            if isinstance(item, dict) and id(item) in source_handoffs
+        ]
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            for item in message.get("codex_reasoning_items") or []:
+                if not (
+                    isinstance(item, dict)
+                    and NATIVE_COMPACTION_METADATA_KEY in item
+                ):
+                    continue
+                matches = [
+                    source_item
+                    for source_item in source_checkpoints
+                    if source_item.get("encrypted_content") == item.get("encrypted_content")
+                    and source_item.get(NATIVE_COMPACTION_METADATA_KEY)
+                    == item.get(NATIVE_COMPACTION_METADATA_KEY)
+                ]
+                if len(matches) != 1:
+                    raise ValueError(
+                        "protected native compaction checkpoint source boundary mismatch"
+                    )
+                protected_native_handoffs[id(item)] = source_handoffs[id(matches[0])]
     items: List[Dict[str, Any]] = []
     # Parallel to ``items``: source chat message per item. Pruning reads a summary
     # carrier's provenance from the source; the converted item may be a lossy shape.
@@ -488,13 +549,23 @@ def _chat_messages_to_responses_input(
         reasoning_items = [] if not replay_encrypted_reasoning else _replay_reasoning_items(
             msg, seen_item_ids=seen_item_ids, current_issuer_kind=current_issuer_kind,
             native_compaction_eligible=native_compaction_eligible,
+            protected_native_handoffs=protected_native_handoffs,
         )
         emit(reasoning_items, msg)
         message_items = _replay_message_items(msg, is_github_responses=is_github_responses)
         emit(message_items, msg)
         if not message_items:
             # Every reasoning item needs a following item (else missing_following_item), hence the "" fallback.
-            fallback = content_parts or (content_text if content_text.strip() else "" if reasoning_items else None)
+            has_protected_handoff = any(
+                item.get("_hermes_native_handoff")
+                for item in reasoning_items
+                if isinstance(item, dict)
+            )
+            fallback = content_parts or (
+                content_text
+                if content_text.strip()
+                else "" if reasoning_items and not has_protected_handoff else None
+            )
             if fallback is not None:
                 emit([{"role": "assistant", "content": fallback}], msg)
         emit(_replay_tool_call_items(msg, start_index=len(items)), msg)
@@ -732,11 +803,43 @@ def _preflight_codex_input_items(
     for idx, item in enumerate(raw_items):
         if not isinstance(item, dict):
             raise ValueError(f"Codex Responses input[{idx}] must be an object.")
+        if item.get("role") == "developer":
+            from agent.native_compaction import NATIVE_INCREMENTAL_REPLAY_BOUNDARY
+
+            # The protected host boundary is the sole allowed developer item:
+            # arbitrary developer history is unsupported, while the canonical
+            # boundary may follow a native checkpoint only.
+            if (
+                normalized
+                and normalized[-1].get("type") == "compaction"
+                and item.get("content") == NATIVE_INCREMENTAL_REPLAY_BOUNDARY
+            ):
+                normalized.append({
+                    "role": "developer",
+                    "content": NATIVE_INCREMENTAL_REPLAY_BOUNDARY,
+                })
+                continue
         item_type = item.get("type")
         handler = _PREFLIGHT_ITEM_HANDLERS.get(item_type) if isinstance(item_type, str) else None
         normalized_item = (handler or _preflight_role_message)(item, idx, ctx)
         if normalized_item is not None:
             normalized.append(normalized_item)
+    # A Responses result is a standalone item, not a child of its call.  The
+    # request must preserve exact declaration-before-result ordering; otherwise
+    # request projection can dispatch an orphan/duplicate tool exchange and
+    # cause a non-retryable provider 400.
+    pending_call_ids = set()
+    for idx, item in enumerate(normalized):
+        if item.get("type") == "function_call":
+            pending_call_ids.add(item["call_id"])
+        elif item.get("type") == "function_call_output":
+            if item["call_id"] not in pending_call_ids:
+                raise ValueError(
+                    "Codex Responses input[%d] function_call_output has no matching "
+                    "function_call for call_id %r (requires an earlier unanswered call)."
+                    % (idx, item["call_id"])
+                )
+            pending_call_ids.remove(item["call_id"])
     return normalized
 
 

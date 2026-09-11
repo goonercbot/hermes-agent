@@ -707,9 +707,9 @@ class GatewayNotificationsMixin:
         skipped = skip_targets or set()
         message = "♻️ Gateway online — Hermes is back and ready."
         for platform, platform_cfg, home, transport in self._home_channel_transports():
-            if not platform_cfg.gateway_restart_notification:
+            if not platform_cfg.home_channel_startup_notification:
                 logger.info(
-                    "Home-channel startup notification suppressed: %s has gateway_restart_notification=false",
+                    "Home-channel startup notification suppressed: %s has home_channel_startup_notification=false",
                     platform.value,
                 )
                 continue

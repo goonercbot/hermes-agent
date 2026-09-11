@@ -28,6 +28,42 @@ from agent.turn_context_compaction import (
 logger = logging.getLogger("agent.conversation_loop")
 
 
+def _native_note_refresh_pending(agent: Any, messages: Any) -> bool:
+    """Keep a stale authenticated tail for the one bounded maintenance request.
+
+    Request construction replaces only that request's tool list and immediately
+    restores ordinary tools on the next iteration.  Running generic compression
+    first would either spend a summary call before the required note refresh or
+    classify the intentionally deferred native compaction as no progress.
+    """
+    if (
+        getattr(agent, "api_mode", None) != "codex_responses"
+        or not bool(getattr(agent, "native_incremental_handoff_enabled", False))
+    ):
+        return False
+    try:
+        from agent.codex_responses_adapter import classify_responses_route
+        from agent.native_incremental_handoff import (
+            _staged_note, native_incremental_continuity_capable, native_note_refresh_required,
+        )
+
+        route = classify_responses_route(agent)
+        if not native_incremental_continuity_capable(
+            agent,
+            is_codex_backend=route.is_codex_backend,
+            is_xai_responses=route.is_xai_responses,
+            is_github_responses=route.is_github_responses,
+        ):
+            return False
+        # A missing/invalid note is the explicit native not-ready state. A valid
+        # note only defers ordinary compression once its uncovered tail is large.
+        return _staged_note(agent, messages) is None or native_note_refresh_required(agent, messages)
+    except Exception:
+        # The request builder owns fail-closed capability issuance.  Do not let
+        # a preflight probe change ordinary compression behavior on uncertainty.
+        return False
+
+
 @dataclass
 class PreflightGateVerdict:
     """``action``: ``"fallthrough"`` (make the API call), ``"continue"`` (window grown or
@@ -81,6 +117,15 @@ def run_preflight_compression(
             agent, v.messages, v.conversation_history, v.api_call_count, request_pressure_tokens,
             max_compression_attempts,
         )
+
+    _native_refresh_pending = not provider_overflow_preflight and _native_note_refresh_pending(
+        agent, v.messages
+    )
+    if _native_refresh_pending:
+        # Let the request loop issue exactly one host-bound continuity_note call.
+        # The maintenance response is not ordinary work and the next iteration
+        # returns to the established compression and tool lifecycle.
+        return _done("fallthrough")
 
     _compression_cooldown = getattr(
         compressor, "get_active_compression_failure_cooldown", lambda: None

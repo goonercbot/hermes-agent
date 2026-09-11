@@ -295,3 +295,30 @@ async def test_cleanup_chains_with_existing_callback(monkeypatch, tmp_path):
     # deletes at least one progress bubble.
     assert pre_existing_fired == [True]
     assert len(adapter.deleted) >= 1
+
+
+@pytest.mark.asyncio
+async def test_cleanup_preserves_commentary_that_is_the_final_answer():
+    """Never delete the only delivered final when an interim callback carried it."""
+    from gateway.run import GatewayRunner
+    ctx = SimpleNamespace(
+        _cleanup_msg_ids=["interim", "progress"],
+        _commentary_messages=[("interim", "final answer")],
+        _cleanup_progress=True,
+        session_key="s",
+        run_generation=None,
+        source=SimpleNamespace(chat_id="chat"),
+    )
+    adapter = CleanupCaptureAdapter()
+    GatewayRunner._run_agent_schedule_bubble_cleanup(
+        object.__new__(GatewayRunner), {"final_response": "final answer"}, adapter, ctx,
+    )
+    callback = adapter.pop_post_delivery_callback("s")
+    assert callback is not None
+    await _fire_post_delivery_cb(callback)
+    # Only the unrelated temporary bubble is eligible for deletion.
+    for _ in range(20):
+        if adapter.deleted:
+            break
+        await asyncio.sleep(0.01)
+    assert [row["message_id"] for row in adapter.deleted] == ["progress"]

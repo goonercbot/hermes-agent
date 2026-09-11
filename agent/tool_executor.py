@@ -57,6 +57,33 @@ from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context
 logger = logging.getLogger(__name__)
 
 
+def _enforce_turn_budget_with_native_projection(
+    agent, messages: list, num_tools: int, *, env=None, config=DEFAULT_BUDGET,
+) -> None:
+    """Preserve the canonical tool tail before a replay-only budget projection."""
+    if num_tools <= 0:
+        return
+    tool_messages = messages[-num_tools:]
+    source = before = None
+    if (
+        getattr(agent, "native_incremental_handoff_enabled", False) is True
+        and sum(len(row.get("content", "")) for row in tool_messages if isinstance(row, dict)) > config.turn_budget
+    ):
+        from copy import deepcopy
+        from agent.native_incremental_handoff import _projection_source_for_messages
+
+        source, _ = _projection_source_for_messages(agent, messages)
+        if source is not None:
+            source, before = deepcopy(source), deepcopy(tool_messages)
+    enforce_turn_budget(tool_messages, env=env, config=config)
+    if source is not None and tool_messages != before:
+        from agent.native_incremental_handoff import bind_native_incremental_replay_projection
+
+        bind_native_incremental_replay_projection(
+            agent, source_messages=source, replay_messages=messages,
+        )
+
+
 _pairing_tool_call_id = coalesce_tool_call_id  # canonical id used by the persisted assistant message
 
 
@@ -253,20 +280,23 @@ class _ToolCallRef:
     task_id: str
     call_id: str
     trace: list
+    maintenance_capability: Any = None
 
     def middleware_kwargs(self) -> dict[str, Any]:
         """Keyword form ``_run_agent_tool_execution_middleware`` (and tests patching it) expect."""
-        return {
+        kwargs = {
             "function_name": self.name, "function_args": self.args, "effective_task_id": self.task_id,
             "tool_call_id": self.call_id, "middleware_trace": self.trace,
         }
+        if self.maintenance_capability is not None:
+            kwargs["maintenance_capability"] = self.maintenance_capability
+        return kwargs
 
     def emit_post(self, agent, result, *, trace=None, **outcome) -> None:
         """Emit the one terminal ``post_tool_call`` for this call (``outcome`` = status /
         error_type / error_message / duration_ms). Resolved through the module attribute so
         tests patching ``_emit_terminal_post_tool_call`` still intercept."""
-        _emit_terminal_post_tool_call(
-            agent,
+        kwargs = dict(
             function_name=self.name,
             function_args=self.args,
             result=result,
@@ -274,6 +304,14 @@ class _ToolCallRef:
             tool_call_id=self.call_id,
             middleware_trace=list(self.trace if trace is None else trace),
             **outcome,
+        )
+        if self.maintenance_capability is None:
+            _emit_terminal_post_tool_call(agent, **kwargs)
+            return
+        from agent.agent_runtime_helpers import emit_terminal_post_tool_call_with_maintenance_context
+
+        emit_terminal_post_tool_call_with_maintenance_context(
+            agent, maintenance_capability=self.maintenance_capability, **kwargs,
         )
 
     def emit_cancelled(self, agent, start_time: float) -> str:
@@ -613,21 +651,30 @@ def _blocked_tool_result(agent, ref: _ToolCallRef, *, block_message: Optional[st
     return result
 
 
-def _pre_tool_block(agent, ref: _ToolCallRef):
+def _pre_tool_block(agent, ref: _ToolCallRef, maintenance_capability=None):
     """Run ``pre_tool_call`` plugin hooks; returns ``(block_message, final_args)`` with any
-    hook-modified args applied. Hook failures never block."""
+    hook-modified args applied. Policy-dispatch failures fail closed."""
     try:
         from hermes_cli.plugins import _dispatch_pre_tool_call_hooks
 
+        hook_context = (
+            {"maintenance_context": maintenance_capability}
+            if maintenance_capability is not None
+            else {}
+        )
         block_msg, modified_args = _dispatch_pre_tool_call_hooks(
             ref.name,
             ref.args,
             **tool_hook_ids(agent, ref.task_id, ref.call_id),
             middleware_trace=list(ref.trace),
+            **hook_context,
         )
         return block_msg, (ref.args if modified_args is None else modified_args)
     except Exception:
-        return None, ref.args
+        # Do not turn a broken policy-dispatch boundary into an authorization
+        # bypass. Plugin callback timeouts/errors are already normalized by the
+        # plugin layer; this covers failures before that layer can decide.
+        return f"BLOCKED: pre-tool policy evaluation failed for {ref.name}", ref.args
 
 
 def _dispatch_authorized_once(
@@ -640,6 +687,7 @@ def _dispatch_authorized_once(
     display_index: int | None,
     begin_execution,
     authorization_gate: _ConcurrentToolAuthorizationGate | None,
+    maintenance_capability=None,
 ) -> Any:
     """Hermes policy (scope → plugin pre-hooks → guardrails) then the one real dispatch.
 
@@ -654,9 +702,18 @@ def _dispatch_authorized_once(
             callback()
 
     block_message, block_error_type = scope_block, "tool_scope_block"
+    if maintenance_capability is not None:
+        from agent.native_note_refresh import consume_native_note_refresh_capability
+
+        # Request/execution middleware have already selected these final args.
+        # Bind the opaque host capability exactly here, before every ordinary
+        # policy gate and before the recorder can run.
+        consume_native_note_refresh_capability(
+            maintenance_capability, agent, ref.name, ref.args, ref.call_id,
+        )
     if block_message is None:
         block_error_type = "plugin_block"
-        resolve = lambda: _pre_tool_block(agent, ref)  # noqa: E731
+        resolve = lambda: _pre_tool_block(agent, ref, maintenance_capability)  # noqa: E731
         block_message, ref.args = resolve() if authorization_gate is None else authorization_gate.run(resolve)
         state.args = ref.args
 
@@ -696,6 +753,7 @@ def _run_agent_tool_execution_middleware(
     middleware_trace: list[dict[str, Any]] | None = None,
     begin_execution=None,
     authorization_gate: _ConcurrentToolAuthorizationGate | None = None,
+    maintenance_capability=None,
 ) -> _ManagedToolResult:
     """Run Relay rewrites before Hermes policy and dispatch exactly once."""
     from agent import relay_tools
@@ -718,12 +776,16 @@ def _run_agent_tool_execution_middleware(
         return _dispatch_authorized_once(
             agent,
             state,
-            _ToolCallRef(function_name, final_args, effective_task_id, tool_call_id, trace),
+            _ToolCallRef(
+                function_name, final_args, effective_task_id, tool_call_id, trace,
+                maintenance_capability,
+            ),
             execute=execute,
             scope_block=scope_block,
             display_index=display_index,
             begin_execution=begin_execution,
             authorization_gate=authorization_gate,
+            maintenance_capability=maintenance_capability,
         )
 
     def _hermes_pipeline(relay_args: dict[str, Any]) -> Any:
@@ -825,13 +887,23 @@ def _run_sequential_tool_execution_middleware(
     scope_block: str | None = None,
     display_index: int | None = None,
     middleware_trace: list[dict[str, Any]] | None = None,
+    maintenance_capability=None,
 ) -> _ManagedToolResult:
     """Run one sequential call on a worker thread under the concurrent executor's deadline.
     Interactive tools (``clarify``) own their wait via ``agent.clarify_timeout``; the
     generic deadline would report ``tool_timeout`` while the prompt is still live."""
     timeout_s = None if function_name in _SEQUENTIAL_DEADLINE_EXEMPT_TOOLS else _resolve_sequential_tool_timeout()
-    ref = _ToolCallRef(function_name, function_args, effective_task_id, tool_call_id, middleware_trace)
-    kwargs = dict(ref.middleware_kwargs(), execute=execute, scope_block=scope_block, display_index=display_index)
+    ref = _ToolCallRef(
+        function_name, function_args, effective_task_id, tool_call_id, middleware_trace,
+        maintenance_capability,
+    )
+    kwargs = dict(
+        ref.middleware_kwargs(),
+        execute=execute,
+        scope_block=scope_block,
+        display_index=display_index,
+        maintenance_capability=maintenance_capability,
+    )
     if function_name in _NEVER_PARALLEL_TOOLS:
         return _run_agent_tool_execution_middleware(agent, **kwargs)
 
@@ -855,7 +927,17 @@ def _run_sequential_tool_execution_middleware(
     try:
         state, result = _poll_sequential_future(agent, future, function_name, deadline, started, authorization_gate)
         if state == "done":
-            return result
+            managed = result
+            # Native maintenance is invoked outside the normal sequential batch
+            # publisher, so it has no later owner for its terminal observer.
+            # Ordinary calls still publish in their existing caller; emitting
+            # here only for the opaque maintenance path preserves that invariant.
+            if maintenance_capability is not None and not managed.blocked:
+                _ToolCallRef(
+                    function_name, managed.args, effective_task_id, tool_call_id,
+                    managed.middleware_trace, maintenance_capability,
+                ).emit_post(agent, managed.result)
+            return managed
         if state == "interrupted":
             # interrupt() already fanned out to tracked tids, but this worker may have
             # registered after that ran; then 3s grace (mirrors the concurrent path).
@@ -1043,7 +1125,9 @@ def _finalize_tool_batch(agent, messages: list, effective_task_id: str, num_tool
     steer marker is never truncated/discarded when enforcement replaces a result."""
     if num_tools <= 0:
         return
-    enforce_turn_budget(messages[-num_tools:], env=get_active_env(effective_task_id), config=budget)
+    _enforce_turn_budget_with_native_projection(
+        agent, messages, num_tools, env=get_active_env(effective_task_id), config=budget
+    )
     agent._apply_pending_steer_to_tool_results(messages, num_tools)
 
 
@@ -1505,6 +1589,22 @@ def _resolve_sequential_dispatch(agent, ref: _ToolCallRef, messages: list) -> _S
         spinner = _start_quiet_tool_spinner(agent, function_name, function_args, label=_delegate_spinner_label(function_args))
         agent._delegate_spinner = spinner
         return _SequentialDispatch(agent._dispatch_delegate_task, spinner=spinner, is_delegate=True)
+    if function_name == "continuity_note":
+        # The registered handler intentionally fails closed outside an active
+        # AIAgent turn. Deferred ``tool_call`` reaches this branch only after
+        # unwrap, so retain the live agent and canonical replay messages here.
+        def _execute(next_args: dict) -> Any:
+            from agent.native_incremental_handoff import record_native_incremental_note_from_tool_call
+
+            return record_native_incremental_note_from_tool_call(agent, next_args, messages)
+
+        return _SequentialDispatch(
+            execute=_execute,
+            spinner=_start_quiet_tool_spinner(agent, function_name, function_args),
+            error_result=lambda e: f"Error executing tool '{function_name}': {e}",
+            error_log="native continuity_note recorder raised for %s: %s",
+            finish_spinner=bool(agent.quiet_mode),
+        )
     if agent._context_engine_tool_names and function_name in agent._context_engine_tool_names:
         return _SequentialDispatch(
             execute=lambda next_args: agent.context_compressor.handle_tool_call(function_name, next_args, messages=messages),

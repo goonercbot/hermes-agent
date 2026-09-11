@@ -15,6 +15,7 @@ from typing import Any, Callable, Dict, List
 
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
 from agent.usage_anchor import set_usage_anchor
+from agent.native_compaction_progress import current_native_compaction_request
 
 logger = logging.getLogger(__name__)
 _codex_watchdog_state_var: contextvars.ContextVar[Any | None] = contextvars.ContextVar(
@@ -878,6 +879,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
     # connection clears the agent-level token, so a worker still draining frames can tell it was retired.
     # ``None`` = no watchdog; every check passes.
     watchdog_state = _codex_watchdog_state_var.get()
+    native_request = current_native_compaction_request()
     request_token = (
         watchdog_state.token
         if watchdog_state is not None
@@ -909,8 +911,14 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 if has_progress:
                     watchdog_state.last_progress_ts = now
         agent._touch_activity("receiving stream response")
+        # Native compression scope: stamp liveness on the request that owns THIS physical stream.
+        # A retired request's fence becomes cancelled first; let the request raise and break the loop.
+        if native_request is not None:
+            native_request.on_event()
 
     def _interrupt_or_superseded() -> bool:
+        if native_request is not None:
+            native_request.check_cancelled()
         # A retired request must NOT break out of the consume loop (that returns a partial ``final`` with
         # status "completed"); raise so the watchdog's TimeoutError is seen.
         if not _request_is_current():

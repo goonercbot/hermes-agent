@@ -1066,7 +1066,11 @@ def run_compress_context_with_progress_timeout(
         settled, result = _await_worker_within_budget(
             future, fence, idle=idle, ceiling=ceiling, wait_started=wait_started
         )
-        if settled:
+        # A cooperative worker can observe the shared deadline and return the
+        # unchanged input before the host's future wait times out. It is still
+        # a timeout, not successful compression; retain cause reporting and
+        # cancellation cleanup. Never discard a committed replacement result.
+        if settled and not (fence.deadline_exceeded and result[0] is messages):
             handled_exit = True
             return result
 
@@ -2551,7 +2555,10 @@ def _adopt_grown_durable_parent(agent: Any, lease: _CompressionLease, messages: 
     durable_loader = getattr(type(lease.db), "get_messages_as_conversation", None)
     if not callable(durable_loader):
         return None
-    durable_parent = durable_loader(lease.db, lease.sid)
+    native = getattr(agent, "native_incremental_handoff_enabled", False) is True
+    durable_parent = durable_loader(
+        lease.db, lease.sid, **({"repair_alternation": False} if native else {})
+    )
     if not (isinstance(durable_parent, list) and len(durable_parent) > len(messages)):
         return None
     # In-memory carries this turn's un-persisted user tail; flush it via the normal
@@ -2578,9 +2585,27 @@ def _adopt_grown_durable_parent(agent: Any, lease: _CompressionLease, messages: 
         )
         return None
     # Re-read after the flush so the adopted snapshot carries the just-persisted tail.
-    durable_parent = durable_loader(lease.db, lease.sid)
+    durable_parent = durable_loader(
+        lease.db, lease.sid,
+        **({"repair_alternation": False, "include_row_ids": True} if native else {}),
+    )
     if not (isinstance(durable_parent, list) and len(durable_parent) > len(messages)):
         return None
+    if native:
+        from agent.native_incremental_handoff import (
+            bind_native_incremental_replay_projection, restore_native_incremental_note,
+        )
+
+        # Pin the commit watermark to this exact lease-owned snapshot. Rows
+        # appended after it remain concurrent tail, not already-folded history.
+        row_ids = [row.pop("_row_id", None) for row in durable_parent]
+        watermark = max((row_id for row_id in row_ids if isinstance(row_id, int)), default=None)
+        if watermark is not None:
+            lease.watermark = watermark
+        bind_native_incremental_replay_projection(
+            agent, source_messages=durable_parent, replay_messages=durable_parent,
+        )
+        restore_native_incremental_note(agent, durable_parent)
     logger.info(
         "compression: session=%s grew before lease (%d → %d msgs); adopting durable snapshot", lease.sid, len(messages),
         len(durable_parent),
@@ -3399,7 +3424,14 @@ def _run_summary_phase(
                 # Adopted list is fully durable: re-anchor persist idx at the end so the post-
                 # compression flush skips it; run_agent marker sync realigns _session_messages.
                 agent._persist_user_message_idx = len(messages)
-        memory_context = _pre_compress_memory_context(agent, messages, checkpoint_required)
+        _native_incremental = bool(
+            getattr(agent, "native_incremental_handoff_enabled", False)
+        )
+        # Native continuity owns its authenticated provider boundary; retain
+        # the generic checkpoint gate unchanged for every other compressor.
+        memory_context = _pre_compress_memory_context(
+            agent, messages, checkpoint_required and not _native_incremental
+        )
         compress_fn, compress_kwargs = _resolve_compress_call(
             agent, approx_tokens=approx_tokens, focus_topic=focus_topic, force=force, memory_context=memory_context,
             bypass_cooldown=bypass_cooldown,
@@ -3408,10 +3440,17 @@ def _run_summary_phase(
         _activity_heartbeat = _CompressionActivityHeartbeat(
             agent, commit_fence=commit_fence, emit_client_status=lease.status_emitted,
         ).start()
-        compressed = _run_summary_dispatch(
-            agent, messages, compress_fn, compress_kwargs, commit_fence=commit_fence,
-            attempt_generation=attempt.generation, hard_cancel_event=hard_cancel_event,
-        )
+        if _native_incremental:
+            from agent.native_compaction_progress import native_compaction_request
+            from agent.native_incremental_handoff import native_incremental_compact_context
+
+            with native_compaction_request(commit_fence):
+                compressed = native_incremental_compact_context(agent, messages, system_message)
+        else:
+            compressed = _run_summary_dispatch(
+                agent, messages, compress_fn, compress_kwargs, commit_fence=commit_fence,
+                attempt_generation=attempt.generation, hard_cancel_event=hard_cancel_event,
+            )
     except AuxiliaryExplicitCancellation:
         try:
             attempt.restore_compressor(agent.context_compressor)
@@ -3682,6 +3721,11 @@ def compress_context(
         _warn_summary_or_aux_fallback(agent)
         _fold_todo_snapshot(agent, compressed)
         compressed_user_turn_outcome = _ensure_compressed_has_user_turn(messages, compressed)
+        _native_publication_attempt = getattr(agent, "_native_compaction_attempt", None)
+        if _native_publication_attempt is not None:
+            from agent.native_compaction import bind_native_compaction_tail
+
+            bind_native_compaction_tail(agent, compressed)
         new_system_prompt = _rebuild_system_prompt_at_boundary(agent, system_message)
         commit = _commit_compaction(
             agent, messages, compressed, in_place=in_place, lease=lease, new_system_prompt=new_system_prompt,
@@ -3701,6 +3745,16 @@ def compress_context(
             compression_made_progress=commit.made_progress, compression_used_fallback=_compression_used_fallback,
             compression_feasibility_skip=_compression_feasibility_skip, task_id=task_id,
         )
+        if _native_publication_attempt is not None and bool(
+            getattr(agent, "native_incremental_handoff_enabled", False)
+        ):
+            from agent.native_incremental_handoff import authenticate_native_compaction_publication
+
+            if not commit.session_commit_succeeded:
+                raise ValueError("native compaction publication did not commit")
+            authenticate_native_compaction_publication(
+                agent, compressed, _native_publication_attempt
+            )
         logger.info(
             "context compression done: session=%s messages=%d->%d rough_tokens=~%s awaiting_real_usage=true",
             agent.session_id or "none", _pre_msg_count, len(compressed), f"{_compressed_est:,}",

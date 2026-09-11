@@ -118,6 +118,70 @@ def test_prepare_iteration_repairs_resumed_user_tail_without_rewriting_source():
     assert _projection_source_for_messages(agent, tampered) == (None, None)
 
 
+def test_resumed_user_tail_fresh_note_restores_from_raw_session_db(tmp_path):
+    """The outgoing merged request must mint a note for raw durable rows."""
+    import json
+
+    from hermes_state import SessionDB
+    from agent.native_incremental_handoff import (
+        _projection_source_for_messages,
+        bind_native_incremental_replay_projection,
+        record_native_incremental_note_from_tool_call,
+        restore_native_incremental_note,
+    )
+    from agent.turn_iteration_prep import prepare_iteration
+    from tests.run_agent.test_native_note_refresh import ARGS
+
+    sid = "resumed-user-tail"
+    source = _native_checkpoint_with_unsealed_tool_pair()
+    source.append({"role": "user", "content": "last durable user"})
+    agent = _iteration_agent()
+    agent.session_id = sid
+    assert bind_native_incremental_replay_projection(
+        agent, source_messages=source, replay_messages=source,
+    )
+    history = [*deepcopy(source), {"role": "user", "content": "fresh resumed user"}]
+    prepared = prepare_iteration(agent, messages=history, api_call_count=1)
+    canonical, _ = _projection_source_for_messages(agent, prepared.messages)
+    assert canonical == history
+    assert canonical is not None
+
+    note = record_native_incremental_note_from_tool_call(
+        NS(session_id=sid), ARGS, canonical,
+    )
+    persisted = [
+        *canonical,
+        {"role": "assistant", "content": "", "tool_calls": [{
+            "id": "fresh-note", "type": "function", "function": {
+                "name": "continuity_note", "arguments": json.dumps(ARGS),
+            },
+        }]},
+        {
+            "role": "tool", "name": "continuity_note", "tool_call_id": "fresh-note",
+            "content": note,
+        },
+    ]
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session(sid, "subagent", model="gpt-5.6-terra")
+        for row in persisted:
+            db.append_message(
+                sid, row["role"], row.get("content"), tool_name=row.get("name"),
+                tool_calls=row.get("tool_calls"), tool_call_id=row.get("tool_call_id"),
+                codex_reasoning_items=row.get("codex_reasoning_items"),
+                codex_message_items=row.get("codex_message_items"),
+            )
+    finally:
+        db.close()
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        restored = db.get_messages_as_conversation(sid, repair_alternation=False)
+        assert restore_native_incremental_note(NS(session_id=sid), restored) is not None
+    finally:
+        db.close()
+
+
 def test_prepare_iteration_persists_native_mid_api_steer_as_append_only_user_event():
     """Native steering never rewrites the already-durable tool result."""
     from agent.turn_iteration_prep import prepare_iteration

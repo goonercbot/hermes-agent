@@ -42,6 +42,23 @@ def store(tmp_path):
 
 
 class TestLoadTranscriptReadFailure:
+    def test_raw_load_preserves_resumed_user_boundary(self, store):
+        db = store._db
+        assert db is not None
+        db.create_session("raw-native", "telegram", session_key="telegram:raw-native")
+        db.append_message("raw-native", "user", "durable user")
+        db.append_message("raw-native", "user", "resumed user")
+
+        # Ordinary callers retain the historical replay projection, while the
+        # native turn can bind the exact database source before its final
+        # request-only repair.
+        assert [row["content"] for row in store.load_transcript("raw-native")] == [
+            "durable user\n\nresumed user",
+        ]
+        assert [row["content"] for row in store.load_transcript(
+            "raw-native", repair_alternation=False,
+        )] == ["durable user", "resumed user"]
+
     def test_read_failure_raises_instead_of_returning_empty(self, store, monkeypatch):
         db = store._db
         assert db is not None

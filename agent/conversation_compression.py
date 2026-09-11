@@ -4628,6 +4628,7 @@ def compress_context(
         # identity minted by this exact native operation may receive the fence;
         # retained checkpoints are intentionally never discovered or rebound.
         from agent.native_compaction import bind_native_compaction_tail
+        _publication_attempt = getattr(agent, "_native_compaction_attempt", None)
         bind_native_compaction_tail(agent, compressed)
 
         cached_system_prompt = agent._cached_system_prompt
@@ -5327,6 +5328,17 @@ def compress_context(
                         "could not record split-failure cooldown",
                         exc_info=True,
                     )
+
+        # All compression callers must resume from the final published tail,
+        # not the provider candidate's earlier replay fence. Do not let the
+        # generic split-error handler turn authentication failure into success.
+        if _publication_attempt is not None and bool(
+            getattr(agent, "native_incremental_handoff_enabled", False)
+        ):
+            from agent.native_incremental_handoff import authenticate_native_compaction_publication
+            if not _session_commit_succeeded:
+                raise ValueError("native compaction publication did not commit")
+            authenticate_native_compaction_publication(agent, compressed, _publication_attempt)
 
         # Compaction-boundary bookkeeping, computed once. `old_session_id` is only
         # bound in the rotation branch; in-place leaves it unset. `_boundary_parent`

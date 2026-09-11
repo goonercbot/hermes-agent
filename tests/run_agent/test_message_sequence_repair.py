@@ -16,6 +16,75 @@ def _bare_agent():
     return AIAgent.__new__(AIAgent)
 
 
+def _native_boundary(tail):
+    """Build one valid v2 boundary without exposing provider checkpoint data."""
+    from agent.native_compaction import native_continuity_boundary_fence
+
+    handoff = "authenticated handoff"
+    checkpoint = {
+        "type": "compaction",
+        "encrypted_content": "opaque-checkpoint",
+        "_hermes_native_compaction": {
+            "version": 2,
+            "identity": "test-boundary",
+            "handoff": handoff,
+            "tail_count": len(tail),
+            "tail_fence": native_continuity_boundary_fence(tail),
+        },
+    }
+    return [
+        {"role": "assistant", "content": "", "codex_reasoning_items": [checkpoint]},
+        {"role": "user", "content": handoff},
+        *tail,
+    ]
+
+
+def test_repair_does_not_merge_across_valid_native_boundary():
+    """Restore/pre-request repair must not rewrite a sealed final user row."""
+    from agent.native_compaction import validate_persisted_native_compaction_history
+
+    messages = _native_boundary([{"role": "user", "content": "sealed user"}]) + [
+        {"role": "user", "content": "first queued followup"},
+        {"role": "user", "content": "second queued followup"},
+    ]
+
+    assert AIAgent._repair_message_sequence(_bare_agent(), messages) == 1
+    assert [m["content"] for m in messages if m["role"] == "user"] == [
+        "authenticated handoff",
+        "sealed user",
+        "first queued followup\n\nsecond queued followup",
+    ]
+    validate_persisted_native_compaction_history(messages)
+
+
+def test_repair_preserves_bound_mid_tool_steer_and_rejects_tamper():
+    """A steer bound before checkpoint finalization survives; later edits fail closed."""
+    import pytest
+
+    from agent.native_compaction import validate_persisted_native_compaction_history
+    from agent.prompt_builder import format_steer_marker
+
+    tool_result = {
+        "role": "tool",
+        "tool_call_id": "call-1",
+        "name": "terminal",
+        "content": "tool result" + format_steer_marker("legitimate correction"),
+    }
+    messages = _native_boundary([
+        {"role": "user", "content": "current request"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "call-1"}]},
+        tool_result,
+    ]) + [{"role": "user", "content": "next turn"}]
+
+    assert AIAgent._repair_message_sequence(_bare_agent(), messages) == 0
+    assert messages[4]["content"] == tool_result["content"]
+    validate_persisted_native_compaction_history(messages)
+
+    messages[4]["content"] += " altered"
+    with pytest.raises(ValueError, match="tail mismatch"):
+        AIAgent._repair_message_sequence(_bare_agent(), messages)
+
+
 # ── _drop_trailing_empty_response_scaffolding ──────────────────────────────
 
 def test_drop_scaffolding_rewinds_orphan_tool_tail():

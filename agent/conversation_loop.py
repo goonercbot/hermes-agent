@@ -2395,10 +2395,26 @@ def run_conversation(
         if _native_boundary_request:
             from agent.agent_runtime_helpers import repair_message_sequence
 
-            _prefix = messages[:_request_current_turn_user_idx]
-            repaired_seq = repair_message_sequence(agent, _prefix)
-            messages = _prefix + messages[_request_current_turn_user_idx:]
-            _request_current_turn_user_idx = len(_prefix)
+            # Native request messages are already a disposable deep copy.  The
+            # repair helper protects the validated carrier/handoff/tail itself,
+            # but it must see the entire copy: a stale current-user cursor can
+            # otherwise cut between an unsealed assistant tool call and its
+            # matching result, prune the call, and leave an outgoing orphan.
+            _cursor_row = (
+                messages[_request_current_turn_user_idx]
+                if _request_current_turn_user_idx < len(messages)
+                else None
+            )
+            _current_user = (
+                _cursor_row
+                if isinstance(_cursor_row, dict) and _cursor_row.get("role") == "user"
+                else None
+            )
+            repaired_seq = repair_message_sequence(agent, messages)
+            _request_current_turn_user_idx = next(
+                (index for index, row in enumerate(messages) if row is _current_user),
+                len(messages),  # Current user was already covered by the note.
+            )
         else:
             from agent.agent_runtime_helpers import repair_message_sequence_with_cursor
 
@@ -4818,6 +4834,14 @@ def run_conversation(
                 break
 
             except NativeNoteRefreshFailure as maintenance_error:
+                # Log only host-controlled labels, never exception/provider text.
+                safe_reason = {
+                    "durable note readback failed authentication": "durable_note_authentication_failed",
+                    "canonical maintenance source unauthenticated": "canonical_source_unauthenticated",
+                    "canonical maintenance source changed": "canonical_source_changed",
+                    "maintenance source changed during dispatch": "source_changed_during_dispatch",
+                }.get(maintenance_error.reason, "maintenance_failed")
+                logger.warning("Native continuity maintenance failed: reason=%s", safe_reason)
                 if thinking_spinner:
                     thinking_spinner.stop("")
                     thinking_spinner = None

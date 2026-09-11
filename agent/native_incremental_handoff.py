@@ -37,7 +37,12 @@ NATIVE_INCREMENTAL_MODEL = "gpt-5.6-luna"
 # trigger repeated provider compactions inside a single Responses request.
 NATIVE_INCREMENTAL_COMPACT_THRESHOLD = 128_000
 NATIVE_INCREMENTAL_NOTE_MAX_CHARS = 8_000
-NATIVE_INCREMENTAL_SUFFIX_MAX_ITEMS = 16
+# A compacted Responses turn may legitimately emit many alternating reasoning
+# and message records after its final checkpoint. Keep a bounded replay window
+# that exceeds observed real-provider streams, while bounding both structural
+# and encoded payload growth before it reaches persisted history.
+NATIVE_INCREMENTAL_SUFFIX_MAX_ITEMS = 256
+NATIVE_INCREMENTAL_SUFFIX_MAX_BYTES = 512 * 1024
 
 # Inline compaction is still a model turn: its temporary task instructions can
 # survive in opaque state. Explicitly end that maintenance task on every normal
@@ -157,6 +162,46 @@ def _projection_source_for_messages(
     ):
         return None, None
     return deepcopy(source) + deepcopy(messages[len(replay):]), len(replay)
+
+
+def authenticate_native_compaction_publication(agent: Any, messages, attempt) -> None:
+    """Install replay state only from the exact published producer checkpoint.
+
+    Shared by every compression caller and the later preflight sidecar seam.
+    Validate on a detached probe so a failed readback cannot partly replace live
+    authentication state. Never discover/reseal a retained checkpoint here.
+    """
+    from types import SimpleNamespace
+
+    if not bool(getattr(agent, "native_incremental_handoff_enabled", False)):
+        return
+    db = getattr(agent, "_session_db", None)
+    if db is None or not isinstance(attempt, NativeCompactionAttempt):
+        raise ValueError("native compaction publication requires durable producer evidence")
+    source = db.get_messages_as_conversation(agent.session_id, repair_alternation=False)
+    validate_persisted_native_compaction_history(source)
+    validate_persisted_native_compaction_history(messages)
+    expected = attempt.carrier["codex_reasoning_items"][0]
+    carriers = [
+        item for row in source for item in (row.get("codex_reasoning_items") or [])
+        if isinstance(item, dict)
+        and item.get("encrypted_content") == expected.get("encrypted_content")
+        and item.get(NATIVE_COMPACTION_METADATA_KEY) == attempt.metadata
+        and attempt.metadata.get("identity") == attempt.identity
+    ]
+    if len(carriers) != 1 or _note_fence(source) != _note_fence(messages):
+        raise ValueError("native compaction persisted replay projection authentication failed")
+    probe = SimpleNamespace(session_id=agent.session_id)
+    if (
+        not bind_native_incremental_replay_projection(
+            probe, source_messages=source, replay_messages=messages
+        )
+        or restore_native_incremental_note(probe, messages) is None
+    ):
+        raise ValueError("native compaction persisted replay projection authentication failed")
+    agent._native_incremental_replay_projection = probe._native_incremental_replay_projection
+    agent._native_incremental_handoff_note = probe._native_incremental_handoff_note
+    agent._native_incremental_handoff_projection_cursor = probe._native_incremental_handoff_projection_cursor
 
 
 def _projection_cursor_for_source_cursor(
@@ -602,6 +647,30 @@ def _latest_checkpoint_and_suffix(response: Any) -> tuple[Optional[Dict[str, Any
     output = distinct
     checkpoint: Optional[Dict[str, Any]] = None
     suffix: List[Dict[str, Any]] = []
+    suffix_bytes = 0
+
+    def suffix_json_default(value: Any) -> Any:
+        """Measure SDK model values without changing their retained payload."""
+        model_dump = getattr(value, "model_dump", None)
+        if callable(model_dump):
+            return model_dump()
+        raise TypeError(f"suffix value is not JSON serializable: {type(value).__name__}")
+
+    def append_suffix(item: Dict[str, Any]) -> None:
+        nonlocal suffix_bytes
+        if len(suffix) >= NATIVE_INCREMENTAL_SUFFIX_MAX_ITEMS:
+            raise ValueError("native incremental output suffix exceeds bound: item limit")
+        try:
+            item_bytes = len(json.dumps(
+                item, ensure_ascii=False, separators=(",", ":"), default=suffix_json_default
+            ).encode("utf-8"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("native incremental output suffix is not serializable") from exc
+        if suffix_bytes + item_bytes > NATIVE_INCREMENTAL_SUFFIX_MAX_BYTES:
+            raise ValueError("native incremental output suffix exceeds bound: byte limit")
+        suffix.append(item)
+        suffix_bytes += item_bytes
+
     # Validate all checkpoints, but only replay output AFTER the last one.
     # Real native streams can emit reasoning between successive checkpoints;
     # that intermediate output is already absorbed by the later checkpoint.
@@ -620,24 +689,21 @@ def _latest_checkpoint_and_suffix(response: Any) -> tuple[Optional[Dict[str, Any
             # Do not strip/normalize ciphertext; it is opaque provider state.
             checkpoint = {"type": "compaction", "encrypted_content": encrypted}
             suffix = []
+            suffix_bytes = 0
             continue
         if checkpoint is not None and index > last_checkpoint:
             if item_type == "reasoning":
                 encrypted = _item_value(item, "encrypted_content")
                 if not isinstance(encrypted, str) or not encrypted.strip():
                     raise ValueError("native incremental reasoning suffix is not replayable")
-                if len(suffix) >= NATIVE_INCREMENTAL_SUFFIX_MAX_ITEMS:
-                    raise ValueError("native incremental output suffix exceeds bound")
-                suffix.append({"role": "assistant", "content": "", "codex_reasoning_items": [{
+                append_suffix({"role": "assistant", "content": "", "codex_reasoning_items": [{
                     "type": "reasoning", "encrypted_content": encrypted,
                     "summary": deepcopy(_item_value(item, "summary") or []),
                 }]})
                 continue
             message = _message_suffix(item)
             if message is not None:
-                if len(suffix) >= NATIVE_INCREMENTAL_SUFFIX_MAX_ITEMS:
-                    raise ValueError("native incremental output suffix exceeds bound")
-                suffix.append(message)
+                append_suffix(message)
             elif item_type != "message":
                 # A new provider output type is not safe to silently discard
                 # after a checkpoint. Keep the original transcript instead

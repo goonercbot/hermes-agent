@@ -1536,6 +1536,7 @@ def build_turn_context(
     # copy AFTER this composition, so the stamped bytes would never match the
     # wire either — skip the stamp rather than persist provably wrong "exact
     # sent bytes" (MoA keeps its pre-sidecar cache behavior).
+    _db = getattr(agent, "_session_db", None)
     if (
         not moa_active
         and getattr(agent, "api_mode", None) != "codex_app_server"
@@ -1554,7 +1555,6 @@ def build_turn_context(
             # current user sidecar and the checkpoint fence together.  The
             # capability identifies only the checkpoint created by this turn;
             # retained checkpoints are never discovered or rebound.
-            _db = getattr(agent, "_session_db", None)
             from agent.native_compaction import (
                 NativeCompactionAttempt,
                 bind_native_compaction_tail,
@@ -1608,10 +1608,30 @@ def build_turn_context(
 
     # No caller may carry this authorization into a later ordinary or local
     # compression.  The last bind sees the final user/tool/TODO tail.
-    from agent.native_compaction import finalize_native_compaction_turn
+    from agent.native_compaction import (
+        NativeCompactionAttempt,
+        finalize_native_compaction_turn,
+    )
 
+    _finalized_native_attempt = getattr(agent, "_native_compaction_attempt", None)
     finalize_native_compaction_turn(agent, messages)
     agent._native_compaction_turn_active = False
+
+    # Native incremental compaction initially binds its transient replay fence
+    # while constructing the provider candidate.  Compression publication may
+    # then legitimately finalize that candidate's tail before it reaches this
+    # turn seam.  Replace the transient pair only from the committed source,
+    # after the producer capability has finalized; never copy an in-memory
+    # candidate or rebind after the atomic sidecar transaction raised.
+    if (
+        _preflight_compressed
+        and bool(getattr(agent, "native_incremental_handoff_enabled", False))
+        and _db is not None
+        and isinstance(_finalized_native_attempt, NativeCompactionAttempt)
+    ):
+        from agent.native_incremental_handoff import authenticate_native_compaction_publication
+
+        authenticate_native_compaction_publication(agent, messages, _finalized_native_attempt)
 
     # Crash-resilience: persist the inbound user turn before the first LLM
     # call. Runs after preflight compression (which rewrites history anyway)

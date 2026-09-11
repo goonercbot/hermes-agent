@@ -2395,10 +2395,26 @@ def run_conversation(
         if _native_boundary_request:
             from agent.agent_runtime_helpers import repair_message_sequence
 
-            _prefix = messages[:_request_current_turn_user_idx]
-            repaired_seq = repair_message_sequence(agent, _prefix)
-            messages = _prefix + messages[_request_current_turn_user_idx:]
-            _request_current_turn_user_idx = len(_prefix)
+            # Native request messages are already a disposable deep copy.  The
+            # repair helper protects the validated carrier/handoff/tail itself,
+            # but it must see the entire copy: a stale current-user cursor can
+            # otherwise cut between an unsealed assistant tool call and its
+            # matching result, prune the call, and leave an outgoing orphan.
+            _cursor_row = (
+                messages[_request_current_turn_user_idx]
+                if _request_current_turn_user_idx < len(messages)
+                else None
+            )
+            _current_user = (
+                _cursor_row
+                if isinstance(_cursor_row, dict) and _cursor_row.get("role") == "user"
+                else None
+            )
+            repaired_seq = repair_message_sequence(agent, messages)
+            _request_current_turn_user_idx = next(
+                (index for index, row in enumerate(messages) if row is _current_user),
+                len(messages),  # Current user was already covered by the note.
+            )
         else:
             from agent.agent_runtime_helpers import repair_message_sequence_with_cursor
 
@@ -3149,6 +3165,12 @@ def run_conversation(
         response = None  # Guard against UnboundLocalError if all retries fail
         api_kwargs = None  # Guard against UnboundLocalError in except handler
         _native_note_refresh_request = False
+        _native_note_refresh_completed = False
+        from agent.native_note_refresh import (
+            NativeNoteRefreshFailure, close_native_note_refresh, execute_native_note_refresh,
+            account_failed_native_note_refresh,
+        )
+        close_native_note_refresh(agent)
         api_request_id = f"{turn_id}:api:{api_call_count}"
         agent._current_api_request_id = api_request_id
 
@@ -3270,6 +3292,8 @@ def run_conversation(
                         is_github_responses=agent._is_copilot_url(),
                         sanitize_harmony_tokens=agent._is_codex_backend(),
                     )
+                if _native_note_refresh_request:
+                    _native_note_refresh_request.bind_request(api_kwargs)
                 # OpenRouter response caching replays identical successful
                 # responses verbatim, including empty completions. An empty-
                 # response retry must reach the provider instead of replaying
@@ -3457,6 +3481,9 @@ def run_conversation(
                         _use_streaming = False
 
                 _native_physical_attempted = False
+                if _native_note_refresh_request:
+                    # No maintenance prose may escape through streamed output.
+                    _use_streaming = False
 
                 def _perform_api_call(next_api_kwargs):
                     nonlocal _native_physical_attempted
@@ -3476,6 +3503,8 @@ def run_conversation(
 
                     def _physical_call(final_api_kwargs):
                         nonlocal _native_physical_attempted
+                        if _native_note_refresh_request:
+                            _native_note_refresh_request.check_request(agent, final_api_kwargs)
                         if _protected_request:
                             if _native_physical_attempted:
                                 raise RuntimeError(
@@ -3603,6 +3632,14 @@ def run_conversation(
                     resp_model = getattr(response, 'model', 'N/A') if response else 'N/A'
                     logging.debug(f"API Response received - Model: {resp_model}, Usage: {response.usage if hasattr(response, 'usage') else 'N/A'}")
                 
+                if _native_note_refresh_request:
+                    # Consume raw output before normalizers can repair/dedupe
+                    # calls or treat a local maintenance failure as provider work.
+                    response = execute_native_note_refresh(
+                        agent, _native_note_refresh_request, response, messages, effective_task_id,
+                    )
+                    _native_note_refresh_completed = True
+
                 # Validate response shape before proceeding
                 response_invalid = False
                 error_details = []
@@ -4796,7 +4833,41 @@ def run_conversation(
                 agent._persist_session(messages, conversation_history)
                 break
 
+            except NativeNoteRefreshFailure as maintenance_error:
+                # Log only host-controlled labels, never exception/provider text.
+                safe_reason = {
+                    "durable note readback failed authentication": "durable_note_authentication_failed",
+                    "canonical maintenance source unauthenticated": "canonical_source_unauthenticated",
+                    "canonical maintenance source changed": "canonical_source_changed",
+                    "maintenance source changed during dispatch": "source_changed_during_dispatch",
+                }.get(maintenance_error.reason, "maintenance_failed")
+                logger.warning("Native continuity maintenance failed: reason=%s", safe_reason)
+                if thinking_spinner:
+                    thinking_spinner.stop("")
+                    thinking_spinner = None
+                if agent.thinking_callback:
+                    agent.thinking_callback("")
+                try:
+                    account_failed_native_note_refresh(agent, response)
+                finally:
+                    agent._persist_session(messages, conversation_history)
+                return {
+                    "final_response": "Continuity-note refresh did not complete; conversation preserved without running other work.",
+                    "messages": messages, "api_calls": api_call_count,
+                    "completed": False, "failed": True, "error": "native_note_refresh_failed",
+                    "maintenance_failure": maintenance_error.reason,
+                }
             except Exception as api_error:
+                if _native_note_refresh_completed:
+                    # The provider and maintenance transaction already ran.
+                    # An accounting/post-processing error must not replay them.
+                    agent._persist_session(messages, conversation_history)
+                    return {
+                        "final_response": "Continuity-note refresh could not finish processing; conversation preserved.",
+                        "messages": messages, "api_calls": api_call_count,
+                        "completed": False, "failed": True, "error": "native_note_refresh_failed",
+                        "maintenance_failure": "maintenance post-processing failed",
+                    }
                 # Stop spinner silently — retry status is buffered and
                 # only flushed when every retry+fallback is exhausted.
                 if thinking_spinner:
@@ -7049,7 +7120,18 @@ def run_conversation(
                     # iteration from the correction instead of re-firing the
                     # stale request.
                     break
-        
+            finally:
+                close_native_note_refresh(agent)
+
+        if _native_note_refresh_completed:
+            # The old no-progress verdict covered an uncovered tail. Only a
+            # durably advanced note invalidates it; normal admission, attempt
+            # budgets and failure cooldowns still own the next compression.
+            _preflight_compression_blocked = False
+            _last_preflight_pressure = None
+            agent._session_messages = messages
+            continue
+
         if _retry.restart_with_redirected_messages:
             # The cancelled request produced no valid assistant item. Reuse the
             # same logical iteration after the outer loop appends the displayed
@@ -7448,21 +7530,7 @@ def run_conversation(
             elif hasattr(agent, "_codex_incomplete_retries"):
                 agent._codex_incomplete_retries = 0
             
-            # Maintenance grants only this host-bound tool for this response,
-            # even when ordinary discovery defers it. Persistent permissions
-            # and the durable tool catalogue are never broadened.
-            _response_valid_tool_names = ({"continuity_note"} if _native_note_refresh_request else agent.valid_tool_names)
-            if _native_note_refresh_request and (
-                not assistant_message.tool_calls
-                or len(assistant_message.tool_calls) != 1
-                or assistant_message.tool_calls[0].function.name != "continuity_note"
-            ):
-                agent._persist_session(messages, conversation_history)
-                return {
-                    "final_response": "Continuity-note refresh did not complete; conversation preserved without running other work.",
-                    "messages": messages, "api_calls": api_call_count,
-                    "completed": False, "failed": True, "error": "native_note_refresh_failed",
-                }
+            _response_valid_tool_names = agent.valid_tool_names
             # Check for tool calls
             if assistant_message.tool_calls:
                 if not agent.quiet_mode:

@@ -1056,11 +1056,19 @@ def test_codex_preflight_defangs_harmony_tokens_before_and_after_middleware(monk
         assert token not in str(request["input"])
         replacement = dict(request)
         replacement["instructions"] = "Inspect source containing " + token
-        replacement["input"] = [{
-            "type": "function_call_output",
-            "call_id": "call_poisoned",
-            "output": "source contains " + token,
-        }]
+        replacement["input"] = [
+            {
+                "type": "function_call",
+                "call_id": "call_poisoned",
+                "name": "terminal",
+                "arguments": "{}",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_poisoned",
+                "output": "source contains " + token,
+            },
+        ]
         return SimpleNamespace(
             payload=replacement,
             original_payload=request,
@@ -1094,6 +1102,58 @@ def test_codex_preflight_defangs_harmony_tokens_before_and_after_middleware(monk
     assert token not in captured["instructions"]
     assert token not in str(captured["input"])
     assert "<｜start｜>" in captured["instructions"]
+
+
+@pytest.mark.parametrize("shape", ["orphan", "output-before-call", "duplicate-output"])
+@pytest.mark.parametrize("layer", ["request", "execution"])
+def test_codex_final_preflight_blocks_middleware_orphaned_output(monkeypatch, shape, layer):
+    """The final native wire check blocks a pair split by request middleware."""
+    agent = _build_agent(monkeypatch)
+    setattr(agent, "_disable_streaming", True)
+    captured = {}
+
+    def _malformed(request):
+        replacement = dict(request)
+        output = {"type": "function_call_output", "call_id": "call_orphaned_by_middleware",
+                  "output": "must not reach the Responses endpoint"}
+        call = {"type": "function_call", "call_id": output["call_id"],
+                "name": "terminal", "arguments": "{}"}
+        replacement["input"] = {
+            "orphan": [output], "output-before-call": [output, call],
+            "duplicate-output": [call, output, dict(output)],
+        }[shape]
+        return replacement
+
+    def _request_middleware(request, **_context):
+        return SimpleNamespace(
+            payload=_malformed(request) if layer == "request" else request,
+            original_payload=request,
+            changed=True,
+            trace=[],
+        )
+
+    def _execution_middleware(request, next_call, **_context):
+        return next_call(_malformed(request) if layer == "execution" else request)
+
+    def _capture_api_call(api_kwargs):
+        captured.update(api_kwargs)
+        return _codex_message_response("unexpected")
+
+    monkeypatch.setattr(
+        "hermes_cli.middleware.apply_llm_request_middleware",
+        _request_middleware,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.middleware.run_llm_execution_middleware",
+        _execution_middleware,
+    )
+    monkeypatch.setattr(agent, "_interruptible_api_call", _capture_api_call)
+
+    result = agent.run_conversation("continue")
+
+    assert result["completed"] is False
+    assert "function_call_output has no matching function_call" in result["error"]
+    assert captured == {}
 
 
 def test_copilot_responses_preflight_preserves_harmony_tokens(monkeypatch):

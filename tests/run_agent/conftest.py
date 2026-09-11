@@ -23,6 +23,13 @@ from __future__ import annotations
 import pytest
 
 
+def pytest_addoption(parser):
+    parser.addoption(
+        "--native-router-source", default=None,
+        help="Test-only absolute path to the external native-maintenance router candidate.",
+    )
+
+
 @pytest.fixture(autouse=True)
 def _fast_retry_backoff(monkeypatch):
     """Short-circuit retry backoff for all tests in this directory."""

@@ -314,6 +314,98 @@ def test_missing_note_recovers_midturn_without_premature_warning(tmp_path, monke
             db.close()
 
 
+def test_native_full_repair_keeps_unsealed_tool_pair_past_stale_cursor():
+    """A stale native cursor must not slice between an unsealed call/result.
+
+    The protected span is valid and remains untouched.  The appended pair is
+    deliberately outside that sealed tail, reproducing the request-only shape
+    that the old prefix repair turned into a Responses orphan.
+    """
+    from agent.agent_runtime_helpers import repair_message_sequence
+    from agent.codex_responses_adapter import _chat_messages_to_responses_input
+    from agent.native_compaction import native_compaction_protected_message_indices
+    from tests.run_agent.test_native_incremental_handoff import _agent, _note, _response, _source
+
+    producer, _calls = _agent([
+        _response({"type": "compaction", "encrypted_content": "repair-cp"})
+    ])
+    source = _source()
+    _note(producer, source)
+    protected = native_incremental_compact_context(producer, source)
+    protected.extend([
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": "call_loss",
+                "call_id": "call_loss",
+                "type": "function",
+                "function": {"name": "terminal", "arguments": "{}"},
+            }],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_loss",
+            "content": "retained unsealed result",
+        },
+    ])
+    source_before = deepcopy(protected)
+    stale_cursor = len(protected) - 1  # Points at the tool result, not a user.
+    sealed_end = max(native_compaction_protected_message_indices(protected)) + 1
+    assert sealed_end < stale_cursor
+
+    # This is the former conversation_loop prefix split: the assistant call is
+    # in the repaired prefix while its result remains in the untouched suffix.
+    split = deepcopy(protected)
+    repair_end = max(stale_cursor, sealed_end)
+    split_prefix = split[:repair_end]
+    split_repairs = repair_message_sequence(producer, split_prefix)
+    split = split_prefix + split[repair_end:]
+    split_wire = _chat_messages_to_responses_input(
+        split, native_compaction_eligible=True
+    )
+    assert split_repairs == 1
+    assert [item["type"] for item in split_wire if item.get("call_id") == "call_loss"] == [
+        "function_call_output"
+    ]
+
+    # Exercise the production branch itself, not a handwritten replacement;
+    # reverting conversation_loop to prefix-only repair must fail this test.
+    import ast
+    from pathlib import Path
+    import agent.conversation_loop as loop
+    module = ast.parse(Path(loop.__file__).read_text())
+    run = next(node for node in module.body if isinstance(node, ast.FunctionDef) and node.name == "run_conversation")
+    branches = [
+        node for node in ast.walk(run)
+        if isinstance(node, ast.If)
+        and isinstance(node.test, ast.Name)
+        and node.test.id == "_native_boundary_request"
+        and any(
+            isinstance(child, ast.ImportFrom)
+            and child.module == "agent.agent_runtime_helpers"
+            and any(alias.name == "repair_message_sequence" for alias in child.names)
+            for child in node.body
+        )
+    ]
+    assert len(branches) == 1
+    full = deepcopy(protected)
+    scope = {"agent": producer, "messages": full, "_request_current_turn_user_idx": stale_cursor}
+    exec(compile(ast.Module(body=branches[0].body, type_ignores=[]), loop.__file__, "exec"), scope)
+    full = scope["messages"]
+    full_repairs = scope["repaired_seq"]
+    assert scope["_request_current_turn_user_idx"] == len(full)
+    full_wire = _chat_messages_to_responses_input(
+        full, native_compaction_eligible=True
+    )
+    assert full_repairs == 0
+    assert [item["type"] for item in full_wire if item.get("call_id") == "call_loss"] == [
+        "function_call",
+        "function_call_output",
+    ]
+    assert protected == source_before
+
+
 def test_real_stream_shape_keeps_only_last_checkpoint_and_its_suffix():
     from agent.native_incremental_handoff import _latest_checkpoint_and_suffix
     cp1={'type':'compaction','id':'cp1','encrypted_content':'early'}
@@ -351,8 +443,9 @@ def test_empty_fallback_projects_valid_checkpoint_tail_for_minimax_chat(monkeypa
     a.context_compressor.should_compress=lambda _:False
     a._fallback_chain=[{'provider':'minimax','model':'MiniMax-M3','base_url':'https://api.minimax.io/v1','api_key':'test-key','api_mode':'chat_completions'}]
     requests=[]
-    empty=response(NS(type='message',role='assistant',content=[]))
-    replies=[empty,empty,empty,chat_response('FALLBACK_OK')]
+    # Malformed historical call is rejected before native transport dispatch;
+    # generic fallback still receives its own safely repaired projection.
+    replies=[chat_response('FALLBACK_OK')]
     a._interruptible_api_call=lambda request:(requests.append(deepcopy(request)) or replies.pop(0))
 
     monkeypatch.setattr('agent.auxiliary_client.resolve_provider_client',lambda *args,**kwargs:(a.client,'MiniMax-M3'))
@@ -365,7 +458,7 @@ def test_empty_fallback_projects_valid_checkpoint_tail_for_minimax_chat(monkeypa
 
     assert result['completed'] and result['final_response']=='FALLBACK_OK'
     assert a.provider=='minimax' and a.model=='MiniMax-M3' and a.api_mode=='chat_completions'
-    assert len(requests)==4 and 'input' in requests[0] and 'messages' in requests[-1]
+    assert len(requests)==1 and 'messages' in requests[0] and 'input' not in requests[0]
     chat_messages=requests[-1]['messages']
     assert all('codex_reasoning_items' not in row for row in chat_messages)
     assert all(call.get('function',{}).get('name') for row in chat_messages for call in row.get('tool_calls') or [])

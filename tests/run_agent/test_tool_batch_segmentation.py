@@ -401,6 +401,36 @@ def agent():
 
 
 class TestSegmentedDispatchIntegration:
+    @pytest.mark.parametrize("path", ["parallel", "sequential", "mixed"])
+    def test_native_budget_projection_in_every_dispatch_path(self, agent, path):
+        from copy import deepcopy
+        from agent.native_incremental_handoff import _projection_source_for_messages
+
+        agent.native_incremental_handoff_enabled = True
+        names = {
+            "parallel": ["web_search"] * 4,
+            "sequential": ["terminal"] * 4,
+            "mixed": ["web_search", "web_search", "terminal", "web_search"],
+        }[path]
+        calls = [_tc(name, json.dumps({"query": f"unique-{i}"}), call_id=f"budget-{i}") for i, name in enumerate(names)]
+        messages = []
+        with (
+            patch("run_agent.handle_function_call", return_value="X" * 61132),
+            patch("agent.tool_executor._budget_for_agent", return_value=BudgetConfig()),
+        ):
+            agent._execute_tool_calls(SimpleNamespace(content="", tool_calls=calls), messages, "task-1")
+
+        assert len(messages) == 4
+        source, cursor = _projection_source_for_messages(agent, messages)
+        assert cursor == len(messages)
+        assert source is not None
+        assert all("X" * 61132 in row["content"] for row in source)
+        assert any(len(row["content"]) < 61132 for row in messages)
+        before = deepcopy(source)
+        messages[0]["content"] += "unauthorized edit"
+        assert _projection_source_for_messages(agent, messages)[0] is None
+        assert agent._native_incremental_replay_projection["source"] == before
+
     def test_mixed_batch_runs_safe_prefix_concurrently_and_barrier_after(self, agent):
         """Two web_search calls must overlap in time; terminal must start only
         after both finish; results land in the model's emission order."""

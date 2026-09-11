@@ -15,6 +15,8 @@ from agent.native_compaction import (
 )
 from agent.native_incremental_handoff import (
     NATIVE_INCREMENTAL_MODEL,
+    NATIVE_INCREMENTAL_SUFFIX_MAX_BYTES,
+    NATIVE_INCREMENTAL_SUFFIX_MAX_ITEMS,
     bind_native_incremental_replay_projection,
     create_native_incremental_note,
     native_incremental_compact_context,
@@ -57,7 +59,7 @@ def _source():
         {"role": "user", "content": "old instruction " * 400},
         {"role": "assistant", "content": "old work " * 400},
         {"role": "user", "content": "latest correction: run the focused test"},
-        {"role": "assistant", "content": "", "tool_calls": [{"id": "call_1"}]},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "terminal", "arguments": "{}"}}]},
         {"role": "tool", "tool_call_id": "call_1", "name": "terminal", "content": "focused result"},
     ]
 
@@ -110,6 +112,93 @@ def test_one_luna_request_keeps_latest_checkpoint_suffix_and_tail():
     assert persisted_note is not None
     assert persisted_note["objective"] == "deliver native incremental handoff"
     assert agent._last_native_incremental_compaction["disposition"] == "checkpoint"
+
+
+def test_post_checkpoint_suffix_over_sixteen_items_is_retained_and_replayed():
+    """A valid long native stream must retain every supported item in order."""
+    from agent.codex_responses_adapter import _chat_messages_to_responses_input
+
+    provider_suffix = []
+    for index in range(18):
+        if index % 3 == 2:
+            provider_suffix.append({
+                "type": "message", "id": f"message-{index}", "role": "assistant",
+                "status": "completed", "phase": f"phase-{index}",
+                "content": [{"type": "output_text", "text": f"message-{index}"}],
+            })
+        else:
+            provider_suffix.append({
+                "type": "reasoning", "id": f"reasoning-{index}",
+                "encrypted_content": f"cipher-{index}",
+                "summary": [{"type": "summary_text", "text": f"summary-{index}"}],
+            })
+    agent, _calls = _agent([_response(
+        {"type": "compaction", "id": "checkpoint", "encrypted_content": "opaque-checkpoint"},
+        *provider_suffix,
+    )])
+    source = _source()
+    _note(agent, source)
+
+    compacted = native_incremental_compact_context(agent, source)
+    suffix = compacted[2:2 + len(provider_suffix)]
+    assert len(suffix) == 18
+    assert [
+        "message" if "codex_message_items" in row else "reasoning" for row in suffix
+    ] == [item["type"] for item in provider_suffix]
+    assert [
+        row["codex_message_items"][0]["content"][0]["text"]
+        for row in suffix if "codex_message_items" in row
+    ] == [item["content"][0]["text"] for item in provider_suffix if item["type"] == "message"]
+    assert [
+        row["codex_reasoning_items"][0]["encrypted_content"]
+        for row in suffix if "codex_reasoning_items" in row
+    ] == [item["encrypted_content"] for item in provider_suffix if item["type"] == "reasoning"]
+
+    replay = _chat_messages_to_responses_input(
+        compacted, native_compaction_eligible=True, current_issuer_kind="openai_codex"
+    )
+    replayed_items = [
+        item for item in replay if item.get("type") in {"reasoning", "message"}
+    ]
+    assert [item["type"] for item in replayed_items] == [item["type"] for item in provider_suffix]
+    assert [
+        item["encrypted_content"] for item in replayed_items if item["type"] == "reasoning"
+    ] == [item["encrypted_content"] for item in provider_suffix if item["type"] == "reasoning"]
+    assert [
+        item["summary"] for item in replayed_items if item["type"] == "reasoning"
+    ] == [item["summary"] for item in provider_suffix if item["type"] == "reasoning"]
+    assert [
+        item for item in replayed_items if item["type"] == "message"
+    ] == [item for item in provider_suffix if item["type"] == "message"]
+
+
+@pytest.mark.parametrize(
+    ("suffix", "error"),
+    [
+        ([
+            {"type": "reasoning", "id": f"reasoning-{index}",
+             "encrypted_content": f"cipher-{index}", "summary": []}
+            for index in range(NATIVE_INCREMENTAL_SUFFIX_MAX_ITEMS + 1)
+        ], "exceeds bound: item"),
+        ([{
+            "type": "message", "id": "large-message", "role": "assistant",
+            "content": [{"type": "output_text", "text": "x" * NATIVE_INCREMENTAL_SUFFIX_MAX_BYTES}],
+        }], "exceeds bound: byte"),
+        ([{"type": "future_native_item", "id": "unknown", "payload": "opaque"}], "unsupported item"),
+    ],
+)
+def test_invalid_or_over_limit_suffix_leaves_source_unchanged(suffix, error):
+    agent, _calls = _agent([_response(
+        {"type": "compaction", "id": "checkpoint", "encrypted_content": "opaque-checkpoint"},
+        *suffix,
+    )])
+    source = _source()
+    before = deepcopy(source)
+    _note(agent, source)
+
+    with pytest.raises(ValueError, match=error):
+        native_incremental_compact_context(agent, source)
+    assert source == before
 
 
 def test_missing_or_changed_prefix_note_is_not_ready_and_never_summarizes(caplog):

@@ -107,6 +107,17 @@ class TestConsumerDeclaredFinal:
 
 class TestInterimSendContract:
     @pytest.mark.asyncio
+    async def test_commentary_callback_tracks_only_successful_delivery(self):
+        adapter = _make_draft_adapter()
+        delivered = []
+        sc = GatewayStreamConsumer(
+            adapter, "D1", StreamConsumerConfig(cursor=""),
+            on_commentary_sent=lambda result, text: delivered.append((result.message_id, text)),
+        )
+        assert await sc._send_commentary("interim") is True
+        assert delivered == [("sealed_ts_1", "interim")]
+
+    @pytest.mark.asyncio
     async def test_commentary_is_marked_interim(self):
         adapter = _make_draft_adapter()
         cfg = StreamConsumerConfig(

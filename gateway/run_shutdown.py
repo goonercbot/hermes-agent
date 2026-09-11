@@ -957,6 +957,12 @@ class GatewayShutdownMixin:
                     continue
                 if not self._notice_allowed(platform, "active session"):
                     continue
+                platform_cfg = self.config.platforms.get(platform)
+                home = self.config.get_home_channel(platform)
+                if (platform_cfg is not None and home is not None
+                        and str(home.chat_id) == str(chat_id)
+                        and not platform_cfg.home_channel_startup_notification):
+                    continue
                 reply_to_message_id = getattr(source, "message_id", None)
                 if reply_to_message_id is None and restart_key == dedup_key:
                     reply_to_message_id = getattr(restart_source, "message_id", None)
@@ -987,7 +993,8 @@ class GatewayShutdownMixin:
             home = self.config.get_home_channel(platform)
             if not home or not home.chat_id:
                 continue
-            if not self._notice_allowed(platform, "home channel"):
+            platform_cfg = self.config.platforms.get(platform)
+            if platform_cfg is not None and not platform_cfg.home_channel_startup_notification:
                 continue
             dedup_key = _notice_target_key(platform.value, home.chat_id, home.thread_id)
             if dedup_key in notified:

@@ -476,7 +476,9 @@ class SessionTranscriptMixin:
         except Exception as e:
             raise TranscriptReadError(session_id) from e
 
-    def load_transcript(self, session_id: str) -> List[Dict[str, Any]]:
+    def load_transcript(
+        self, session_id: str, *, repair_alternation: bool = True,
+    ) -> List[Dict[str, Any]]:
         """Load all messages from a session's transcript (state.db is canonical). Reads follow the
         same routing writes use — the in-memory reroute map, then the durable compression tip —
         otherwise the transcript "vanishes" while every message sits under the child."""
@@ -488,9 +490,12 @@ class SessionTranscriptMixin:
             db = self._db_for_session_id(session_id)
             session_id = db.get_compression_tip(session_id) or session_id
         try:
-            # repair_alternation: this feeds LIVE REPLAY; heal a durable user;user wedge once here.
+            # Most transcript consumers need an immediately replayable view. The
+            # native continuity turn requests the raw canonical rows instead;
+            # its final request preparation owns the disposable repair so note
+            # fences always describe durable bytes.
             return self._db_for_session_id(session_id).get_messages_as_conversation(
-                session_id, repair_alternation=True)
+                session_id, repair_alternation=repair_alternation)
         except Exception as e:
             # Empty history is valid data; a failed canonical read is not — live-replay callers
             # must fail closed, not start from [].

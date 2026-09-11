@@ -65,6 +65,9 @@ def summarize_manual_compression(
             "Summary generation failed; Hermes used limited fallback context "
             f"and removed {dropped_count} message(s)."
         )
+    elif noop and failure_reason:
+        headline = f"Compression blocked: {before_count} messages preserved"
+        note = "Compression could not proceed; no messages were removed."
     elif noop:
         headline = f"No changes from compression: {before_count} messages"
     else:
@@ -80,7 +83,7 @@ def summarize_manual_compression(
     else:
         token_line = f"Approx request size: ~{before_tokens:,} → ~{after_tokens:,} tokens"
 
-    if failure_reason and (aborted or fallback_used):
+    if failure_reason and (aborted or fallback_used or noop):
         # Crosses a user-facing UI boundary: never let a disabled global redaction
         # preference expose credentials embedded in provider exception text.
         note = f"{note} Reason: {redact_sensitive_text(failure_reason.strip(), force=True)}"

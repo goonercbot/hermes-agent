@@ -13,6 +13,7 @@ import logging
 import random
 import sys
 from contextlib import suppress
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Dict
 
@@ -140,6 +141,23 @@ def prepare_iteration(agent: Any,*, messages: Any, api_call_count: Any) -> Itera
     _maybe_inject_iteration_budget_warning(agent, messages)
 
     request_logger = getattr(agent, "logger", None) or logger  # same name as the origin module
+    # A validated native checkpoint seals the carrier, handoff, and recorded
+    # tail.  Request-side sanitizers and sequence repair are lossy projections,
+    # so never run them against the durable source.  The native-aware repair
+    # helper receives the entire disposable copy: slicing at a stale flush/user
+    # cursor can separate a trailing assistant tool call from its tool result.
+    from agent.native_compaction import validate_persisted_native_compaction_history
+    native_boundary_request = bool(validate_persisted_native_compaction_history(messages))
+    native_request_source = None
+    if native_boundary_request:
+        from agent.native_incremental_handoff import _projection_source_for_messages
+
+        # Capture canonical evidence before repair.  A resumed gateway replay
+        # may be a cleaned projection and this turn's user row may already be
+        # durable, so the authenticated source can have a different shape from
+        # the outgoing repaired request.
+        native_request_source, _ = _projection_source_for_messages(agent, messages)
+        messages = deepcopy(messages)
     # Per-agent validation cursor skips re-parsing tool_call args already validated.
     # Identity-keyed; a rewritten list breaks the prefix match and forces a re-scan.
     _sanitize_cursor = getattr(agent, "_sanitize_args_cursor", None)
@@ -169,13 +187,60 @@ def prepare_iteration(agent: Any,*, messages: Any, api_call_count: Any) -> Itera
             )
         )
 
-    messages = [msg for msg in messages if not _is_scaffold_ghost(msg)]
+    if native_boundary_request:
+        from agent.native_compaction import native_compaction_protected_message_indices
+
+        protected_indices = native_compaction_protected_message_indices(messages)
+        messages = [
+            msg for index, msg in enumerate(messages)
+            if index in protected_indices or not _is_scaffold_ghost(msg)
+        ]
+    else:
+        messages = [msg for msg in messages if not _is_scaffold_ghost(msg)]
 
     # Repair malformed role alternation (tool→user / user→user tails): providers
     # return empty content on them and the empty-retry loop spins. The _with_cursor
     # variant also recomputes the SessionDB flush cursor after compaction.
-    from agent.agent_runtime_helpers import repair_message_sequence_with_cursor
-    repaired_seq = repair_message_sequence_with_cursor(agent, messages)
+    if native_boundary_request:
+        from agent.agent_runtime_helpers import repair_message_sequence
+
+        # Repair each unsealed side as a whole.  Do not use a stale flush/user
+        # cursor: it can split a trailing assistant tool call from its result.
+        # The sealed carrier/handoff/tail remains byte-identical, including its
+        # deliberate user/user adjacency.
+        from agent.native_compaction import native_compaction_protected_message_indices
+
+        native_request_copy = deepcopy(messages)
+        protected_indices = native_compaction_protected_message_indices(messages)
+        protected_start = min(protected_indices)
+        protected_end = max(protected_indices) + 1
+        prefix = messages[:protected_start]
+        sealed = messages[protected_start:protected_end]
+        suffix = messages[protected_end:]
+        repaired_seq = (
+            repair_message_sequence(agent, prefix)
+            + repair_message_sequence(agent, suffix)
+        )
+        messages[:] = [*prefix, *sealed, *suffix]
+        validate_persisted_native_compaction_history(messages)
+        if repaired_seq:
+            from agent.native_incremental_handoff import bind_native_incremental_request_projection
+
+            if native_request_source is None or not bind_native_incremental_request_projection(
+                agent,
+                source_messages=native_request_source,
+                replay_messages=messages,
+            ):
+                messages[:] = native_request_copy
+                logger.warning(
+                    "Rejected native request sequence repair without authenticated source "
+                    "(session=%s)", agent.session_id or "-"
+                )
+                raise ValueError("native request sequence repair source unauthenticated")
+    else:
+        from agent.agent_runtime_helpers import repair_message_sequence_with_cursor
+
+        repaired_seq = repair_message_sequence_with_cursor(agent, messages)
     if repaired_seq > 0:
         request_logger.info(
             "Repaired %s message-alternation violations before request (session=%s)",
@@ -216,6 +281,20 @@ def _inject_steer_into_newest_tool_result(agent: Any, messages: Any, steer_text:
         if isinstance(_sm, dict) and _sm.get("role") == "tool":
             from agent.prompt_builder import format_steer_marker
             marker = format_steer_marker(steer_text)
+            if getattr(agent, "native_incremental_handoff_enabled", False) is True:
+                # Native replay authenticates canonical persisted bytes.  Tool
+                # results can already be durable while an API call is in
+                # flight, so rewriting one here would create an in-memory
+                # prefix that cannot survive SessionDB readback.  Append an
+                # explicit durable user event instead.
+                messages.append({"role": "user", "content": marker.strip()})
+                if agent._flush_messages_to_session_db(messages) is False:
+                    raise RuntimeError("Native steering message persistence failed")
+                logger.debug(
+                    "Pre-API-call steer drain: persisted native user event after tool msg at index %d",
+                    _si,
+                )
+                return
             existing = _sm.get("content", "")
             if isinstance(existing, str):
                 _sm["content"] = existing + marker

@@ -12,6 +12,7 @@ import json
 import logging
 import re
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field, fields
 from typing import Any, Dict, List, Optional
 
@@ -182,6 +183,37 @@ def _should_skip_model_call_for_reference_handoff(
 _HANDOFF_SKIP_FINAL_RESPONSE = (
     "Context was compacted. The previous response is complete — awaiting your next message."
 )
+
+
+@contextmanager
+def _suppress_pending_native_overflow_warning(agent: Any, native_note_refresh_request: Any):
+    """Defer only a stale-tail overflow warning during verified note maintenance.
+
+    The capability exists only for an authenticated native tail and is rechecked at
+    the physical-call boundary. In that narrow interval, a structural-backoff warning
+    describes the tail that maintenance is about to repair. The normal method is
+    restored before response processing, including every failure path.
+    """
+    warn = getattr(agent, "_warn_context_overflow_blocked", None)
+    if not native_note_refresh_request or not callable(warn):
+        yield
+        return
+
+    def _defer_warning(reason: str, preflight_tokens: int, threshold_tokens: int) -> None:
+        logger.info(
+            "Deferring blocked-context warning while native continuity-note maintenance is pending "
+            "(reason=%s, tokens=%s, threshold=%s)",
+            reason, preflight_tokens, threshold_tokens,
+        )
+
+    agent._warn_context_overflow_blocked = _defer_warning
+    try:
+        yield
+    finally:
+        # Do not replace an intentional concurrent update to the warning sink.
+        if getattr(agent, "_warn_context_overflow_blocked", None) is _defer_warning:
+            agent._warn_context_overflow_blocked = warn
+
 
 # Terminal final_response when compression timed out while the request was still oversized (#98722).
 # Terminal final_response for a turn ended because context compression hit its host progress-aware timeout
@@ -1322,6 +1354,8 @@ class _LoopState:
     api_request_id: Any = None
     _original_api_kwargs: Any = None
     _llm_middleware_trace: Any = None
+    native_note_refresh_request: Any = False
+    native_note_refresh_completed: bool = False
     api_duration: Any = None
     assistant_message: Any = None
 
@@ -1365,6 +1399,35 @@ def _run_api_retry_loop(agent, s: _LoopState) -> Optional[Dict[str, Any]]:
 
     Returns a turn result dict when a phase ends the turn, else None once the loop is left
     (success, a restart armed on ``s._retry``, interrupt, or retries exhausted)."""
+    from agent.native_note_refresh import (
+        NativeNoteRefreshFailure, account_failed_native_note_refresh,
+        close_native_note_refresh, execute_native_note_refresh,
+    )
+
+    def _maintenance_failure(
+        error: NativeNoteRefreshFailure, *, account_usage: bool = True,
+    ) -> Dict[str, Any]:
+        # Reasons are fixed host-side failure classes; retain them in the local
+        # log so a generic user-facing preservation response remains diagnosable.
+        logger.warning(
+            "Native continuity-note refresh failed (session=%s): %s",
+            getattr(agent, "session_id", None) or "-", error.reason,
+        )
+        if account_usage:
+            try:
+                account_failed_native_note_refresh(agent, s.response)
+            except Exception:
+                logger.debug("native note maintenance usage accounting failed", exc_info=True)
+        try:
+            agent._persist_session(s.messages, s.conversation_history)
+        except Exception:
+            logger.debug("native note maintenance failure persistence failed", exc_info=True)
+        return _partial_turn_result(
+            "Continuity-note refresh did not complete; conversation preserved without running other work.",
+            s.messages, s.api_call_count, failed=True,
+            error="native_note_refresh_failed", maintenance_failure=error.reason,
+        )
+
     while s.retry_count < s.max_retries:
         _ng = _run_phase(nous_rate_limit_guard, agent, s)
         if _ng.action == "return":
@@ -1373,22 +1436,52 @@ def _run_api_retry_loop(agent, s: _LoopState) -> Optional[Dict[str, Any]]:
             return None
         try:
             _run_phase(build_api_request, agent, s)
-            if _run_phase(perform_api_call, agent, s).action == "break":
-                return None
+            # The capability covers stale-note maintenance. A missing/invalid note has
+            # no capability yet because the ordinary model must produce it; both are
+            # the same authenticated native not-ready admission state for this one
+            # request, so defer only its structural-tail warning.
+            from agent.turn_preflight import _native_note_refresh_pending
+
+            _native_maintenance_pending = bool(s.native_note_refresh_request) or _native_note_refresh_pending(
+                agent, s.messages
+            )
+            with _suppress_pending_native_overflow_warning(agent, _native_maintenance_pending):
+                if _run_phase(perform_api_call, agent, s).action == "break":
+                    return None
+            if s.native_note_refresh_request:
+                # Consume the raw Responses output before normalizers can repair,
+                # dedupe, or dispatch it as an ordinary tool call.  The native
+                # transaction itself runs the normal sequential tool middleware.
+                s.native_note_refresh_request.check_request(agent, s.api_kwargs)
+                s.response = execute_native_note_refresh(
+                    agent, s.native_note_refresh_request, s.response, s.messages,
+                    s.effective_task_id,
+                )
+                s.native_note_refresh_completed = True
             _rc = _run_phase(check_api_response, agent, s)
             if _rc.action == "return":
                 return _rc.result
             if _rc.action == "break":
                 return None
+        except NativeNoteRefreshFailure as maintenance_error:
+            return _maintenance_failure(maintenance_error)
         except InterruptedError:
             if _run_phase(handle_api_interrupt, agent, s).action == "break":
                 return None
         except Exception as api_error:
+            if s.native_note_refresh_completed:
+                return _maintenance_failure(NativeNoteRefreshFailure(
+                    "maintenance post-processing failed"
+                ), account_usage=False)
             _ae = _run_phase(handle_api_error, agent, s, api_error=api_error)
             if _ae.action == "return":
                 return _ae.result
             if _ae.action == "break":
                 return None
+        finally:
+            # A provider failure or interruption must not leave a one-request
+            # capability alive for a retry/fallback or a later user turn.
+            close_native_note_refresh(agent)
     return None
 
 
@@ -1497,11 +1590,21 @@ def run_conversation(
 
         s.api_start_time, s.retry_count, s.max_retries = time.time(), 0, agent._api_max_retries
         s._retry, s.finish_reason, s.response, s.api_kwargs = TurnRetryState(), "stop", None, None
+        s.native_note_refresh_completed = False
         s.api_request_id = agent._current_api_request_id = f"{s.turn_id}:api:{s.api_call_count}"
 
         early_result = _run_api_retry_loop(agent, s)
         if early_result is not None:
             return early_result
+
+        if s.native_note_refresh_completed:
+            # A durably advanced note, not an arbitrary request retry, clears
+            # only the stale-tail admission latch.  The next normal iteration
+            # rebuilds its tools from agent.tools, restoring ordinary tools.
+            s._preflight_compression_blocked = False
+            s._last_preflight_pressure = None
+            agent._session_messages = s.messages
+            continue
 
         _rs = _run_phase(apply_retry_restarts, agent, s)
         if _rs.action == "break":

@@ -398,7 +398,12 @@ async def test_shutdown_notifications_are_fully_muted_when_flag_disabled():
     source = make_restart_source(chat_id="active-42", chat_type="group", thread_id="topic-7")
     session_key = build_session_key(source)
 
-    runner.config.platforms[Platform.TELEGRAM].gateway_restart_notification = False
+    # Load the legacy single-flag configuration through its compatibility bridge.
+    # New explicit home-channel settings intentionally control broadcasts separately.
+    legacy = runner.config.platforms[Platform.TELEGRAM].to_dict()
+    legacy.pop("home_channel_startup_notification", None)
+    legacy["gateway_restart_notification"] = False
+    runner.config.platforms[Platform.TELEGRAM] = PlatformConfig.from_dict(legacy)
     runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
         platform=Platform.TELEGRAM,
         chat_id="home-42",

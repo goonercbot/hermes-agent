@@ -676,14 +676,20 @@ class GatewayTurnMixin:
                 raise asyncio.TimeoutError
             # Charge the idle budget from the LAST PROGRESS event, else silence can approach 2x timeout.
             _hyg_waited = time.monotonic() - attempt.wait_started
-            _slice = min(
-                max(hs.timeout_seconds - fence.seconds_since_progress(), 0.005),
-                max(hs.total_ceiling_seconds - _hyg_waited, 0.005),
-            )
-            # Cap the slice at the remaining turn-hold budget so a continuously-streaming worker can't
-            # hold the turn until the ceiling. Budget exhausted → immediate timeout → abandonment.
-            _turn_hold_remaining = hs.max_turn_hold_seconds - (time.monotonic() - attempt.wait_started)
-            _slice = 0.005 if _turn_hold_remaining <= 0 else min(_slice, max(_turn_hold_remaining, 0.005))
+            total_left = max(hs.total_ceiling_seconds - _hyg_waited, 0.005)
+            if attempt.require_exclusive_completion:
+                # Native Responses compaction owns a checkpoint boundary. Its
+                # provider consumes SSE internally, so the generic progress
+                # fence cannot observe healthy prefill; wait through the hard
+                # ceiling rather than racing the user turn against its commit.
+                _slice = total_left
+            else:
+                _slice = min(
+                    max(hs.timeout_seconds - fence.seconds_since_progress(), 0.005), total_left,
+                )
+                # Cap ordinary hygiene at the turn-hold availability budget.
+                _turn_hold_remaining = hs.max_turn_hold_seconds - (time.monotonic() - attempt.wait_started)
+                _slice = 0.005 if _turn_hold_remaining <= 0 else min(_slice, max(_turn_hold_remaining, 0.005))
             # Short poll so a /stop or /restart cancel is not stuck behind a full idle window.
             _idle_left = max(hs.timeout_seconds - fence.seconds_since_progress(), 0.005)
             _slice = min(_slice, 0.25)
@@ -695,9 +701,10 @@ class GatewayTurnMixin:
                     raise
                 _hyg_waited = time.monotonic() - attempt.wait_started
                 _idle = fence.seconds_since_progress()
-                # Never hold the TURN past the budget even while the summary streams: proceed on the
-                # uncompressed transcript so the wire never trips a transport idle-timeout.
-                if _hyg_waited >= hs.max_turn_hold_seconds:
+                if attempt.require_exclusive_completion and _hyg_waited < hs.total_ceiling_seconds:
+                    continue
+                # Never hold an ordinary compressor past the availability budget even while it streams.
+                if not attempt.require_exclusive_completion and _hyg_waited >= hs.max_turn_hold_seconds:
                     logger.info(
                         "Session hygiene compression for session %s exceeded the turn-hold "
                         "budget (%.1fs >= %.1fs) — abandoning inline wait, proceeding "
@@ -1152,6 +1159,14 @@ class GatewayTurnMixin:
             # Never finalize on close() — that would end the live gateway session row.
             _hyg_agent._end_session_on_close = False
             _hyg_agent._print_fn = lambda *a, **kw: None
+            # Hygiene calls _compress_context directly, bypassing the normal
+            # turn preflight. Restore the authenticated native note from its
+            # canonical rows before that preflight can inspect the boundary.
+            if bool(getattr(_hyg_agent, "native_incremental_handoff_enabled", False)):
+                from agent.native_incremental_handoff import restore_native_incremental_note
+                restore_native_incremental_note(_hyg_agent, _hyg_msgs)
+            from gateway.run import _hygiene_requires_exclusive_completion
+            attempt.require_exclusive_completion = _hygiene_requires_exclusive_completion(_hyg_agent)
 
             loop = asyncio.get_running_loop()
             _hyg_commit_fence = CompressionCommitFence(total_ceiling_seconds=hs.total_ceiling_seconds)
@@ -1266,7 +1281,8 @@ class GatewayTurnMixin:
                 turn_sidecar_notes.append(_intro_note)
 
         # One-time prompt if no home channel is set (webhooks deliver to configured targets instead).
-        if not source.platform or source.platform in (Platform.LOCAL, Platform.WEBHOOK):
+        if (not source.platform or source.platform in (Platform.LOCAL, Platform.WEBHOOK)
+                or str(getattr(source, "chat_type", "")).lower() not in {"dm", "private"}):
             return
         platform_name = source.platform.value
         env_key = _home_target_env_var(platform_name)
@@ -1864,7 +1880,12 @@ class GatewayTurnMixin:
         # An unreadable store is not an empty conversation: stop before the agent invents continuity
         # from []. Restore task-local context here (before the broad cleanup finally).
         try:
-            history = await self.async_session_store.load_transcript(session_entry.session_id)
+            # Native note authentication is against canonical stored rows.  Do
+            # not merge a resumed user/user boundary while loading it: the
+            # final request projection repairs that disposable provider input.
+            history = await self.async_session_store.load_transcript(
+                session_entry.session_id, repair_alternation=False,
+            )
             history = await self._hmwa_run_session_hygiene(
                 event, source, session_entry, session_key, history, _quick_key, run_generation,
             )
@@ -3519,6 +3540,14 @@ class GatewayTurnMixin:
             else:
                 await self._await_stream_task(stream_task)
 
+        # Fallback commentary bypasses the stream consumer. Settle those sends before
+        # releasing the turn or snapshotting IDs for post-delivery cleanup.
+        if turn_ctx._direct_commentary_futures:
+            await asyncio.gather(
+                *(asyncio.wrap_future(future) for future in turn_ctx._direct_commentary_futures),
+                return_exceptions=True,
+            )
+
         # Abort + bounded wait for streaming TTS: covers paths where normal finalisation was skipped.
         _stts_finally = turn_ctx.streaming_tts_consumer_holder[0]
         # See #60671.
@@ -3664,7 +3693,16 @@ class GatewayTurnMixin:
             and hasattr(_cleanup_adapter, "register_post_delivery_callback")
         ):
             return
-        _ids_snapshot = list(_cleanup_msg_ids)
+        # An interim message can itself be the final answer.  Keep it, rather than deleting the
+        # only delivered answer after normal final-send suppression.
+        _final_text = str(response.get("final_response") or "").strip()
+        _commentary_ids_to_keep = {
+            message_id for message_id, text in turn_ctx._commentary_messages
+            if _final_text and str(text).strip() == _final_text
+        }
+        _ids_snapshot = [message_id for message_id in _cleanup_msg_ids if message_id not in _commentary_ids_to_keep]
+        if not _ids_snapshot:
+            return
         _chat_id_snapshot = turn_ctx.source.chat_id
         _loop_snapshot = asyncio.get_running_loop()
 

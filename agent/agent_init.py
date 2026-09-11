@@ -1452,6 +1452,18 @@ def _parse_compression_config(agent, _agent_cfg) -> CompressionSettings:
         checkpoint_required, getattr(agent, "api_mode", None)
     )
     app_server_auto, responses_native, compact_threshold = _compression_codex_settings(cfg)
+    native_incremental_handoff_enabled = is_truthy_value(
+        cfg.get("native_incremental_handoff", False)
+    )
+    native_incremental_handoff_model = str(
+        cfg.get("native_incremental_model", "gpt-5.6-luna") or ""
+    ).strip().lower()
+    try:
+        native_incremental_compact_threshold = int(
+            cfg.get("native_incremental_compact_threshold", 128000)
+        )
+    except (TypeError, ValueError):
+        native_incremental_compact_threshold = 0
     # Opt-in idle compaction: compact up front when a session resumes after this many
     # seconds idle (0 = disabled). Consumed by build_turn_context().
     idle_compact_after_seconds = max(0, int(cfg.get("idle_compact_after_seconds", 0)))
@@ -1501,6 +1513,9 @@ def _parse_compression_config(agent, _agent_cfg) -> CompressionSettings:
         codex_app_server_auto=app_server_auto,
         codex_responses_native=responses_native,
         codex_responses_compact_threshold=compact_threshold,
+        native_incremental_handoff_enabled=native_incremental_handoff_enabled,
+        native_incremental_handoff_model=native_incremental_handoff_model,
+        native_incremental_compact_threshold=native_incremental_compact_threshold,
         idle_compact_after_seconds=idle_compact_after_seconds,
     )
 
@@ -1880,10 +1895,17 @@ def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_c
     agent.codex_app_server_auto_compaction = cs.codex_app_server_auto
     agent.codex_responses_native_compaction = cs.codex_responses_native
     agent.codex_responses_compact_threshold = cs.codex_responses_compact_threshold
+    agent.native_incremental_handoff_enabled = cs.native_incremental_handoff_enabled
+    agent.native_incremental_handoff_model = cs.native_incremental_handoff_model
+    agent.native_incremental_compact_threshold = cs.native_incremental_compact_threshold
+    agent._native_incremental_handoff_note = None
+    agent._native_incremental_no_progress_fingerprint = None
+    agent._native_compaction_attempt = None
     from agent.native_compaction import resolve_native_compaction_capabilities
     agent.runtime_capabilities = resolve_native_compaction_capabilities(
         model=agent.model, base_url=agent.base_url, provider=agent.provider,
         is_codex_backend=(agent.provider or "").strip().lower() == "openai-codex",
+        native_incremental_enabled=cs.native_incremental_handoff_enabled,
     )
     agent.max_compression_attempts = cs.max_attempts
     agent.compression_idle_compact_after_seconds = cs.idle_compact_after_seconds

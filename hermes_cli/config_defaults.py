@@ -620,6 +620,11 @@ DEFAULT_CONFIG = {
         # Absolute server compaction trigger (input tokens). None follows the local trigger with a
         # safety margin; explicit values only clamp downward so the server goes first.
         "codex_responses_compact_threshold": None,
+        # Opt-in authenticated incremental checkpoint route; its server-side
+        # operation threshold is separate from the ordinary context trigger.
+        "native_incremental_handoff": False,
+        "native_incremental_model": "gpt-5.6-luna",
+        "native_incremental_compact_threshold": 128000,
         # in_place: compaction rewrites the message list and system prompt WITHOUT rotating the
         # session id (no parent_session_id chain, no `name #N` renumbering), avoiding the
         # session-rotation bug cluster. Pre-compaction turns are soft-archived under the same id

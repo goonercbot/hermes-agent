@@ -1,0 +1,8 @@
+{
+  "source_repository": "agentic-improvements",
+  "source_base": "a52e313f54d8a02763d2ff2ed0ad78298d9efb98",
+  "source_staged_tree": "aa96c897862b9885259db0d54094cd4a26af4605",
+  "source_relative_path": "plugins/fleet-task-router/__init__.py",
+  "sha256": "f0ac88e7127ab3bde148ced000866b935ed639279a9ba82cb6c57d98e4e7ac78",
+  "purpose": "Test-only byte-exact product-source snapshot; never installed as a runtime plugin."
+}

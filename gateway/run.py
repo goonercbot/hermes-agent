@@ -1161,8 +1161,19 @@ def _build_gateway_agent_history(
     agent_history: List[Dict[str, Any]] = []
     observed_group_context: List[str] = []
     separate_observed_context = _uses_telegram_observed_group_context(channel_prompt)
+    # A native checkpoint seals its carrier/handoff/tail bytes. Generic replay
+    # normalizers must not rewrite that authenticated span before the native
+    # adapter receives it.
+    from agent.native_compaction import native_compaction_protected_message_indices
+    protected_history_indices = native_compaction_protected_message_indices(history or [])
 
-    for msg in history or []:
+    for history_index, msg in enumerate(history or []):
+        if history_index in protected_history_indices:
+            agent_history.append({
+                key: value for key, value in msg.items()
+                if key not in {"timestamp", "observed"}
+            })
+            continue
         role = msg.get("role")
         # session_meta rows are transcript logging, not LLM input; the agent rebuilds its own system prompt.
         if not role or role in {"session_meta", "system"}:
@@ -1212,18 +1223,22 @@ def _build_gateway_agent_history(
                 entry.pop("api_content", None)  # prefix rewrite: the sidecar no longer matches
             agent_history.append(entry)
 
-    # Strip interrupted tool-call tails so the LLM doesn't re-execute tools killed mid-flight.
-    agent_history = strip_interrupted_tool_tails(agent_history)
+    def _clean_replay_segment(segment: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        cleaned = strip_interrupted_tool_tails(segment)
+        cleaned = strip_dangling_tool_call_tail(cleaned)
+        return strip_stale_dangerous_confirmations(cleaned, now=time.time())
 
-    # Strip a dangling assistant(tool_calls) tail (SIGKILL-mid-tool-call); else the model re-issues it forever.
-    # Strip a dangling assistant(tool_calls) tail with no tool answers — the signature of a SIGKILL
-    # mid-tool-call (e.g. the tool itself ran `docker restart`/`kill` and took the gateway down before the
-    # result was persisted). Without this the model re-issues the unanswered call on resume and loops the
-    # restart forever (#49201).
-    agent_history = strip_dangling_tool_call_tail(agent_history)
-
-    # Strip expired dangerous-confirmation phrases; replayed, a follow-up could read as a fresh confirmation.
-    agent_history = strip_stale_dangerous_confirmations(agent_history, now=time.time())
+    protected_replay_indices = native_compaction_protected_message_indices(agent_history)
+    if protected_replay_indices:
+        protected_start = min(protected_replay_indices)
+        protected_end = max(protected_replay_indices) + 1
+        agent_history = (
+            _clean_replay_segment(agent_history[:protected_start])
+            + agent_history[protected_start:protected_end]
+            + _clean_replay_segment(agent_history[protected_end:])
+        )
+    else:
+        agent_history = _clean_replay_segment(agent_history)
 
     observed_context = "\n".join(observed_group_context).strip() or None
     return agent_history, observed_context
@@ -1581,6 +1596,22 @@ class SecondaryPortBindingConfigError(MultiplexConfigError):
 class HygieneTurnHoldExceeded(Exception):
     """Hygiene-compression turn-hold budget elapsed mid-stream. Availability boundary, not a failure:
     must NOT take the idle-timeout path (AGENT_COMPRESSION_TIMEOUT, "no output", failure cooldown)."""
+
+
+def _hygiene_requires_exclusive_completion(agent: object) -> bool:
+    """Whether a native checkpoint must finish before this user turn starts."""
+    if getattr(agent, "api_mode", "") != "codex_responses":
+        return False
+    from agent.codex_responses_adapter import classify_responses_route
+    from agent.native_compaction import native_continuity_capable
+
+    route = classify_responses_route(agent)
+    return native_continuity_capable(
+        agent,
+        is_codex_backend=route.is_codex_backend,
+        is_xai_responses=route.is_xai_responses,
+        is_github_responses=route.is_github_responses,
+    )
 
 
 def _multiplex_profile_homes(config: object) -> list[tuple[str, "Path"]]:
@@ -3979,6 +4010,7 @@ class GatewayRunner(
         wait_started: float = 0.0
         cleanup_deferred: bool = False
         history: Any = None
+        require_exclusive_completion: bool = False
 
     def _thread_metadata_for_source(
         self, source, reply_to_message_id: Optional[str] = None) -> Optional[Dict[str, Any]]:

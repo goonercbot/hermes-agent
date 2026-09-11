@@ -32,6 +32,7 @@ class ApiRequestBuild:
     api_kwargs: Any
     _original_api_kwargs: Any
     _llm_middleware_trace: Any
+    native_note_refresh_request: Any
 
 
 def _set_extra_header(api_kwargs: Any, key: str, value: str) -> None:
@@ -39,6 +40,47 @@ def _set_extra_header(api_kwargs: Any, key: str, value: str) -> None:
     _xh = dict(api_kwargs.get("extra_headers") or {})
     _xh[key] = value
     api_kwargs["extra_headers"] = _xh
+
+
+def _authenticated_native_continuity_kwargs(agent: Any, messages: Any) -> dict[str, Any]:
+    """Return protected replay kwargs from the authenticated durable source only.
+
+    ``api_messages`` is an expendable wire projection: sanitizers, cache decoration and
+    gateway recovery may rewrite it.  The Responses adapter needs the original sealed
+    carrier source to validate a protected checkpoint, so never derive this from that
+    projection or from a model-visible request payload.
+    """
+    if (
+        getattr(agent, "api_mode", None) != "codex_responses"
+        or not bool(getattr(agent, "native_incremental_handoff_enabled", False))
+    ):
+        return {}
+    from agent.codex_responses_adapter import classify_responses_route
+    from agent.native_incremental_handoff import (
+        _projection_source_for_messages, native_incremental_continuity_capable,
+        native_incremental_note_from_history,
+    )
+    from agent.native_compaction import validate_persisted_native_compaction_history
+
+    route = classify_responses_route(agent)
+    if not native_incremental_continuity_capable(
+        agent, is_codex_backend=route.is_codex_backend,
+        is_xai_responses=route.is_xai_responses,
+        is_github_responses=route.is_github_responses,
+    ):
+        return {}
+    source_messages, _ = _projection_source_for_messages(agent, messages)
+    if source_messages is None:
+        # An unauthenticated replay projection must never gain checkpoint-pruning
+        # authority merely because its mutable wire copy looks plausible.
+        return {}
+    validate_persisted_native_compaction_history(source_messages)
+    if native_incremental_note_from_history(source_messages) is None:
+        return {}
+    return {
+        "native_continuity_replay": True,
+        "native_continuity_source_messages": source_messages,
+    }
 
 
 def _fire_pre_api_request_hook(
@@ -116,10 +158,29 @@ def build_api_request(
             tools_for_api=tools_for_api,
         )
     )
-    if tools_for_api == agent.tools:
+    _native_continuity_kwargs = _authenticated_native_continuity_kwargs(agent, messages)
+    if tools_for_api == agent.tools and not _native_continuity_kwargs:
+        # Keep the ordinary builder call byte-for-byte in the disabled path.
         api_kwargs = agent._build_api_kwargs(api_messages)
+    elif tools_for_api == agent.tools:
+        api_kwargs = agent._build_api_kwargs(api_messages, **_native_continuity_kwargs)
     else:
-        api_kwargs = agent._build_api_kwargs(api_messages, tools_for_api=tools_for_api)
+        api_kwargs = agent._build_api_kwargs(
+            api_messages, tools_for_api=tools_for_api, **_native_continuity_kwargs
+        )
+    _native_note_refresh_request = False
+    if _native_continuity_kwargs and isinstance(api_kwargs.get("input"), list):
+        from agent.native_incremental_handoff import native_incremental_resume_instructions
+
+        if any(isinstance(item, dict) and item.get("type") == "compaction" for item in api_kwargs["input"]):
+            api_kwargs["instructions"] = native_incremental_resume_instructions(
+                api_kwargs.get("instructions", ""),
+                _native_continuity_kwargs["native_continuity_source_messages"],
+            )
+    if agent.api_mode == "codex_responses" and getattr(agent, "native_incremental_handoff_enabled", False):
+        from agent.native_incremental_handoff import prepare_native_note_refresh_request
+
+        _native_note_refresh_request = prepare_native_note_refresh_request(agent, messages, api_kwargs)
     # Surrogate chokepoint: tool descriptions, extra_body and kwargs strings can carry
     # invalid code points (HTTP 400). One walk makes the payload json.dumps()-safe.
     # Outbound-request surrogate chokepoint (#50959): the messages were scrubbed above, but the rest of the
@@ -136,6 +197,10 @@ def build_api_request(
             api_kwargs, allow_stream=False, is_github_responses=agent._is_copilot_url(),
             sanitize_harmony_tokens=agent._is_codex_backend(),
         )
+    if _native_note_refresh_request:
+        # Bind after Responses preflight, before request middleware observes the
+        # payload.  The capability is checked again before raw-response use.
+        _native_note_refresh_request.bind_request(api_kwargs)
     # OpenRouter caching replays identical responses, even empty ones; an empty-response
     # retry must bypass the cache.
     if agent._empty_content_retries > 0 and agent._is_openrouter_url():
@@ -187,5 +252,5 @@ def build_api_request(
             )
     return ApiRequestBuild(
         "fallthrough", api_messages, _moa_prepared_request, tools_for_api, api_kwargs,
-        _original_api_kwargs, _llm_middleware_trace,
+        _original_api_kwargs, _llm_middleware_trace, _native_note_refresh_request,
     )

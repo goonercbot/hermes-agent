@@ -529,6 +529,13 @@ def _stage_turn_user_message(
 
 def _hydrate_from_history(agent: Any, conversation_history: Optional[List[Any]]) -> None:
     """Hydrate process-local state from persisted history on the first resumed turn."""
+    if bool(getattr(agent, "native_incremental_handoff_enabled", False)):
+        try:
+            from agent.native_incremental_handoff import restore_native_incremental_note
+            restore_native_incremental_note(agent, conversation_history or [])
+        except Exception:
+            logger.warning("native incremental continuity-note restore failed closed", exc_info=True)
+            agent._native_incremental_handoff_note = None
     if not conversation_history:
         return
     if not agent._todo_store.has_items():
@@ -734,6 +741,28 @@ def _stamp_api_content_sidecar(
     if _api_content is None or _api_content == _turn_user_msg.get("content"):
         return
     _turn_user_msg["api_content"] = _api_content
+    _attempt = getattr(agent, "_native_compaction_attempt", None)
+    _db = getattr(agent, "_session_db", None)
+    if preflight_compressed and _db is not None and _attempt is not None:
+        from agent.native_compaction import NativeCompactionAttempt, bind_native_compaction_tail
+
+        if isinstance(_attempt, NativeCompactionAttempt):
+            old_metadata = dict(_attempt.metadata)
+            try:
+                bind_native_compaction_tail(agent, messages)
+                _db.set_in_place_native_compaction_api_content(
+                    agent.session_id,
+                    user_content=_turn_user_msg.get("content"), api_content=_api_content,
+                    identity=_attempt.identity,
+                    encrypted_content=_attempt.carrier["codex_reasoning_items"][0]["encrypted_content"],
+                    old_metadata=old_metadata, new_metadata=dict(_attempt.metadata),
+                )
+            except Exception as exc:
+                _attempt.metadata.clear()
+                _attempt.metadata.update(old_metadata)
+                _turn_user_msg.pop("api_content", None)
+                raise ValueError("native compaction api_content atomic rebind failed") from exc
+            return
     # In-place preflight compaction already inserted this turn's user row and the
     # crash persist identity-skips compacted dicts, so backfill the stamp onto the row
     # directly. Rotation mode flushes to the child session later.
@@ -843,6 +872,10 @@ def build_turn_context(
     append_message(messages, user_msg)
     current_turn_user_idx = len(messages) - 1
     agent._persist_user_message_idx = current_turn_user_idx
+    # A native producer capability is single-turn authority only. A prior
+    # interrupted turn must never authorize a later local/user rewrite.
+    agent._native_compaction_attempt = None
+    agent._native_compaction_turn_active = True
 
     agent._user_turn_count += 1
     # Copilot x-initiator: the first API call of this user turn is user-initiated;
@@ -910,6 +943,23 @@ def build_turn_context(
             agent, messages, current_turn_user_idx, ext_prefetch_cache,
             plugin_user_context, preflight_compressed=compaction.compressed,
         )
+
+    # Only the producer capability from this turn may seal its final tail.
+    # Consume it after the atomic sidecar update, before any provider request.
+    from agent.native_compaction import NativeCompactionAttempt, finalize_native_compaction_turn
+
+    finalized_native_attempt = getattr(agent, "_native_compaction_attempt", None)
+    finalize_native_compaction_turn(agent, messages)
+    agent._native_compaction_turn_active = False
+    if (
+        compaction.compressed
+        and bool(getattr(agent, "native_incremental_handoff_enabled", False))
+        and getattr(agent, "_session_db", None) is not None
+        and isinstance(finalized_native_attempt, NativeCompactionAttempt)
+    ):
+        from agent.native_incremental_handoff import authenticate_native_compaction_publication
+
+        authenticate_native_compaction_publication(agent, messages, finalized_native_attempt)
 
     _persist_turn_start(agent, messages, conversation_history, pending_cli_message)
 

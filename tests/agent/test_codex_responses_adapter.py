@@ -573,6 +573,31 @@ def test_preflight_codex_input_items_fails_closed_on_orphaned_output():
         )
 
 
+@pytest.mark.parametrize("shape", ["output-before-call", "duplicate-output"])
+def test_preflight_rejects_unordered_or_repeated_results_without_mutation(shape):
+    from copy import deepcopy
+    call = {"type": "function_call", "call_id": "call_order", "name": "terminal", "arguments": "{}"}
+    output = {"type": "function_call_output", "call_id": "call_order", "output": "retain"}
+    items = [output, call] if shape == "output-before-call" else [call, output, dict(output)]
+    original = deepcopy(items)
+    with pytest.raises(ValueError, match="requires an earlier unanswered call"):
+        _preflight_codex_input_items(items)
+    assert items == original
+
+
+def test_preflight_accepts_parallel_results_in_reverse_completion_order():
+    from copy import deepcopy
+    items = [
+        {"type": "function_call", "call_id": "a", "name": "terminal", "arguments": "{}"},
+        {"type": "function_call", "call_id": "b", "name": "terminal", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "b", "output": "second completed first"},
+        {"type": "function_call_output", "call_id": "a", "output": "first completed second"},
+    ]
+    original = deepcopy(items)
+    assert _preflight_codex_input_items(items) == original
+    assert items == original
+
+
 def test_preflight_codex_api_kwargs_leaves_tool_definition_names_alone():
     """Live tool schema names must NOT be rewritten — they have to match the
     dispatch registry exactly. Sanitization is replay-only."""

@@ -1104,30 +1104,36 @@ def test_codex_preflight_defangs_harmony_tokens_before_and_after_middleware(monk
     assert "<｜start｜>" in captured["instructions"]
 
 
-def test_codex_final_preflight_blocks_middleware_orphaned_output(monkeypatch):
+@pytest.mark.parametrize("shape", ["orphan", "output-before-call", "duplicate-output"])
+@pytest.mark.parametrize("layer", ["request", "execution"])
+def test_codex_final_preflight_blocks_middleware_orphaned_output(monkeypatch, shape, layer):
     """The final native wire check blocks a pair split by request middleware."""
     agent = _build_agent(monkeypatch)
     setattr(agent, "_disable_streaming", True)
     captured = {}
 
-    def _request_middleware(request, **_context):
+    def _malformed(request):
         replacement = dict(request)
-        replacement["input"] = [
-            {
-                "type": "function_call_output",
-                "call_id": "call_orphaned_by_middleware",
-                "output": "must not reach the Responses endpoint",
-            }
-        ]
+        output = {"type": "function_call_output", "call_id": "call_orphaned_by_middleware",
+                  "output": "must not reach the Responses endpoint"}
+        call = {"type": "function_call", "call_id": output["call_id"],
+                "name": "terminal", "arguments": "{}"}
+        replacement["input"] = {
+            "orphan": [output], "output-before-call": [output, call],
+            "duplicate-output": [call, output, dict(output)],
+        }[shape]
+        return replacement
+
+    def _request_middleware(request, **_context):
         return SimpleNamespace(
-            payload=replacement,
+            payload=_malformed(request) if layer == "request" else request,
             original_payload=request,
             changed=True,
             trace=[],
         )
 
     def _execution_middleware(request, next_call, **_context):
-        return next_call(request)
+        return next_call(_malformed(request) if layer == "execution" else request)
 
     def _capture_api_call(api_kwargs):
         captured.update(api_kwargs)

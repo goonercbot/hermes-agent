@@ -3,6 +3,7 @@
 These tests deliberately target the request-loop seam rather than re-testing native-note
 cryptographic/durable helpers owned by their respective modules.
 """
+import logging
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -109,7 +110,7 @@ def test_successful_maintenance_bypasses_normal_tool_round_and_rebuilds_next_req
 
 
 @pytest.mark.parametrize("failure", ["malformed", "blocked", "interrupted"])
-def test_maintenance_failure_returns_closed_partial_result(monkeypatch, failure):
+def test_maintenance_failure_returns_closed_partial_result(monkeypatch, failure, caplog):
     from agent import conversation_loop
     import agent.native_note_refresh as native_note_refresh
 
@@ -133,9 +134,11 @@ def test_maintenance_failure_returns_closed_partial_result(monkeypatch, failure)
     monkeypatch.setattr(native_note_refresh, "account_failed_native_note_refresh", lambda *_a: None)
     monkeypatch.setattr(native_note_refresh, "close_native_note_refresh", lambda *_a: None)
 
-    result = conversation_loop._run_api_retry_loop(agent, cast(Any, state))
+    with caplog.at_level(logging.WARNING, logger="agent.conversation_loop"):
+        result = conversation_loop._run_api_retry_loop(agent, cast(Any, state))
 
     assert result is not None
+    assert f"Native continuity-note refresh failed (session=-): {failure}" in caplog.text
     assert result["failed"] is True
     assert result["error"] == "native_note_refresh_failed"
     assert result["maintenance_failure"] == failure

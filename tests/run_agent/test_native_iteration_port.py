@@ -67,6 +67,57 @@ def test_prepare_iteration_keeps_sealed_source_and_unsealed_tool_pair_with_stale
     assert prepared.messages[-1]["tool_call_id"] == "unsealed-call"
 
 
+def test_prepare_iteration_repairs_resumed_user_tail_without_rewriting_source():
+    """A resumed user/user tail is request-only; canonical native evidence stays exact."""
+    from agent.native_incremental_handoff import (
+        _note_fence,
+        _projection_source_for_messages,
+        bind_native_incremental_replay_projection,
+        restore_native_incremental_note,
+    )
+    from agent.native_note_refresh import close_native_note_refresh, issue_native_note_refresh
+    from agent.turn_iteration_prep import prepare_iteration
+
+    source = _native_checkpoint_with_unsealed_tool_pair()
+    # This user is outside the sealed native carrier.  The next resumed turn
+    # appends another user, which ordinary sequence repair must merge only on
+    # the disposable outgoing projection.
+    source.append({"role": "user", "content": "last durable user"})
+    agent = _iteration_agent()
+    agent.session_id = "test-session"
+    assert bind_native_incremental_replay_projection(
+        agent, source_messages=source, replay_messages=source
+    )
+    assert restore_native_incremental_note(agent, source) is not None
+    history = deepcopy(source)
+    history.append({"role": "user", "content": "new resumed user"})
+    canonical = deepcopy(history)
+
+    prepared = prepare_iteration(agent, messages=history, api_call_count=1)
+
+    assert history == canonical
+    assert len(prepared.messages) == len(canonical) - 1
+    assert prepared.messages[-1]["content"] == "last durable user\n\nnew resumed user"
+    authenticated_source, cursor = _projection_source_for_messages(agent, prepared.messages)
+    assert authenticated_source == canonical
+    assert cursor == len(prepared.messages)
+
+    # The maintenance capability receives the canonical, unmerged source — not
+    # the repair projection the provider sees.
+    agent._current_api_request_id = "resume:api:1"
+    capability = issue_native_note_refresh(agent, prepared.messages)
+    try:
+        assert capability.canonical_source_fence == _note_fence(canonical)
+    finally:
+        close_native_note_refresh(agent)
+
+    # The binding is exact: a caller cannot tamper with the repaired wire view
+    # and retain canonical-note authority.
+    tampered = deepcopy(prepared.messages)
+    tampered[-1]["content"] = "forged resumed user"
+    assert _projection_source_for_messages(agent, tampered) == (None, None)
+
+
 def test_prepare_iteration_persists_native_mid_api_steer_as_append_only_user_event():
     """Native steering never rewrites the already-durable tool result."""
     from agent.turn_iteration_prep import prepare_iteration

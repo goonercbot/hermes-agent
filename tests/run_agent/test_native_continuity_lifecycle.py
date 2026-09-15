@@ -70,7 +70,7 @@ def test_restart_recovers_only_legacy_projection_pair_without_history_loss():
     assert history == before  # the failed pair and every user/task/tool row remain auditable
 
 
-@pytest.mark.parametrize("tamper", ["payload_field", "malformed_payload", "call_arguments"])
+@pytest.mark.parametrize("tamper", ["payload_field", "malformed_payload", "call_arguments", "[]", "null", "0", "true", "\"text\""])
 def test_terminal_malformed_or_tampered_note_fails_closed(tamper):
     history = _legacy_poisoned_history()
     if tamper == "payload_field":
@@ -79,6 +79,8 @@ def test_terminal_malformed_or_tampered_note_fails_closed(tamper):
         history[-1]["content"] = json.dumps(payload)
     elif tamper == "malformed_payload":
         history[-1]["content"] = "not-json"
+    elif tamper in {"[]", "null", "0", "true", "\"text\""}:
+        history[-1]["content"] = tamper
     else:
         history[-2]["tool_calls"][0]["function"]["arguments"] = json.dumps({**ARGS, "next_action": "tampered"})
 
@@ -133,3 +135,36 @@ def test_projection_binding_keeps_valid_source_for_fresh_reload():
     agent = NS(session_id=SID)
     assert bind_native_incremental_replay_projection(agent, source_messages=history, replay_messages=history)
     assert restore_native_incremental_note(agent, history) is not None
+
+
+@pytest.mark.parametrize("event_pending", [True, False])
+def test_queued_followup_survives_failed_canonical_reload(event_pending):
+    import asyncio
+    from gateway.run_turn import GatewayTurnMixin
+
+    queued = []
+    event = NS(text="retained queued correction")
+    pending_store = {"key": event} if event_pending else {}
+    pending_event = pending_store.pop("key", None)  # actual destructive dequeue
+    adapter = NS(_active_sessions={}, _pending_messages=pending_store,
+                 queue_message=lambda *args: queued.append(args))
+
+    def failed_read(*args, **kwargs):
+        raise OSError("isolated canonical read failure")
+
+    ctx = NS(source=NS(chat_id="isolated"), session_id=SID, session_key="key",
+             run_generation=1, _interrupt_depth=0, history=[], _status_thread_metadata=None,
+             agent_holder=[NS(native_incremental_handoff_enabled=True,
+                              _session_db=NS(get_messages_as_conversation=failed_read),
+                              session_id=SID)], result_holder=[None])
+    result = {"interrupted": True, "messages": []}
+    returned = asyncio.run(GatewayTurnMixin._run_agent_queued_followup(
+        NS(_MAX_INTERRUPT_DEPTH=9), ctx, adapter, event.text, pending_event,
+        result, result, None,
+    ))
+    assert returned is result
+    if event_pending:
+        assert adapter._pending_messages["key"] is event
+        assert not queued
+    else:
+        assert queued == [("key", event.text)]

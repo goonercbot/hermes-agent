@@ -561,7 +561,7 @@ def _recover_failed_native_note_refresh_suffix(
 
         payload = json.loads(result_row.get("content", ""))
         note = payload.get("note") if isinstance(payload, dict) else None
-        if payload.get("authenticated_by") != CONTINUITY_NOTE_AUTHENTICATOR or not isinstance(note, dict):
+        if not isinstance(payload, dict) or payload.get("authenticated_by") != CONTINUITY_NOTE_AUTHENTICATOR or not isinstance(note, dict):
             return messages
         prefix = messages[:-2]
         expected = create_native_incremental_note(

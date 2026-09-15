@@ -3476,6 +3476,12 @@ class GatewayTurnMixin:
                         "Queued native follow-up could not reload canonical history; refusing stale replay source",
                         exc_info=True,
                     )
+                    # The outer drain already removed this follow-up. Retain it
+                    # for retry instead of losing input when storage is unavailable.
+                    if adapter and pending_event is not None:
+                        merge_pending_message_event(adapter._pending_messages, session_key, pending_event)
+                    elif adapter and hasattr(adapter, "queue_message"):
+                        adapter.queue_message(session_key, pending)
                     return result
         next_source, next_message, next_session_key = source, pending, session_key
         # message_type is carried into the recursive call so queued voice turns can stream TTS.

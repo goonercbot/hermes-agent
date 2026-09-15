@@ -453,7 +453,8 @@ def _continuity_note_arguments(value: Any) -> Optional[Dict[str, Any]]:
 
 
 def _tool_call_authenticates_note(
-    messages: List[Dict[str, Any]], index: int, tool_call_id: Any, note: Dict[str, Any]
+    messages: List[Dict[str, Any]], index: int, tool_call_id: Any, note: Dict[str, Any],
+    *, minimum_index: int = 0,
 ) -> bool:
     """Bind an authenticated result to its exact direct or deferred model call."""
     if not isinstance(tool_call_id, str) or not tool_call_id:
@@ -466,7 +467,9 @@ def _tool_call_authenticates_note(
     })
     if expected_arguments is None:
         return False
-    for prior in reversed(messages[:index]):
+    if not isinstance(minimum_index, int) or minimum_index < 0 or minimum_index > index:
+        return False
+    for prior in reversed(messages[minimum_index:index]):
         if not isinstance(prior, dict) or prior.get("role") != "assistant":
             continue
         for call in prior.get("tool_calls") or []:
@@ -498,10 +501,14 @@ def _tool_call_authenticates_note(
     return False
 
 
-def _note_from_authenticated_tool_history(messages: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+def _note_from_authenticated_tool_history(
+    messages: List[Dict[str, Any]], *, minimum_index: int = 0,
+) -> Optional[Dict[str, Any]]:
     from tools.continuity_note_tool import CONTINUITY_NOTE_AUTHENTICATOR
 
-    for index in range(len(messages) - 1, -1, -1):
+    if not isinstance(minimum_index, int) or minimum_index < 0 or minimum_index > len(messages):
+        return None
+    for index in range(len(messages) - 1, minimum_index - 1, -1):
         message = messages[index]
         if not isinstance(message, dict) or message.get("role") != "tool":
             continue
@@ -516,7 +523,9 @@ def _note_from_authenticated_tool_history(messages: List[Dict[str, Any]]) -> Opt
         note = payload.get("note")
         if not isinstance(note, dict) or note.get("version") != NATIVE_INCREMENTAL_NOTE_VERSION:
             continue
-        if not _tool_call_authenticates_note(messages, index, message.get("tool_call_id"), note):
+        if not _tool_call_authenticates_note(
+            messages, index, message.get("tool_call_id"), note, minimum_index=minimum_index,
+        ):
             continue
         return deepcopy(note)
     return None
@@ -612,17 +621,14 @@ def native_incremental_note_from_history(messages: List[Dict[str, Any]]) -> Opti
     return _note_from_authenticated_tool_history(messages)
 
 
-def _checkpoint_binds_terminal_maintenance_pair(messages: List[Dict[str, Any]]) -> bool:
-    """Whether the final direct note pair is immutable historical checkpoint tail.
+def _validated_sealed_tail_range(messages: List[Dict[str, Any]]) -> Optional[tuple[int, int]]:
+    """Return the immutable tail's half-open range after validating its checkpoint.
 
-    Validation is deliberately required first: only a v2 checkpoint's exact
-    authenticated tail can supersede older maintenance evidence.  A later pair
-    remains ordinary newest evidence and continues through the strict gate.
+    Direct maintenance evidence in this range belongs to the compacted
+    generation.  The boundary remains authoritative after ordinary rows append,
+    so selection must not depend on whether the final row is still in the tail.
     """
-    if len(messages) < 2:
-        return False
     validate_persisted_native_compaction_history(messages)
-    terminal_start = len(messages) - 2
     for carrier_index, message in enumerate(messages):
         items = message.get("codex_reasoning_items") if isinstance(message, dict) else None
         for checkpoint in items if isinstance(items, list) else []:
@@ -630,8 +636,8 @@ def _checkpoint_binds_terminal_maintenance_pair(messages: List[Dict[str, Any]]) 
             if isinstance(metadata, dict):
                 tail_start = carrier_index + 2
                 tail_end = tail_start + metadata["tail_count"]
-                return tail_start <= terminal_start and len(messages) <= tail_end
-    return False
+                return tail_start, tail_end
+    return None
 
 
 def restore_native_incremental_note(agent: Any, messages: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -644,9 +650,15 @@ def restore_native_incremental_note(agent: Any, messages: List[Dict[str, Any]]) 
     if source_messages is None:
         return None
     try:
-        checkpoint_bound_terminal_pair = _checkpoint_binds_terminal_maintenance_pair(source_messages)
+        sealed_tail = _validated_sealed_tail_range(source_messages)
     except ValueError:
         return None
+    terminal_start = len(source_messages) - 2
+    checkpoint_bound_terminal_pair = bool(
+        sealed_tail is not None
+        and terminal_start >= sealed_tail[0]
+        and len(source_messages) <= sealed_tail[1]
+    )
     recovered_source = source_messages if checkpoint_bound_terminal_pair else _recover_failed_native_note_refresh_suffix(
         getattr(agent, "session_id", None), source_messages
     )
@@ -671,8 +683,10 @@ def restore_native_incremental_note(agent: Any, messages: List[Dict[str, Any]]) 
                 terminal_note = payload.get("note") if isinstance(payload, dict) else None
             except (TypeError, ValueError, json.JSONDecodeError):
                 terminal_note = None
+            minimum_direct_note_index = sealed_tail[1] if sealed_tail is not None else 0
             if not isinstance(terminal_note, dict) or not _tool_call_authenticates_note(
-                source_messages, len(source_messages) - 1, call_id, terminal_note
+                source_messages, len(source_messages) - 1, call_id, terminal_note,
+                minimum_index=minimum_direct_note_index,
             ):
                 return None
     source_messages = recovered_source
@@ -681,10 +695,13 @@ def restore_native_incremental_note(agent: Any, messages: List[Dict[str, Any]]) 
     except ValueError:
         return None
     note = native_incremental_note_from_history(source_messages)
-    # All direct maintenance evidence inside that same sealed tail is historical;
-    # it cannot outrank the checkpoint carrier.  An ordinary note appended after
-    # the boundary remains eligible and is still validated below.
-    tool_note = None if checkpoint_bound_terminal_pair else _note_from_authenticated_tool_history(source_messages)
+    # All direct maintenance evidence inside the validated sealed tail is
+    # historical, even after later ordinary rows append. A new direct note must
+    # have both its call and result after that boundary and remains strict.
+    minimum_direct_note_index = sealed_tail[1] if sealed_tail is not None else 0
+    tool_note = _note_from_authenticated_tool_history(
+        source_messages, minimum_index=minimum_direct_note_index,
+    )
     carrier_end = None
     for index, message in enumerate(source_messages):
         for item in message.get("codex_reasoning_items", []) or []:

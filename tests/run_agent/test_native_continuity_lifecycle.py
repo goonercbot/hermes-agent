@@ -96,6 +96,11 @@ def _synthetic_checkpoint_child_with_historical_pair(*, pair_in_tail):
         source_messages=[{"role": "user", "content": "public original objective"}],
         **ARGS,
     )
+    historical_note = create_native_incremental_note(
+        session_id=SID,
+        source_messages=[{"role": "user", "content": "older public objective"}],
+        **ARGS,
+    )
     handoff = "NATIVE_INCREMENTAL_NOTE\n" + json.dumps(
         carried_note, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     )
@@ -114,7 +119,7 @@ def _synthetic_checkpoint_child_with_historical_pair(*, pair_in_tail):
         "tool_call_id": "historical-carried-note",
         "content": json.dumps({
             "authenticated_by": "hermes.continuity_note.v1",
-            "note": carried_note,
+            "note": historical_note,
         }),
     }
     stale_call = {
@@ -171,6 +176,48 @@ def test_checkpoint_bound_historical_maintenance_pair_restores_carrier_without_m
     assert restored is not None
     assert restored["objective"] == ARGS["objective"]
     assert restored["source_cursor"] == 2
+    assert history == before
+
+
+@pytest.mark.parametrize("ordinary_row", [
+    {"role": "user", "content": "Continue the retained task."},
+    {"role": "assistant", "content": "ordinary resumed completion"},
+])
+def test_checkpoint_boundary_excludes_historical_pairs_after_ordinary_append(ordinary_row):
+    """The sealed boundary survives the first resumed user or assistant row."""
+    history = _synthetic_checkpoint_child_with_historical_pair(pair_in_tail=True)
+    history.append(ordinary_row)
+    before = deepcopy(history)
+
+    restored = restore_native_incremental_note(NS(session_id=SID), history)
+
+    assert restored is not None
+    assert restored["source_cursor"] == 2
+    assert history == before
+
+
+def test_new_valid_direct_note_after_sealed_boundary_supersedes_carrier():
+    history = _synthetic_checkpoint_child_with_historical_pair(pair_in_tail=True)
+    history.append({"role": "user", "content": "new correction after restart"})
+    refreshed = {**ARGS, "objective": "New post-checkpoint objective"}
+    history.append({"role": "assistant", "content": "", "tool_calls": [{
+        "id": "post-boundary-note", "type": "function",
+        "function": {"name": "continuity_note", "arguments": json.dumps(refreshed)},
+    }]})
+    result = record_native_incremental_note_from_tool_call(
+        NS(session_id=SID, native_incremental_handoff_enabled=True), refreshed, history,
+    )
+    history.append({
+        "role": "tool", "name": "continuity_note", "tool_call_id": "post-boundary-note",
+        "content": result,
+    })
+    before = deepcopy(history)
+
+    restored = restore_native_incremental_note(NS(session_id=SID), history)
+
+    assert restored is not None
+    assert restored["objective"] == refreshed["objective"]
+    assert restored["source_cursor"] == len(history) - 1
     assert history == before
 
 

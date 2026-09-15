@@ -612,6 +612,28 @@ def native_incremental_note_from_history(messages: List[Dict[str, Any]]) -> Opti
     return _note_from_authenticated_tool_history(messages)
 
 
+def _checkpoint_binds_terminal_maintenance_pair(messages: List[Dict[str, Any]]) -> bool:
+    """Whether the final direct note pair is immutable historical checkpoint tail.
+
+    Validation is deliberately required first: only a v2 checkpoint's exact
+    authenticated tail can supersede older maintenance evidence.  A later pair
+    remains ordinary newest evidence and continues through the strict gate.
+    """
+    if len(messages) < 2:
+        return False
+    validate_persisted_native_compaction_history(messages)
+    terminal_start = len(messages) - 2
+    for carrier_index, message in enumerate(messages):
+        items = message.get("codex_reasoning_items") if isinstance(message, dict) else None
+        for checkpoint in items if isinstance(items, list) else []:
+            metadata = checkpoint.get(NATIVE_COMPACTION_METADATA_KEY) if isinstance(checkpoint, dict) else None
+            if isinstance(metadata, dict):
+                tail_start = carrier_index + 2
+                tail_end = tail_start + metadata["tail_count"]
+                return tail_start <= terminal_start and len(messages) <= tail_end
+    return False
+
+
 def restore_native_incremental_note(agent: Any, messages: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """Restore the recorded cursor; only a sealed checkpoint permits rebinding."""
     from types import SimpleNamespace
@@ -621,14 +643,18 @@ def restore_native_incremental_note(agent: Any, messages: List[Dict[str, Any]]) 
     source_messages, _replay_base_count = _projection_source_for_messages(agent, messages)
     if source_messages is None:
         return None
-    recovered_source = _recover_failed_native_note_refresh_suffix(
+    try:
+        checkpoint_bound_terminal_pair = _checkpoint_binds_terminal_maintenance_pair(source_messages)
+    except ValueError:
+        return None
+    recovered_source = source_messages if checkpoint_bound_terminal_pair else _recover_failed_native_note_refresh_suffix(
         getattr(agent, "session_id", None), source_messages
     )
     # A terminal direct maintenance pair is the newest claimed continuity
-    # evidence. If it is malformed or its tool result no longer authenticates
-    # that exact call, do not silently fall back to an older note. The narrowly
-    # identified legacy projection failure above is the sole exception.
-    if recovered_source is source_messages and len(source_messages) >= 2:
+    # evidence unless it was preserved inside a validated checkpoint tail. A
+    # checkpoint-bound pair is historical maintenance evidence; its carrier is
+    # the authenticated continuity authority for this compacted generation.
+    if not checkpoint_bound_terminal_pair and recovered_source is source_messages and len(source_messages) >= 2:
         call_row, result_row = source_messages[-2:]
         calls = call_row.get("tool_calls") if isinstance(call_row, dict) else None
         call = calls[0] if isinstance(calls, list) and len(calls) == 1 and isinstance(calls[0], dict) else None
@@ -655,7 +681,10 @@ def restore_native_incremental_note(agent: Any, messages: List[Dict[str, Any]]) 
     except ValueError:
         return None
     note = native_incremental_note_from_history(source_messages)
-    tool_note = _note_from_authenticated_tool_history(source_messages)
+    # All direct maintenance evidence inside that same sealed tail is historical;
+    # it cannot outrank the checkpoint carrier.  An ordinary note appended after
+    # the boundary remains eligible and is still validated below.
+    tool_note = None if checkpoint_bound_terminal_pair else _note_from_authenticated_tool_history(source_messages)
     carrier_end = None
     for index, message in enumerate(source_messages):
         for item in message.get("codex_reasoning_items", []) or []:

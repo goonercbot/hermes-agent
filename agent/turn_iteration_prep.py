@@ -148,15 +148,35 @@ def prepare_iteration(agent: Any,*, messages: Any, api_call_count: Any) -> Itera
     # cursor can separate a trailing assistant tool call from its tool result.
     from agent.native_compaction import validate_persisted_native_compaction_history
     native_boundary_request = bool(validate_persisted_native_compaction_history(messages))
+    # Before the first checkpoint exists, the native route still needs the raw
+    # durable rows to mint its first authenticated note.  Treat its request
+    # repairs as an explicitly bound disposable projection too; otherwise a
+    # user/user merge or sanitizer rewrite becomes the later note source.
+    native_projection_request = native_boundary_request
+    if not native_projection_request:
+        from agent.codex_responses_adapter import classify_responses_route
+        from agent.native_incremental_handoff import native_incremental_continuity_capable
+
+        route = classify_responses_route(agent)
+        native_projection_request = native_incremental_continuity_capable(
+            agent,
+            is_codex_backend=route.is_codex_backend,
+            is_xai_responses=route.is_xai_responses,
+            is_github_responses=route.is_github_responses,
+        )
     native_request_source = None
-    if native_boundary_request:
-        from agent.native_incremental_handoff import _projection_source_for_messages
+    native_request_replay_fence = None
+    if native_projection_request:
+        from agent.native_incremental_handoff import _projection_source_for_messages, _note_fence
 
         # Capture canonical evidence before repair.  A resumed gateway replay
         # may be a cleaned projection and this turn's user row may already be
         # durable, so the authenticated source can have a different shape from
         # the outgoing repaired request.
         native_request_source, _ = _projection_source_for_messages(agent, messages)
+        if native_request_source is None:
+            raise ValueError("native request source unauthenticated")
+        native_request_replay_fence = _note_fence(messages)
         messages = deepcopy(messages)
     # Per-agent validation cursor skips re-parsing tool_call args already validated.
     # Identity-keyed; a rewritten list breaks the prefix match and forces a re-scan.
@@ -237,6 +257,25 @@ def prepare_iteration(agent: Any,*, messages: Any, api_call_count: Any) -> Itera
                     "(session=%s)", agent.session_id or "-"
                 )
                 raise ValueError("native request sequence repair source unauthenticated")
+    elif native_projection_request:
+        from agent.agent_runtime_helpers import repair_message_sequence
+        from agent.native_incremental_handoff import bind_native_incremental_request_projection, _note_fence
+
+        # No protected checkpoint exists yet, so every request-side repair is
+        # applied only to the copy captured above and then fenced to its raw
+        # durable source.  This gives the first maintenance capability the
+        # canonical pre-repair rows without granting a tampered replay a reseal.
+        repaired_seq = repair_message_sequence(agent, messages)
+        # An unchanged next iteration must retain the existing prefix mapping:
+        # advancing it across a freshly recorded note would make its cursor
+        # appear ambiguously inside a length-changing repaired prefix.
+        if _note_fence(messages) != native_request_replay_fence:
+            if native_request_source is None or not bind_native_incremental_request_projection(
+                agent,
+                source_messages=native_request_source,
+                replay_messages=messages,
+            ):
+                raise ValueError("native request projection source unauthenticated")
     else:
         from agent.agent_runtime_helpers import repair_message_sequence_with_cursor
 

@@ -3454,6 +3454,35 @@ class GatewayTurnMixin:
             await self._run_agent_deliver_first_response(turn_ctx, adapter, response, result, stream_task)
 
         updated_history = result.get("messages", history)
+        # A completed turn returns its provider-facing replay, not necessarily
+        # the byte-exact persistence source. Re-entering a queued follow-up
+        # with that replay makes the next native note authenticate a projection
+        # while publication reads SQLite. Prefer the durable source for native
+        # continuity; ordinary sessions retain intentionally unpersisted paths.
+        active_agent = turn_ctx.agent_holder[0] if turn_ctx.agent_holder else None
+        if bool(getattr(active_agent, "native_incremental_handoff_enabled", False)):
+            db = getattr(active_agent, "_session_db", None)
+            if db is not None:
+                try:
+                    canonical = db.get_messages_as_conversation(
+                        getattr(active_agent, "session_id", session_id), repair_alternation=False,
+                    )
+                    from agent.native_compaction import validate_persisted_native_compaction_history
+
+                    validate_persisted_native_compaction_history(canonical)
+                    updated_history = canonical
+                except Exception:
+                    logger.warning(
+                        "Queued native follow-up could not reload canonical history; refusing stale replay source",
+                        exc_info=True,
+                    )
+                    # The outer drain already removed this follow-up. Retain it
+                    # for retry instead of losing input when storage is unavailable.
+                    if adapter and pending_event is not None:
+                        merge_pending_message_event(adapter._pending_messages, session_key, pending_event)
+                    elif adapter and hasattr(adapter, "queue_message"):
+                        adapter.queue_message(session_key, pending)
+                    return result
         next_source, next_message, next_session_key = source, pending, session_key
         # message_type is carried into the recursive call so queued voice turns can stream TTS.
         next_message_id = next_channel_prompt = next_message_type = None

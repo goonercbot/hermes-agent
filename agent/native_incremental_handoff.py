@@ -262,7 +262,11 @@ def _projection_cursor_for_source_cursor(
     """Map a source cursor through a bounded host replay projection."""
     if source_cursor < 0:
         return None
-    if source_cursor <= source_base_count:
+    if source_cursor == source_base_count:
+        # The authenticated end of a repaired prefix has an exact mapping,
+        # even when deterministic repair changed the number of prefix rows.
+        return replay_base_count
+    if source_cursor < source_base_count:
         # Existing notes can be replayed only when cleanup preserved row
         # positions.  A deletion before a note is ambiguous; fail closed.
         return source_cursor if source_base_count == replay_base_count else None
@@ -384,7 +388,11 @@ def _staged_note(agent: Any, messages: List[Dict[str, Any]]) -> Optional[Dict[st
     else:
         projection_cursor = _projection_cursor_for_source_cursor(
             cursor,
-            source_base_count=len(getattr(agent, "_native_incremental_replay_projection")["source"]),
+            # The authenticated resolver may have selected a request-only
+            # projection rather than a gateway replay. Its appended suffix is
+            # shared verbatim by source and replay, so subtract that suffix to
+            # recover the selected source-prefix length without another lookup.
+            source_base_count=len(source_messages) - (len(messages) - replay_base_count),
             replay_base_count=replay_base_count,
         )
     if projection_cursor is None or projection_cursor > len(messages):
@@ -445,7 +453,8 @@ def _continuity_note_arguments(value: Any) -> Optional[Dict[str, Any]]:
 
 
 def _tool_call_authenticates_note(
-    messages: List[Dict[str, Any]], index: int, tool_call_id: Any, note: Dict[str, Any]
+    messages: List[Dict[str, Any]], index: int, tool_call_id: Any, note: Dict[str, Any],
+    *, minimum_index: int = 0,
 ) -> bool:
     """Bind an authenticated result to its exact direct or deferred model call."""
     if not isinstance(tool_call_id, str) or not tool_call_id:
@@ -458,7 +467,9 @@ def _tool_call_authenticates_note(
     })
     if expected_arguments is None:
         return False
-    for prior in reversed(messages[:index]):
+    if not isinstance(minimum_index, int) or minimum_index < 0 or minimum_index > index:
+        return False
+    for prior in reversed(messages[minimum_index:index]):
         if not isinstance(prior, dict) or prior.get("role") != "assistant":
             continue
         for call in prior.get("tool_calls") or []:
@@ -490,10 +501,14 @@ def _tool_call_authenticates_note(
     return False
 
 
-def _note_from_authenticated_tool_history(messages: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+def _note_from_authenticated_tool_history(
+    messages: List[Dict[str, Any]], *, minimum_index: int = 0,
+) -> Optional[Dict[str, Any]]:
     from tools.continuity_note_tool import CONTINUITY_NOTE_AUTHENTICATOR
 
-    for index in range(len(messages) - 1, -1, -1):
+    if not isinstance(minimum_index, int) or minimum_index < 0 or minimum_index > len(messages):
+        return None
+    for index in range(len(messages) - 1, minimum_index - 1, -1):
         message = messages[index]
         if not isinstance(message, dict) or message.get("role") != "tool":
             continue
@@ -508,10 +523,68 @@ def _note_from_authenticated_tool_history(messages: List[Dict[str, Any]]) -> Opt
         note = payload.get("note")
         if not isinstance(note, dict) or note.get("version") != NATIVE_INCREMENTAL_NOTE_VERSION:
             continue
-        if not _tool_call_authenticates_note(messages, index, message.get("tool_call_id"), note):
+        if not _tool_call_authenticates_note(
+            messages, index, message.get("tool_call_id"), note, minimum_index=minimum_index,
+        ):
             continue
         return deepcopy(note)
     return None
+
+
+def _recover_failed_native_note_refresh_suffix(
+    session_id: Any, messages: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """Hide one known pre-publication maintenance failure from restart recovery.
+
+    Older builds could append a direct ``continuity_note`` pair before proving
+    that the request projection and SQLite transcript had the same source
+    fence. The pair remains durable for audit; this only prevents it from
+    eclipsing an earlier authenticated note. This is deliberately narrower
+    than accepting an arbitrary older note: the terminal pair must be direct,
+    host-authenticated, and differ from its canonical form only by its fence.
+    """
+    if not isinstance(messages, list) or len(messages) < 2:
+        return messages
+    call_row, result_row = messages[-2:]
+    if not isinstance(call_row, dict) or not isinstance(result_row, dict):
+        return messages
+    if call_row.get("role") != "assistant" or result_row.get("role") != "tool":
+        return messages
+    calls = call_row.get("tool_calls")
+    if not isinstance(calls, list) or len(calls) != 1 or not isinstance(calls[0], dict):
+        return messages
+    call = calls[0]
+    function = call.get("function") if isinstance(call.get("function"), dict) else None
+    if (
+        not isinstance(function, dict)
+        or function.get("name") != "continuity_note"
+        or result_row.get("tool_call_id") != call.get("id")
+        or (result_row.get("name") or result_row.get("tool_name")) != "continuity_note"
+    ):
+        return messages
+    arguments = _continuity_note_arguments(function.get("arguments"))
+    if arguments is None:
+        return messages
+    try:
+        from tools.continuity_note_tool import CONTINUITY_NOTE_AUTHENTICATOR
+
+        payload = json.loads(result_row.get("content", ""))
+        note = payload.get("note") if isinstance(payload, dict) else None
+        if not isinstance(payload, dict) or payload.get("authenticated_by") != CONTINUITY_NOTE_AUTHENTICATOR or not isinstance(note, dict):
+            return messages
+        prefix = messages[:-2]
+        expected = create_native_incremental_note(
+            session_id=session_id, source_messages=prefix, **arguments,
+        )
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return messages
+    if (
+        note.get("source_cursor") != len(prefix)
+        or note.get("source_prefix_fence") == expected["source_prefix_fence"]
+        or {**expected, "source_prefix_fence": note.get("source_prefix_fence")} != note
+    ):
+        return messages
+    return deepcopy(prefix)
 
 
 def native_incremental_note_from_history(messages: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -548,6 +621,25 @@ def native_incremental_note_from_history(messages: List[Dict[str, Any]]) -> Opti
     return _note_from_authenticated_tool_history(messages)
 
 
+def _validated_sealed_tail_range(messages: List[Dict[str, Any]]) -> Optional[tuple[int, int]]:
+    """Return the immutable tail's half-open range after validating its checkpoint.
+
+    Direct maintenance evidence in this range belongs to the compacted
+    generation.  The boundary remains authoritative after ordinary rows append,
+    so selection must not depend on whether the final row is still in the tail.
+    """
+    validate_persisted_native_compaction_history(messages)
+    for carrier_index, message in enumerate(messages):
+        items = message.get("codex_reasoning_items") if isinstance(message, dict) else None
+        for checkpoint in items if isinstance(items, list) else []:
+            metadata = checkpoint.get(NATIVE_COMPACTION_METADATA_KEY) if isinstance(checkpoint, dict) else None
+            if isinstance(metadata, dict):
+                tail_start = carrier_index + 2
+                tail_end = tail_start + metadata["tail_count"]
+                return tail_start, tail_end
+    return None
+
+
 def restore_native_incremental_note(agent: Any, messages: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """Restore the recorded cursor; only a sealed checkpoint permits rebinding."""
     from types import SimpleNamespace
@@ -558,11 +650,58 @@ def restore_native_incremental_note(agent: Any, messages: List[Dict[str, Any]]) 
     if source_messages is None:
         return None
     try:
+        sealed_tail = _validated_sealed_tail_range(source_messages)
+    except ValueError:
+        return None
+    terminal_start = len(source_messages) - 2
+    checkpoint_bound_terminal_pair = bool(
+        sealed_tail is not None
+        and terminal_start >= sealed_tail[0]
+        and len(source_messages) <= sealed_tail[1]
+    )
+    recovered_source = source_messages if checkpoint_bound_terminal_pair else _recover_failed_native_note_refresh_suffix(
+        getattr(agent, "session_id", None), source_messages
+    )
+    # A terminal direct maintenance pair is the newest claimed continuity
+    # evidence unless it was preserved inside a validated checkpoint tail. A
+    # checkpoint-bound pair is historical maintenance evidence; its carrier is
+    # the authenticated continuity authority for this compacted generation.
+    if not checkpoint_bound_terminal_pair and recovered_source is source_messages and len(source_messages) >= 2:
+        call_row, result_row = source_messages[-2:]
+        calls = call_row.get("tool_calls") if isinstance(call_row, dict) else None
+        call = calls[0] if isinstance(calls, list) and len(calls) == 1 and isinstance(calls[0], dict) else None
+        call_id = call.get("id") if isinstance(call, dict) else None
+        function = call.get("function") if isinstance(call, dict) and isinstance(call.get("function"), dict) else None
+        if (
+            isinstance(function, dict) and function.get("name") == "continuity_note"
+            and isinstance(result_row, dict) and result_row.get("role") == "tool"
+            and result_row.get("tool_call_id") == call_id
+            and (result_row.get("name") or result_row.get("tool_name")) == "continuity_note"
+        ):
+            try:
+                payload = json.loads(result_row.get("content", ""))
+                terminal_note = payload.get("note") if isinstance(payload, dict) else None
+            except (TypeError, ValueError, json.JSONDecodeError):
+                terminal_note = None
+            minimum_direct_note_index = sealed_tail[1] if sealed_tail is not None else 0
+            if not isinstance(terminal_note, dict) or not _tool_call_authenticates_note(
+                source_messages, len(source_messages) - 1, call_id, terminal_note,
+                minimum_index=minimum_direct_note_index,
+            ):
+                return None
+    source_messages = recovered_source
+    try:
         validate_persisted_native_compaction_history(source_messages)
     except ValueError:
         return None
     note = native_incremental_note_from_history(source_messages)
-    tool_note = _note_from_authenticated_tool_history(source_messages)
+    # All direct maintenance evidence inside the validated sealed tail is
+    # historical, even after later ordinary rows append. A new direct note must
+    # have both its call and result after that boundary and remains strict.
+    minimum_direct_note_index = sealed_tail[1] if sealed_tail is not None else 0
+    tool_note = _note_from_authenticated_tool_history(
+        source_messages, minimum_index=minimum_direct_note_index,
+    )
     carrier_end = None
     for index, message in enumerate(source_messages):
         for item in message.get("codex_reasoning_items", []) or []:
@@ -785,6 +924,10 @@ def native_note_refresh_required(agent: Any, messages: List[Dict[str, Any]]) -> 
     silently rebound by the host. Size is a local serialized-character proxy,
     not a claim about provider token counts.
     """
+    # Background-review forks deliberately share a session id for prompt-cache
+    # warmth but cannot publish durable maintenance evidence.
+    if getattr(agent, "_persist_disabled", False):
+        return False
     note = _staged_note(agent, messages)
     # Freshness measures evidence added after the authenticated cursor. The
     # latest user message remains protected independently, however large it is;

@@ -186,7 +186,6 @@ def execute_native_note_refresh(agent, capability, response, messages, effective
     from agent.tool_dispatch_helpers import make_tool_result_message
 
     initial_message_count = len(messages)
-    pair_persisted = False
     try:
         if type(capability) is not _NoteRefreshCapability:
             raise NativeNoteRefreshFailure("forged maintenance capability")
@@ -224,16 +223,10 @@ def execute_native_note_refresh(agent, capability, response, messages, effective
         if getattr(agent, "_persist_disabled", False) or getattr(agent, "_session_db", None) is None:
             raise NativeNoteRefreshFailure("durable maintenance persistence unavailable")
         capability.call_id, capability.arguments = call_id, arguments
-        # Maintenance prose/reasoning is not ordinary assistant output. Stage
-        # only the exact call and host-authenticated result, with no UI
-        # emission. The pair is flushed once, atomically, after dispatch.
-        messages.append({"role": "assistant", "content": "", "tool_calls": [{
-            "id": call_id, "type": "function", "function": {
-                "name": "continuity_note", "arguments": raw_arguments,
-            },
-        }]})
-        if _note_fence(messages[:-1]) != capability.source_fence:
-            raise NativeNoteRefreshFailure("maintenance source changed during persistence")
+        # Prove the canonical source *before* appending the maintenance call.
+        # The call/result pair is not itself continuity evidence. This catches
+        # a queued follow-up whose replay omitted a newly durable async row
+        # before any maintenance rows can be published.
         source, _ = _projection_source_for_messages(agent, messages)
         if source is None:
             raise NativeNoteRefreshFailure("canonical maintenance source unauthenticated")
@@ -242,6 +235,22 @@ def execute_native_note_refresh(agent, capability, response, messages, effective
         expected = create_native_incremental_note(
             session_id=agent.session_id, source_messages=source, **arguments,
         )
+        stored_before = agent._session_db.get_messages_as_conversation(
+            agent.session_id, repair_alternation=False,
+        )
+        validate_persisted_native_compaction_history(stored_before)
+        if _note_fence(stored_before) != source_fence:
+            raise NativeNoteRefreshFailure(
+                "canonical maintenance source diverged before publication"
+            )
+        # Maintenance prose/reasoning is not ordinary assistant output. Stage
+        # only the exact call and host-authenticated result, with no UI
+        # emission. The pair is flushed once, atomically, after dispatch.
+        messages.append({"role": "assistant", "content": "", "tool_calls": [{
+            "id": call_id, "type": "function", "function": {
+                "name": "continuity_note", "arguments": raw_arguments,
+            },
+        }]})
         staged = SimpleNamespace(
             session_id=agent.session_id, native_incremental_handoff_enabled=True,
         )
@@ -270,7 +279,6 @@ def execute_native_note_refresh(agent, capability, response, messages, effective
         ))
         if agent._flush_messages_to_session_db(messages) is False:
             raise NativeNoteRefreshFailure("maintenance pair persistence failed")
-        pair_persisted = True
         # A successful flush alone is not proof: authenticate a fresh reader of
         # the canonical database, not the mutable replay or staged note.
         stored = agent._session_db.get_messages_as_conversation(
@@ -284,7 +292,13 @@ def execute_native_note_refresh(agent, capability, response, messages, effective
             and row.get("content") == managed.result for row in stored
         ):
             raise NativeNoteRefreshFailure("durable tool result missing")
-        current_source, _ = _projection_source_for_messages(agent, messages[:-1])
+        # The staged call/result pair is deliberately outside continuity
+        # source evidence. Revalidate the original replay prefix, then map it
+        # back to canonical history; using ``messages[:-1]`` would include the
+        # staged call and make every successful direct refresh self-conflict.
+        current_source, _ = _projection_source_for_messages(
+            agent, messages[:initial_message_count]
+        )
         if current_source is None or _note_fence(current_source) != source_fence:
             raise NativeNoteRefreshFailure("maintenance source changed during dispatch")
         record_native_incremental_note(agent, expected, source)
@@ -297,8 +311,11 @@ def execute_native_note_refresh(agent, capability, response, messages, effective
             id=_item_value(response, "id"),
         )
     except Exception as exc:
-        if not pair_persisted:
-            del messages[initial_message_count:]
+        # The in-memory request copy is always rolled back. If a durable reader
+        # fails after the atomic SQLite flush, preserve its maintenance pair for
+        # auditable, restart-safe recovery rather than rewriting user/task/tool
+        # history; the recovery gate accepts only the narrow known pair shape.
+        del messages[initial_message_count:]
         if isinstance(exc, NativeNoteRefreshFailure):
             raise
         raise NativeNoteRefreshFailure("maintenance execution or persistence failed") from exc

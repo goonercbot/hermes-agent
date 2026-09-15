@@ -522,6 +522,62 @@ def _note_from_authenticated_tool_history(messages: List[Dict[str, Any]]) -> Opt
     return None
 
 
+def _recover_failed_native_note_refresh_suffix(
+    session_id: Any, messages: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """Hide one known pre-publication maintenance failure from restart recovery.
+
+    Older builds could append a direct ``continuity_note`` pair before proving
+    that the request projection and SQLite transcript had the same source
+    fence. The pair remains durable for audit; this only prevents it from
+    eclipsing an earlier authenticated note. This is deliberately narrower
+    than accepting an arbitrary older note: the terminal pair must be direct,
+    host-authenticated, and differ from its canonical form only by its fence.
+    """
+    if not isinstance(messages, list) or len(messages) < 2:
+        return messages
+    call_row, result_row = messages[-2:]
+    if not isinstance(call_row, dict) or not isinstance(result_row, dict):
+        return messages
+    if call_row.get("role") != "assistant" or result_row.get("role") != "tool":
+        return messages
+    calls = call_row.get("tool_calls")
+    if not isinstance(calls, list) or len(calls) != 1 or not isinstance(calls[0], dict):
+        return messages
+    call = calls[0]
+    function = call.get("function") if isinstance(call.get("function"), dict) else None
+    if (
+        not isinstance(function, dict)
+        or function.get("name") != "continuity_note"
+        or result_row.get("tool_call_id") != call.get("id")
+        or (result_row.get("name") or result_row.get("tool_name")) != "continuity_note"
+    ):
+        return messages
+    arguments = _continuity_note_arguments(function.get("arguments"))
+    if arguments is None:
+        return messages
+    try:
+        from tools.continuity_note_tool import CONTINUITY_NOTE_AUTHENTICATOR
+
+        payload = json.loads(result_row.get("content", ""))
+        note = payload.get("note") if isinstance(payload, dict) else None
+        if payload.get("authenticated_by") != CONTINUITY_NOTE_AUTHENTICATOR or not isinstance(note, dict):
+            return messages
+        prefix = messages[:-2]
+        expected = create_native_incremental_note(
+            session_id=session_id, source_messages=prefix, **arguments,
+        )
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return messages
+    if (
+        note.get("source_cursor") != len(prefix)
+        or note.get("source_prefix_fence") == expected["source_prefix_fence"]
+        or {**expected, "source_prefix_fence": note.get("source_prefix_fence")} != note
+    ):
+        return messages
+    return deepcopy(prefix)
+
+
 def native_incremental_note_from_history(messages: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """Read only authenticated host-persisted notes, never transcript text."""
     try:
@@ -565,6 +621,35 @@ def restore_native_incremental_note(agent: Any, messages: List[Dict[str, Any]]) 
     source_messages, _replay_base_count = _projection_source_for_messages(agent, messages)
     if source_messages is None:
         return None
+    recovered_source = _recover_failed_native_note_refresh_suffix(
+        getattr(agent, "session_id", None), source_messages
+    )
+    # A terminal direct maintenance pair is the newest claimed continuity
+    # evidence. If it is malformed or its tool result no longer authenticates
+    # that exact call, do not silently fall back to an older note. The narrowly
+    # identified legacy projection failure above is the sole exception.
+    if recovered_source is source_messages and len(source_messages) >= 2:
+        call_row, result_row = source_messages[-2:]
+        calls = call_row.get("tool_calls") if isinstance(call_row, dict) else None
+        call = calls[0] if isinstance(calls, list) and len(calls) == 1 and isinstance(calls[0], dict) else None
+        call_id = call.get("id") if isinstance(call, dict) else None
+        function = call.get("function") if isinstance(call, dict) and isinstance(call.get("function"), dict) else None
+        if (
+            isinstance(function, dict) and function.get("name") == "continuity_note"
+            and isinstance(result_row, dict) and result_row.get("role") == "tool"
+            and result_row.get("tool_call_id") == call_id
+            and (result_row.get("name") or result_row.get("tool_name")) == "continuity_note"
+        ):
+            try:
+                payload = json.loads(result_row.get("content", ""))
+                terminal_note = payload.get("note") if isinstance(payload, dict) else None
+            except (TypeError, ValueError, json.JSONDecodeError):
+                terminal_note = None
+            if not isinstance(terminal_note, dict) or not _tool_call_authenticates_note(
+                source_messages, len(source_messages) - 1, call_id, terminal_note
+            ):
+                return None
+    source_messages = recovered_source
     try:
         validate_persisted_native_compaction_history(source_messages)
     except ValueError:
@@ -793,6 +878,10 @@ def native_note_refresh_required(agent: Any, messages: List[Dict[str, Any]]) -> 
     silently rebound by the host. Size is a local serialized-character proxy,
     not a claim about provider token counts.
     """
+    # Background-review forks deliberately share a session id for prompt-cache
+    # warmth but cannot publish durable maintenance evidence.
+    if getattr(agent, "_persist_disabled", False):
+        return False
     note = _staged_note(agent, messages)
     # Freshness measures evidence added after the authenticated cursor. The
     # latest user message remains protected independently, however large it is;

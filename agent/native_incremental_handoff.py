@@ -262,7 +262,11 @@ def _projection_cursor_for_source_cursor(
     """Map a source cursor through a bounded host replay projection."""
     if source_cursor < 0:
         return None
-    if source_cursor <= source_base_count:
+    if source_cursor == source_base_count:
+        # The authenticated end of a repaired prefix has an exact mapping,
+        # even when deterministic repair changed the number of prefix rows.
+        return replay_base_count
+    if source_cursor < source_base_count:
         # Existing notes can be replayed only when cleanup preserved row
         # positions.  A deletion before a note is ambiguous; fail closed.
         return source_cursor if source_base_count == replay_base_count else None
@@ -384,7 +388,11 @@ def _staged_note(agent: Any, messages: List[Dict[str, Any]]) -> Optional[Dict[st
     else:
         projection_cursor = _projection_cursor_for_source_cursor(
             cursor,
-            source_base_count=len(getattr(agent, "_native_incremental_replay_projection")["source"]),
+            # The authenticated resolver may have selected a request-only
+            # projection rather than a gateway replay. Its appended suffix is
+            # shared verbatim by source and replay, so subtract that suffix to
+            # recover the selected source-prefix length without another lookup.
+            source_base_count=len(source_messages) - (len(messages) - replay_base_count),
             replay_base_count=replay_base_count,
         )
     if projection_cursor is None or projection_cursor > len(messages):

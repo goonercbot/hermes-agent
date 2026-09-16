@@ -6,6 +6,8 @@ import weakref
 
 from agent.native_compaction import validate_persisted_native_compaction_history
 from agent.native_incremental_handoff import (
+    bind_native_incremental_replay_projection,
+    canonical_native_incremental_source_messages,
     _continuity_note_arguments,
     _item_value,
     _note_fence,
@@ -27,6 +29,12 @@ class NativeNoteRefreshFailure(RuntimeError):
 
 
 _LIVE_CAPABILITIES = weakref.WeakSet()
+
+
+# Kept as a private compatibility alias for existing direct callers. The
+# representation owner is native_incremental_handoff so maintenance, readiness,
+# and automatic compaction cannot drift.
+_native_canonical_source_messages = canonical_native_incremental_source_messages
 
 
 class _NoteRefreshCapability:
@@ -231,18 +239,19 @@ def execute_native_note_refresh(agent, capability, response, messages, effective
         if source is None:
             raise NativeNoteRefreshFailure("canonical maintenance source unauthenticated")
         validate_persisted_native_compaction_history(source)
-        source_fence = _note_fence(source)
-        expected = create_native_incremental_note(
-            session_id=agent.session_id, source_messages=source, **arguments,
-        )
         stored_before = agent._session_db.get_messages_as_conversation(
             agent.session_id, repair_alternation=False,
         )
         validate_persisted_native_compaction_history(stored_before)
+        source = canonical_native_incremental_source_messages(source, stored_before)
+        source_fence = _note_fence(source)
         if _note_fence(stored_before) != source_fence:
             raise NativeNoteRefreshFailure(
                 "canonical maintenance source diverged before publication"
             )
+        expected = create_native_incremental_note(
+            session_id=agent.session_id, source_messages=source, **arguments,
+        )
         # Maintenance prose/reasoning is not ordinary assistant output. Stage
         # only the exact call and host-authenticated result, with no UI
         # emission. The pair is flushed once, atomically, after dispatch.
@@ -299,9 +308,19 @@ def execute_native_note_refresh(agent, capability, response, messages, effective
         current_source, _ = _projection_source_for_messages(
             agent, messages[:initial_message_count]
         )
+        if current_source is not None:
+            current_source = canonical_native_incremental_source_messages(current_source, stored_before)
         if current_source is None or _note_fence(current_source) != source_fence:
             raise NativeNoteRefreshFailure("maintenance source changed during dispatch")
         record_native_incremental_note(agent, expected, source)
+        # Keep the raw provider replay only as a fenced projection. The source
+        # is the just-read canonical DB history, including the published pair,
+        # so the next note check and automatic compaction authenticate the same
+        # bytes that durable readback used without rewriting historical rows.
+        if not bind_native_incremental_replay_projection(
+            agent, source_messages=stored, replay_messages=messages,
+        ):
+            raise NativeNoteRefreshFailure("canonical maintenance replay projection failed")
         # The ordinary usage/accounting path still owns this physical request.
         # Give it only the validated call, not maintenance narration/refusals
         # that could trigger ordinary retry or user-facing delivery policies.

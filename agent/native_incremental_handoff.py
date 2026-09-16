@@ -106,6 +106,49 @@ def _source_prefix_fence(messages: List[Dict[str, Any]], cursor: int) -> str:
     return _note_fence(messages[:cursor])
 
 
+def canonical_native_incremental_source_messages(source, persisted):
+    """Map only SessionDB's ordinary-text cleanup onto an exact replay source.
+
+    The provider replay may retain edge whitespace until its batch is flushed,
+    while SessionDB's conversation loader trims top-level user and assistant
+    text.  Native continuity authentication is anchored to that durable view,
+    so every native consumer must use this one canonical representation.  Do
+    not normalize structured content, metadata, or meaningful text changes.
+    """
+    canonical = list(source)
+    if len(source) != len(persisted):
+        return canonical
+    for index, (message, durable) in enumerate(zip(source, persisted)):
+        if not (
+            isinstance(message, dict) and isinstance(durable, dict)
+            and message.get("role") in {"user", "assistant"}
+            and message.get("role") == durable.get("role")
+            and isinstance(message.get("content"), str)
+            and isinstance(durable.get("content"), str)
+            and durable["content"] == message["content"].strip()
+        ):
+            continue
+        canonical[index] = {**message, "content": durable["content"]}
+    return canonical
+
+
+def _native_incremental_operation_messages(
+    agent: Any, messages: List[Dict[str, Any]],
+) -> tuple[List[Dict[str, Any]], bool]:
+    """Select canonical source only for the accepted DB-text projection.
+
+    Other native projections repair request structure or tool output and remain
+    replay-only by design.  They must not be mistaken for a durable source just
+    because both happen to have an authenticated fence.  The exact
+    edge-whitespace bridge is the sole projection that can become a canonical
+    compaction request/result without changing semantic history.
+    """
+    source, _ = _projection_source_for_messages(agent, messages)
+    if source is not None and source == canonical_native_incremental_source_messages(messages, source):
+        return source, True
+    return list(messages), False
+
+
 def bind_native_incremental_replay_projection(
     agent: Any,
     *,
@@ -929,11 +972,17 @@ def native_note_refresh_required(agent: Any, messages: List[Dict[str, Any]]) -> 
     if getattr(agent, "_persist_disabled", False):
         return False
     note = _staged_note(agent, messages)
+    source_messages, canonical_operation = _native_incremental_operation_messages(agent, messages)
     # Freshness measures evidence added after the authenticated cursor. The
     # latest user message remains protected independently, however large it is;
     # asking for another note cannot make that required input disappear.
-    cursor = getattr(agent, "_native_incremental_handoff_projection_cursor", None)
-    tail = messages if note is None else messages[cursor if cursor is not None else note["source_cursor"]:]
+    if note is None:
+        tail = messages
+    elif canonical_operation:
+        tail = source_messages[note["source_cursor"]:]
+    else:
+        cursor = getattr(agent, "_native_incremental_handoff_projection_cursor", None)
+        tail = messages[cursor if cursor is not None else note["source_cursor"]:]
     return _native_message_size(tail) > 128_000
 
 
@@ -996,6 +1045,8 @@ def native_incremental_compact_context(
         agent._last_native_incremental_compaction = {"disposition": "invalid_route"}
         return messages
     validate_persisted_native_compaction_history(messages)
+    operation_messages, canonical_operation = _native_incremental_operation_messages(agent, messages)
+    validate_persisted_native_compaction_history(operation_messages)
     if native_note_refresh_required(agent, messages):
         _set_native_attempt_state(agent, error="native incremental continuity note refresh required")
         agent._last_native_incremental_compaction = {"disposition": "refresh_required"}
@@ -1009,14 +1060,21 @@ def native_incremental_compact_context(
         _set_native_attempt_state(agent, error="native incremental handoff note not ready")
         agent._last_native_incremental_compaction = {"disposition": "not_ready"}
         return messages
-    frozen = deepcopy(messages)
+    # The compacting request and its returned transcript must share the durable
+    # canonical representation.  A raw replay can differ only in accepted
+    # edge whitespace, but carrying it into this request would mint a result
+    # whose next authentication fence disagrees with SessionDB.
+    frozen = deepcopy(operation_messages)
     validate_persisted_native_compaction_history(frozen)
     # Preserve every post-note operational row and, independently, the latest
     # user correction even when the note was written after that correction.
     tail = _protected_tail_since_note(
         frozen,
         note,
-        projection_cursor=getattr(agent, "_native_incremental_handoff_projection_cursor", None),
+        projection_cursor=(
+            note["source_cursor"] if canonical_operation
+            else getattr(agent, "_native_incremental_handoff_projection_cursor", None)
+        ),
     )
     if len(tail) == len(frozen):
         _set_native_attempt_state(agent)

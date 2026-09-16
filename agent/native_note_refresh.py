@@ -29,6 +29,31 @@ class NativeNoteRefreshFailure(RuntimeError):
 _LIVE_CAPABILITIES = weakref.WeakSet()
 
 
+def _native_canonical_source_messages(source, persisted):
+    """Map only the loader's text cleanup onto an otherwise exact source.
+
+    The provider replay can retain edge whitespace until its batch is flushed,
+    while the canonical SessionDB conversation view trims ordinary user and
+    assistant text. Accept only that edge-whitespace difference; every other
+    field and content difference remains fence-visible.
+    """
+    canonical = list(source)
+    if len(source) != len(persisted):
+        return canonical
+    for index, (message, durable) in enumerate(zip(source, persisted)):
+        if not (
+            isinstance(message, dict) and isinstance(durable, dict)
+            and message.get("role") in {"user", "assistant"}
+            and message.get("role") == durable.get("role")
+            and isinstance(message.get("content"), str)
+            and isinstance(durable.get("content"), str)
+            and durable["content"] == message["content"].strip()
+        ):
+            continue
+        canonical[index] = {**message, "content": durable["content"]}
+    return canonical
+
+
 class _NoteRefreshCapability:
     """Opaque host state, never a tool argument or persisted permission."""
 
@@ -231,18 +256,19 @@ def execute_native_note_refresh(agent, capability, response, messages, effective
         if source is None:
             raise NativeNoteRefreshFailure("canonical maintenance source unauthenticated")
         validate_persisted_native_compaction_history(source)
-        source_fence = _note_fence(source)
-        expected = create_native_incremental_note(
-            session_id=agent.session_id, source_messages=source, **arguments,
-        )
         stored_before = agent._session_db.get_messages_as_conversation(
             agent.session_id, repair_alternation=False,
         )
         validate_persisted_native_compaction_history(stored_before)
+        source = _native_canonical_source_messages(source, stored_before)
+        source_fence = _note_fence(source)
         if _note_fence(stored_before) != source_fence:
             raise NativeNoteRefreshFailure(
                 "canonical maintenance source diverged before publication"
             )
+        expected = create_native_incremental_note(
+            session_id=agent.session_id, source_messages=source, **arguments,
+        )
         # Maintenance prose/reasoning is not ordinary assistant output. Stage
         # only the exact call and host-authenticated result, with no UI
         # emission. The pair is flushed once, atomically, after dispatch.
@@ -299,6 +325,8 @@ def execute_native_note_refresh(agent, capability, response, messages, effective
         current_source, _ = _projection_source_for_messages(
             agent, messages[:initial_message_count]
         )
+        if current_source is not None:
+            current_source = _native_canonical_source_messages(current_source, stored_before)
         if current_source is None or _note_fence(current_source) != source_fence:
             raise NativeNoteRefreshFailure("maintenance source changed during dispatch")
         record_native_incremental_note(agent, expected, source)

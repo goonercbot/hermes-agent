@@ -6,6 +6,8 @@ import weakref
 
 from agent.native_compaction import validate_persisted_native_compaction_history
 from agent.native_incremental_handoff import (
+    bind_native_incremental_replay_projection,
+    canonical_native_incremental_source_messages,
     _continuity_note_arguments,
     _item_value,
     _note_fence,
@@ -29,29 +31,10 @@ class NativeNoteRefreshFailure(RuntimeError):
 _LIVE_CAPABILITIES = weakref.WeakSet()
 
 
-def _native_canonical_source_messages(source, persisted):
-    """Map only the loader's text cleanup onto an otherwise exact source.
-
-    The provider replay can retain edge whitespace until its batch is flushed,
-    while the canonical SessionDB conversation view trims ordinary user and
-    assistant text. Accept only that edge-whitespace difference; every other
-    field and content difference remains fence-visible.
-    """
-    canonical = list(source)
-    if len(source) != len(persisted):
-        return canonical
-    for index, (message, durable) in enumerate(zip(source, persisted)):
-        if not (
-            isinstance(message, dict) and isinstance(durable, dict)
-            and message.get("role") in {"user", "assistant"}
-            and message.get("role") == durable.get("role")
-            and isinstance(message.get("content"), str)
-            and isinstance(durable.get("content"), str)
-            and durable["content"] == message["content"].strip()
-        ):
-            continue
-        canonical[index] = {**message, "content": durable["content"]}
-    return canonical
+# Kept as a private compatibility alias for existing direct callers. The
+# representation owner is native_incremental_handoff so maintenance, readiness,
+# and automatic compaction cannot drift.
+_native_canonical_source_messages = canonical_native_incremental_source_messages
 
 
 class _NoteRefreshCapability:
@@ -260,7 +243,7 @@ def execute_native_note_refresh(agent, capability, response, messages, effective
             agent.session_id, repair_alternation=False,
         )
         validate_persisted_native_compaction_history(stored_before)
-        source = _native_canonical_source_messages(source, stored_before)
+        source = canonical_native_incremental_source_messages(source, stored_before)
         source_fence = _note_fence(source)
         if _note_fence(stored_before) != source_fence:
             raise NativeNoteRefreshFailure(
@@ -326,10 +309,18 @@ def execute_native_note_refresh(agent, capability, response, messages, effective
             agent, messages[:initial_message_count]
         )
         if current_source is not None:
-            current_source = _native_canonical_source_messages(current_source, stored_before)
+            current_source = canonical_native_incremental_source_messages(current_source, stored_before)
         if current_source is None or _note_fence(current_source) != source_fence:
             raise NativeNoteRefreshFailure("maintenance source changed during dispatch")
         record_native_incremental_note(agent, expected, source)
+        # Keep the raw provider replay only as a fenced projection. The source
+        # is the just-read canonical DB history, including the published pair,
+        # so the next note check and automatic compaction authenticate the same
+        # bytes that durable readback used without rewriting historical rows.
+        if not bind_native_incremental_replay_projection(
+            agent, source_messages=stored, replay_messages=messages,
+        ):
+            raise NativeNoteRefreshFailure("canonical maintenance replay projection failed")
         # The ordinary usage/accounting path still owns this physical request.
         # Give it only the validated call, not maintenance narration/refusals
         # that could trigger ordinary retry or user-facing delivery policies.

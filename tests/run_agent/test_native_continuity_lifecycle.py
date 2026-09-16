@@ -332,6 +332,111 @@ def test_native_note_refresh_uses_sqlite_canonical_source_without_rewriting_rows
         db.close()
 
 
+def test_untrimmed_replay_refresh_advances_next_request_and_compacts_canonical_source(
+    tmp_path, monkeypatch, blocking_router,
+):
+    """A published refresh must carry its DB source into both next consumers."""
+    from hermes_state import SessionDB
+    from run_agent import AIAgent
+    from agent.native_incremental_handoff import (
+        _projection_source_for_messages,
+        bind_native_incremental_replay_projection,
+        native_incremental_compact_context,
+        prepare_native_note_refresh_request,
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        "compression:\n  enabled: true\n  codex_responses_native: true\n"
+        "  native_incremental_handoff: true\n"
+    )
+    db = SessionDB(db_path=tmp_path / "state.db")
+    sid = "canonical-refresh-next-consumer"
+    db.create_session(sid, "subagent", model="gpt-5.6-terra")
+    agent = AIAgent(
+        api_key="fixture", base_url="https://chatgpt.com/backend-api/codex",
+        api_mode="codex_responses", model="gpt-5.6-terra", provider="openai-codex",
+        session_db=db, session_id=sid, platform="subagent", quiet_mode=True,
+        skip_memory=True, skip_context_files=True, skip_background_review=True,
+        enabled_toolsets=["continuity"],
+    )
+    agent._end_session_on_close = False  # type: ignore[attr-defined]
+    try:
+        db.append_message(sid, "user", "durable objective")
+        db.append_message(sid, "assistant", "initial verified state")
+        db.append_message(sid, "assistant", "", tool_calls=[{
+            "id": "old-note", "type": "function",
+            "function": {"name": "continuity_note", "arguments": json.dumps(ARGS)},
+        }])
+        old_source = db.get_messages_as_conversation(sid, repair_alternation=False)
+        old_result = record_native_incremental_note_from_tool_call(agent, ARGS, old_source)
+        db.append_message(sid, "tool", old_result, tool_call_id="old-note", tool_name="continuity_note")
+        # The durable loader strips these edge bytes. The provider replay keeps
+        # them until publication, which is the real divergence boundary.
+        stale_tail = "verified stale evidence " * 7000 + " \n"
+        db.append_message(sid, "assistant", stale_tail)
+        durable_before_refresh = db.get_messages_as_conversation(sid, repair_alternation=False)
+        replay = deepcopy(durable_before_refresh)
+        replay[-1]["content"] = stale_tail
+        assert replay[-1]["content"] != durable_before_refresh[-1]["content"]
+        assert bind_native_incremental_replay_projection(
+            agent, source_messages=durable_before_refresh, replay_messages=replay,
+        )
+        assert restore_native_incremental_note(agent, replay) is not None
+
+        agent._current_api_request_id = "canonical:api:1"  # type: ignore[attr-defined]
+        first_request = {"instructions": "ordinary", "tools": []}
+        first = prepare_native_note_refresh_request(agent, replay, first_request)
+        assert first is not False
+        first.bind_request(first_request)
+        execute_native_note_refresh(
+            agent, first,
+            reply(NS(type="function_call", id="fc-note", call_id="fresh-note",
+                     name="continuity_note", arguments=json.dumps(ARGS))),
+            replay, sid,
+        )
+
+        source_after_refresh, cursor = _projection_source_for_messages(agent, replay)
+        assert source_after_refresh == db.get_messages_as_conversation(sid, repair_alternation=False)
+        assert cursor == len(replay)
+        assert replay[-3]["content"] == stale_tail  # no historical rewrite
+        assert not native_note_refresh_required(agent, replay)
+
+        # The following physical request uses the same turn identity. Before
+        # this repair it saw the raw replay as a stale/no-note identity and the
+        # guard stopped it rather than issuing the required refresh.
+        next_tail = "new durable evidence " * 7000 + " \n"
+        db.append_message(sid, "assistant", next_tail)
+        replay.append({"role": "assistant", "content": next_tail})
+        agent._current_api_request_id = "canonical:api:2"  # type: ignore[attr-defined]
+        second_request = {"instructions": "ordinary", "tools": []}
+        second = prepare_native_note_refresh_request(agent, replay, second_request)
+        assert second is not False
+        assert second.canonical_source_fence != first.canonical_source_fence
+        second.close()
+
+        # A separate fresh canonical projection proves the automatic native
+        # compaction request and result use DB text rather than raw replay text.
+        compact_replay = replay[:-1]
+        agent._current_api_request_id = "canonical:compact:1"  # type: ignore[attr-defined]
+        provider_requests = []
+        agent._interruptible_api_call = lambda request: provider_requests.append(deepcopy(request)) or reply(
+            NS(type="compaction", id="checkpoint", encrypted_content="public-checkpoint"),
+            model="gpt-5.6-luna",
+        )
+        compacted = native_incremental_compact_context(agent, compact_replay)
+        assert compacted != compact_replay
+        assert len(provider_requests) == 1
+        wire = json.dumps(provider_requests[0]["input"], ensure_ascii=False)
+        assert stale_tail.strip() in wire
+        assert stale_tail not in wire
+        assert all(row.get("content") != stale_tail for row in compacted)
+        validate_persisted_native_compaction_history(compacted)
+    finally:
+        agent.close()
+        db.close()
+
+
 def test_native_canonical_source_keeps_sqlite_structured_content_exact(tmp_path):
     from hermes_state import SessionDB
     from agent.native_incremental_handoff import _note_fence

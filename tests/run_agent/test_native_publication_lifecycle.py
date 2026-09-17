@@ -192,3 +192,158 @@ def test_publication_failure_never_returns_success(tmp_path, monkeypatch, in_pla
     finally:
         agent.close()
         db.close()
+
+
+def test_post_commit_crash_reconciles_in_fresh_process_and_allows_changed_turn_retry(tmp_path, monkeypatch):
+    """A committed child survives a process death before native readback.
+
+    This intentionally terminates a separate interpreter at the exact native
+    authentication seam after SQLite publication. The parent test then reads
+    the durable generation, and a second fresh interpreter restores it before
+    completing a materially changed ordinary turn. Provider responses remain
+    local fixture objects; the database is this test's isolated SQLite file.
+    """
+    agent, db, source = _agent_with_authenticated_history(tmp_path, monkeypatch)
+    session_id = agent.session_id
+    db_path = tmp_path / "state.db"
+    try:
+        # The spawned process owns its connection. Close this fixture reader
+        # before the deliberate os._exit so neither test process holds a lock.
+        agent.close()
+        db.close()
+
+        root = Path(__file__).resolve().parents[2]
+        crash_script = f"""
+import os
+from pathlib import Path
+from types import SimpleNamespace as NS
+from unittest.mock import patch
+from hermes_state import SessionDB
+from run_agent import AIAgent
+from agent.native_incremental_handoff import bind_native_incremental_replay_projection, restore_native_incremental_note
+import agent.native_incremental_handoff as handoff
+
+path = Path({str(db_path)!r})
+session_id = {session_id!r}
+db = SessionDB(db_path=path)
+agent = AIAgent(
+    api_key='fixture', base_url='https://chatgpt.com/backend-api/codex',
+    api_mode='codex_responses', model='gpt-6-astra', provider='openai-codex',
+    session_db=db, session_id=session_id, quiet_mode=True, skip_memory=True,
+    skip_context_files=True, skip_background_review=True, enabled_toolsets=[]
+)
+agent._disable_streaming = True
+agent.compression_in_place = False
+agent._compression_feasibility_checked = True
+agent._emit_status = lambda *args, **kwargs: None
+agent._emit_warning = lambda *args, **kwargs: None
+agent.commit_memory_session = lambda *args, **kwargs: None
+agent.context_compressor.threshold_tokens = 100
+agent.context_compressor.should_compress_preflight = lambda _: True
+agent.context_compressor.should_compress = lambda _: False
+agent.context_compressor.update_from_response({{'prompt_tokens': 20000}})
+source = db.get_messages_as_conversation(session_id, repair_alternation=False)
+assert bind_native_incremental_replay_projection(agent, source_messages=source, replay_messages=source)
+assert restore_native_incremental_note(agent, source) is not None
+agent._native_compaction_turn_active = False
+agent._interruptible_api_call = lambda request: NS(
+    output=[
+        NS(type='compaction', id='crash-cp', encrypted_content='crash-checkpoint'),
+        NS(type='message', role='assistant', content=[NS(type='output_text', text='published before crash')]),
+    ],
+    usage=NS(input_tokens=210000, output_tokens=4, total_tokens=210004),
+    status='completed', model='gpt-5.6-luna'
+)
+# Publication is already committed when this authentication/readback seam runs.
+# os._exit prevents finally blocks from supplying an in-process recovery path.
+handoff.authenticate_native_compaction_publication = lambda *args, **kwargs: os._exit(73)
+with patch('hermes_cli.plugins.invoke_hook', return_value=[]):
+    agent._compress_context(source, 'crash after durable publication', approx_tokens=210000)
+raise AssertionError('post-commit crash seam was not reached')
+"""
+        env = os.environ.copy()
+        env.update({
+            "HOME": str(tmp_path),
+            "HERMES_HOME": str(tmp_path),
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONPATH": str(root) + os.pathsep + env.get("PYTHONPATH", ""),
+        })
+        crashed = subprocess.run(
+            [sys.executable, "-B", "-c", crash_script], cwd=root, env=env,
+            text=True, capture_output=True, timeout=60,
+        )
+        assert crashed.returncode == 73, crashed.stderr
+
+        db = __import__("hermes_state").SessionDB(db_path=db_path)
+        children = db._conn.execute(
+            "SELECT id FROM sessions WHERE parent_session_id = ? ORDER BY started_at", (session_id,)
+        ).fetchall()
+        assert len(children) == 1
+        child_session_id = children[0][0]
+        published = db.get_messages_as_conversation(child_session_id, repair_alternation=False)
+        validate_persisted_native_compaction_history(published)
+        assert restore_native_incremental_note(NS(session_id=child_session_id), published) is not None
+        assert db._conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        db.close()
+        db = None
+
+        retry_script = f"""
+from pathlib import Path
+from types import SimpleNamespace as NS
+from unittest.mock import patch
+from hermes_state import SessionDB
+from run_agent import AIAgent
+from agent.native_compaction import validate_persisted_native_compaction_history
+from agent.native_incremental_handoff import bind_native_incremental_replay_projection, restore_native_incremental_note
+
+path = Path({str(db_path)!r})
+session_id = {child_session_id!r}
+db = SessionDB(db_path=path)
+agent = AIAgent(
+    api_key='fixture', base_url='https://chatgpt.com/backend-api/codex',
+    api_mode='codex_responses', model='gpt-6-astra', provider='openai-codex',
+    session_db=db, session_id=session_id, quiet_mode=True, skip_memory=True,
+    skip_context_files=True, skip_background_review=True, enabled_toolsets=[]
+)
+agent._disable_streaming = True
+agent._compression_feasibility_checked = True
+agent._emit_status = lambda *args, **kwargs: None
+agent._emit_warning = lambda *args, **kwargs: None
+agent.commit_memory_session = lambda *args, **kwargs: None
+agent.context_compressor.should_compress_preflight = lambda _: False
+agent.context_compressor.should_compress = lambda _: False
+source = db.get_messages_as_conversation(session_id, repair_alternation=False)
+validate_persisted_native_compaction_history(source)
+assert bind_native_incremental_replay_projection(agent, source_messages=source, replay_messages=source)
+assert restore_native_incremental_note(agent, source) is not None
+agent._interruptible_api_call = lambda request: NS(
+    output=[NS(type='message', role='assistant', content=[NS(type='output_text', text='CHANGED_TURN_RETRY_OK')])],
+    usage=NS(input_tokens=42, output_tokens=4, total_tokens=46),
+    status='completed', model='gpt-6-astra'
+)
+with patch('hermes_cli.plugins.invoke_hook', return_value=[]), patch(
+    'hermes_cli.lifecycle.invoke_hook', return_value=[]
+), patch('agent.turn_context._maybe_title_session_at_turn_start', return_value=None):
+    result = agent.run_conversation(
+        'Changed retry instruction: preserve the committed checkpoint; do not replay work.',
+        conversation_history=source,
+    )
+assert result['completed'] and result['final_response'] == 'CHANGED_TURN_RETRY_OK'
+reloaded = db.get_messages_as_conversation(session_id, repair_alternation=False)
+validate_persisted_native_compaction_history(reloaded)
+assert any(row.get('content') == 'Changed retry instruction: preserve the committed checkpoint; do not replay work.' for row in reloaded)
+assert any(row.get('content') == 'CHANGED_TURN_RETRY_OK' for row in reloaded)
+assert restore_native_incremental_note(NS(session_id=session_id), reloaded) is not None
+agent.close()
+db.close()
+print('fresh-process crash reconciliation and changed-turn retry ok')
+"""
+        retried = subprocess.run(
+            [sys.executable, "-B", "-c", retry_script], cwd=root, env=env,
+            text=True, capture_output=True, timeout=60,
+        )
+        assert retried.returncode == 0, retried.stderr
+        assert retried.stdout.strip() == "fresh-process crash reconciliation and changed-turn retry ok"
+    finally:
+        if db is not None:
+            db.close()

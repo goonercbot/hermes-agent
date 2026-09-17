@@ -290,7 +290,7 @@ def test_stale_tail_defers_without_provider_and_preserves_source():
     a,calls=_agent([])
     messages=[{'role':'user','content':'earlier objective'},{'role':'assistant','content':'earlier state'}]
     _note(a,messages)
-    messages.append({'role':'user','content':'new evidence '*20000})
+    messages.append({'role':'assistant','content':'new evidence '*20000})
     before=deepcopy(messages)
     assert native_incremental_compact_context(a,messages)==before
     assert calls==[] and messages==before

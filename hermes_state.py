@@ -797,14 +797,47 @@ class SessionDB(
                 with self._lock:
                     if self._conn is None:  # close() raced this writer
                         self._reopen_after_close_locked(context="write")
-                    self._conn.execute("BEGIN IMMEDIATE")
+                    # Do not delegate any of the configured patience to SQLite's native
+                    # busy handler.  Its timer is not a strict wall-clock upper bound on
+                    # every supported SQLite build (and a connection's 1s setup timeout
+                    # otherwise lets one BEGIN bypass a short caller budget).  A
+                    # non-blocking BEGIN lets this loop own all waiting, including jitter,
+                    # compression fencing, cancellation-safe rollback, and the exact
+                    # configured deadline.  Keep that zero timeout scoped to acquisition:
+                    # direct maintenance on this shared connection must retain its configured
+                    # SQLite grace after an ordinary write. Zero-patience writes retain one
+                    # immediate uncontended BEGIN attempt.
+                    conn = cast(sqlite3.Connection, self._conn)
+                    previous_timeout = int(conn.execute("PRAGMA busy_timeout").fetchone()[0])
+                    conn.execute("PRAGMA busy_timeout=0")
+                    try:
+                        conn.execute("BEGIN IMMEDIATE")
+                    except BaseException:
+                        # Preserve the failed BEGIN (including cancellation) if a broken or
+                        # concurrently closed connection also refuses the restoration.
+                        try:
+                            conn.execute(f"PRAGMA busy_timeout={previous_timeout}")
+                        except BaseException:
+                            logger.debug("Could not restore state.db busy_timeout after failed BEGIN", exc_info=True)
+                        raise
+                    try:
+                        conn.execute(f"PRAGMA busy_timeout={previous_timeout}")
+                    except BaseException:
+                        # Do not run the callback with a leaked zero timeout. The local
+                        # connection reference is intentional: self._conn can only be
+                        # replaced after this lock is released.
+                        try:
+                            conn.rollback()
+                        except BaseException:
+                            logger.debug("Could not roll back state.db after busy_timeout restore failure", exc_info=True)
+                        raise
                     try:
                         fn_started = True
-                        result = fn(self._conn)
-                        self._conn.commit()
+                        result = fn(conn)
+                        conn.commit()
                     except BaseException:
                         try:
-                            self._conn.rollback()
+                            conn.rollback()
                         except Exception:
                             pass
                         raise

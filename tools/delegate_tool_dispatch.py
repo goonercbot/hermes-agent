@@ -195,6 +195,10 @@ _SYNC_FALLBACK_NOTES = {
         "SYNCHRONOUSLY and the result is included above. Raise "
         "delegation.max_concurrent_children in config.yaml to allow more concurrent background delegations."
     ),
+    "subagent_origin": (
+        "background=true is not available from a delegated subagent because it has no independent "
+        "gateway delivery ownership. The subagent(s) ran SYNCHRONOUSLY and the result is included above."
+    ),
 }
 
 def _run_sync_with_note(batch: _Batch, reason: str) -> str:
@@ -366,6 +370,12 @@ def _dispatch_background(batch: _Batch) -> str:
     running synchronously (with an explanatory ``note``) when the session cannot receive detached completions or the
     async pool is at capacity."""
     from tools.delegate_tool import _get_max_async_children
+    if str(getattr(batch.parent_agent, "platform", "") or "").strip().lower() == "subagent":
+        # A child can inherit the originating gateway key through context. Detached completion would
+        # then carry the child's durable id as parent_session_id and could be mistaken for the gateway
+        # owner. Keep nested work in the child turn unless a path supplies independent delivery ownership.
+        logger.info("delegate_task: delegated subagent origin; running the batch synchronously.")
+        return _run_sync_with_note(batch, "subagent_origin")
     wake_sid = _resolve_async_wake_sid(batch.origin_wake_sid)
     if wake_sid is None:
         logger.info("delegate_task: async delivery unsupported on this session runtime; running the batch synchronously instead.")

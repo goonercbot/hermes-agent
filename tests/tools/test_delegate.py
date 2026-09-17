@@ -413,9 +413,11 @@ class TestDelegateTask(unittest.TestCase):
                 child_db = kwargs["session_db"]
                 self.assertIsInstance(child_db, SessionDB)
                 self.assertIsNot(child_db, parent_db)
-                self.assertEqual(
-                    str(child_db.db_path), str(parent_db.db_path)
-                )
+                # Registry handles canonicalize paths; macOS /tmp is a symlink
+                # to /private/tmp. Compare the actual file, not its spelling.
+                self.assertTrue(Path(child_db.db_path).samefile(parent_db.db_path))
+                parent_db.set_meta("child-db-identity", "same-profile-file")
+                self.assertEqual(child_db.get_meta("child-db-identity"), "same-profile-file")
             finally:
                 if child_db is not None:
                     child_db.close()

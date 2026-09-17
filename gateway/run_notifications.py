@@ -203,6 +203,14 @@ class GatewayNotificationsMixin:
                 "dropping injection (#55578 fail-closed).", pinned_session_id,
             )
             return None
+        if str(pinned_row.get("source") or "").strip().lower() == "subagent":
+            # A delegate child may retain an inherited gateway session key, but it never owns the
+            # gateway route. Do not turn its parent id into a route switch.
+            logger.warning(
+                "Async-delegation completion targets delegate child session %s; "
+                "dropping injection instead of rebinding gateway route.", pinned_session_id,
+            )
+            return None
         target_session_id = pinned_session_id
         follows_compression = False
         if pinned_row.get("ended_at"):
@@ -231,6 +239,15 @@ class GatewayNotificationsMixin:
                 return None
         if target_session_id == session_entry.session_id:
             return session_entry
+        if not follows_compression:
+            # A live route can receive only the completion owned by its current session. A /resume-like
+            # switch is a user action; an async completion is never authority to retag a gateway route.
+            logger.warning(
+                "Async-delegation completion targets live session %s but route %s owns %s; "
+                "dropping injection instead of switching ownership.",
+                target_session_id, session_entry.session_key, session_entry.session_id,
+            )
+            return None
         prior_session_id = session_entry.session_id
         if follows_compression:
             switched = await self.async_session_store.advance_compression_session(

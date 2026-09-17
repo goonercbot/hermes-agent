@@ -8,6 +8,9 @@ Three invariants on the messaging-gateway surface, mirroring the TUI rules:
 3. /new interrupts the old conversation's in-flight async delegations.
 """
 
+import asyncio
+import threading
+from collections import OrderedDict
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -100,22 +103,121 @@ class TestGatewayPinningFailsClosed:
 
 
     @pytest.mark.asyncio
-    async def test_live_spawning_session_rebinds_from_different_route(self):
+    async def test_live_foreign_session_cannot_rebind_gateway_route(self):
         current = self._entry("sess_current")
-        pinned = self._entry("sess_live")
         runner = self._make_runner(
-            {"sess_live": {"id": "sess_live", "ended_at": None}},
-            switched_entry=pinned,
+            {"sess_live": {"id": "sess_live", "source": "telegram", "ended_at": None}},
         )
 
         resolved = await runner._resolve_async_delegation_session(
             current, "sess_live"
         )
 
-        assert resolved is pinned
-        getattr(runner.session_store, "switch_session").assert_called_once_with(
-            current.session_key, "sess_live"
+        assert resolved is None
+        self._assert_no_route_change(runner)
+
+    @pytest.mark.asyncio
+    async def test_live_subagent_row_in_real_sqlite_cannot_rebind_gateway_route(self, tmp_path, request):
+        """A live delegate child is never a gateway route owner, even with a valid parent id."""
+        from gateway.run import GatewayRunner
+        from gateway.session import AsyncSessionStore
+        from hermes_state import AsyncSessionDB, SessionDB
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        request.addfinalizer(db.close)
+        db.create_session("gateway-owner", source="telegram")
+        db.create_session(
+            "active-subagent", source="subagent", parent_session_id="gateway-owner"
         )
+        owner = self._entry("gateway-owner")
+        runner = object.__new__(GatewayRunner)
+        runner._session_db = AsyncSessionDB(db)
+        runner.session_store = MagicMock()
+        runner.session_store.switch_session = MagicMock()
+        runner.session_store.advance_compression_session = MagicMock()
+        runner._async_session_store = AsyncSessionStore(runner.session_store)
+
+        resolved = await runner._resolve_async_delegation_session(owner, "active-subagent")
+
+        assert resolved is None
+        self._assert_no_route_change(runner)
+        assert db.get_session("gateway-owner")["ended_at"] is None
+        assert db.get_session("active-subagent")["ended_at"] is None
+
+    @pytest.mark.asyncio
+    async def test_real_sqlite_profiles_isolate_active_children_and_preserve_arrival_order(self, tmp_path, monkeypatch, request):
+        """Policy: distinct same-turn completions are consolidated in queue-arrival order per route."""
+        from gateway.run import GatewayRunner
+        from gateway.session import AsyncSessionStore
+        from hermes_state import AsyncSessionDB, SessionDB
+
+        def make_profile(profile, chat_id):
+            db = SessionDB(db_path=tmp_path / profile / "state.db")
+            request.addfinalizer(db.close)
+            owner_id, child_id = f"{profile}-owner", f"{profile}-child"
+            db.create_session(owner_id, source="telegram", profile_name=profile)
+            db.create_session(
+                child_id, source="subagent", parent_session_id=owner_id, profile_name=profile,
+            )
+            entry = self._entry(owner_id)
+            entry.session_key = f"agent:{profile}:telegram:dm:{chat_id}"
+            runner = object.__new__(GatewayRunner)
+            runner._session_db = AsyncSessionDB(db)
+            runner.session_store = MagicMock()
+            runner.session_store.switch_session = MagicMock()
+            runner.session_store.advance_compression_session = MagicMock()
+            runner._async_session_store = AsyncSessionStore(runner.session_store)
+            runner._completion_delivery_lock = threading.Lock()
+            runner._completion_deliveries_inflight = set()
+            runner._completion_deliveries_delivered = OrderedDict()
+            runner._completion_delivery_retention = 2048
+            return runner, db, entry, owner_id, child_id
+
+        runner_a, db_a, owner_a, owner_a_id, child_a_id = make_profile("profile-a", "100")
+        runner_b, db_b, owner_b, owner_b_id, child_b_id = make_profile("profile-b", "200")
+        assert await runner_a._resolve_async_delegation_session(owner_a, child_a_id) is None
+        assert await runner_b._resolve_async_delegation_session(owner_b, child_b_id) is None
+        assert db_a.get_session(child_b_id) is None
+        assert db_b.get_session(child_a_id) is None
+
+        delivered = []
+
+        async def capture(text, event, **_kwargs):
+            delivered.append((event["session_key"], text, event["delegation_id"]))
+            return True
+
+        async def ready(_event):
+            return True
+
+        runner_a._deliver_completion_notification = capture
+        runner_b._deliver_completion_notification = capture
+        runner_a._completion_delivery_ready = ready
+        runner_b._completion_delivery_ready = ready
+        monkeypatch.setattr("tools.async_delegation.claim_event_delivery", lambda event, _claim: event["delegation_id"])
+
+        def event(delegation_id, session_key, parent_session_id, summary):
+            return {
+                "type": "async_delegation", "delegation_id": delegation_id,
+                "session_key": session_key, "parent_session_id": parent_session_id,
+                "goal": delegation_id, "status": "completed", "summary": summary,
+                "api_calls": 1, "duration_seconds": 1.0,
+            }
+
+        a_first = event("a-first", owner_a.session_key, owner_a_id, "first arrived")
+        a_second = event("a-second", owner_a.session_key, owner_a_id, "second arrived")
+        b_only = event("b-only", owner_b.session_key, owner_b_id, "profile-b only")
+        assert await asyncio.gather(
+            runner_a._deliver_async_delegation_group([a_second, a_first]),
+            runner_b._deliver_async_delegation_group([b_only]),
+        ) == [True, True]
+
+        a_delivery = next(item for item in delivered if item[0] == owner_a.session_key)
+        b_delivery = next(item for item in delivered if item[0] == owner_b.session_key)
+        assert a_delivery[1].index("second arrived") < a_delivery[1].index("first arrived")
+        assert "profile-b only" not in a_delivery[1]
+        assert "profile-b only" in b_delivery[1]
+        assert db_a.get_session(owner_a_id)["profile_name"] == "profile-a"
+        assert db_b.get_session(owner_b_id)["profile_name"] == "profile-b"
 
     @pytest.mark.asyncio
     async def test_non_compression_ended_parent_drops(self):

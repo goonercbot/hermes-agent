@@ -146,9 +146,14 @@ def test_resumed_user_tail_fresh_note_restores_from_raw_session_db(tmp_path):
     assert canonical == history
     assert canonical is not None
 
+    # Match the real continuity-tool dispatch seam: only the enabled native
+    # capability may mint a host-authenticated result.  A bare namespace makes
+    # the handler correctly return its disabled error payload, which must never
+    # be persisted as a valid direct-note fixture.
     note = record_native_incremental_note_from_tool_call(
-        NS(session_id=sid), ARGS, canonical,
+        NS(session_id=sid, native_incremental_handoff_enabled=True), ARGS, canonical,
     )
+    assert json.loads(note)["ok"] is True
     persisted = [
         *canonical,
         {"role": "assistant", "content": "", "tool_calls": [{

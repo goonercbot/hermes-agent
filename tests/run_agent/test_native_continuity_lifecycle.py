@@ -526,14 +526,14 @@ def test_native_note_transition_diagnostics_are_correlated_private_and_neutral(
         pairs = {(event["event"], event["disposition"]) for event in events}
         assert ("native_note_issue", "issued") in pairs
         assert ("native_note_execute", "entered") in pairs
-        assert ("native_note_publication", "durable_saved") in pairs
+        assert ("native_note_publication", "flush_accepted") in pairs
         assert ("native_note_publication", "projection_bound") in pairs
         assert ("native_note_execute", "succeeded") in pairs
         assert ("native_note_prepare", "guard_rejected") in pairs
         assert all(set(event) <= {
             "event", "disposition", "message_count", "source_cursor", "capability_present",
             "projection_present", "request_digest", "session_digest", "prefix_digest",
-            "persisted", "dispatched", "turn_digest", "staged_note_present",
+            "flush_accepted", "dispatched", "turn_digest", "staged_note_present",
             "staged_source_cursor", "staged_prefix_digest",
         } for event in events)
         assert [event["source_cursor"] for event in events if event["event"] == "native_note_execute"
@@ -571,10 +571,17 @@ def test_native_note_transition_diagnostics_are_correlated_private_and_neutral(
             for record in caplog.records
             if record.name == "agent.native_continuity.diagnostics"
         ]
-        assert ("native_note_publication", "durable_saved") in {
+        assert ("native_note_publication", "flush_accepted") in {
             (event["event"], event["disposition"]) for event in failure_events
         }
-        assert failure_events[-1]["disposition"] == "failed_after_durable_save"
+        assert failure_events[-1]["disposition"] == "failed_after_flush_accepted"
+        failed_request = handoff._native_note_diagnostic_digest(f"{private_request}-failure:api:1")
+        failed_dispositions = [event["disposition"] for event in failure_events
+                               if event.get("request_digest") == failed_request]
+        assert "flush_accepted" in failed_dispositions
+        assert "readback_validated" not in failed_dispositions
+        assert "succeeded" not in failed_dispositions
+        assert all("persisted" not in event for event in failure_events)
         failure_text = "\n".join(record.getMessage() for record in caplog.records)
         for sentinel in (*private_note.values(), private_session, private_request, private_message):
             for value in sentinel if isinstance(sentinel, list) else [sentinel]:

@@ -40,8 +40,8 @@ _NATIVE_NOTE_DIAGNOSTIC_EVENTS = frozenset({
 })
 _NATIVE_NOTE_DIAGNOSTIC_DISPOSITIONS = frozenset({
     "attempted", "not_required", "guard_rejected", "issued", "entered",
-    "dispatch_accepted", "dispatch_rejected", "durable_saved", "readback_validated", "projection_bound",
-    "succeeded", "failed_before_durable_save", "failed_after_durable_save",
+    "dispatch_accepted", "dispatch_rejected", "flush_accepted", "readback_validated", "projection_bound",
+    "succeeded", "failed_before_flush_accepted", "failed_after_flush_accepted",
 })
 
 
@@ -54,7 +54,7 @@ def _native_note_diagnostic_digest(value: Any) -> Optional[str]:
 
 def log_native_note_transition(
     event: str, disposition: str, *, agent: Any = None, messages: Any = None,
-    note: Any = None, prefix: Any = None, persisted: Optional[bool] = None,
+    note: Any = None, prefix: Any = None, flush_accepted: Optional[bool] = None,
     dispatched: Optional[bool] = None,
 ) -> None:
     """Best-effort, privacy-safe native continuity transition diagnostic.
@@ -106,8 +106,8 @@ def log_native_note_transition(
         prefix_digest = _native_note_diagnostic_digest(prefix)
         if prefix_digest is not None:
             payload["prefix_digest"] = prefix_digest
-        if persisted is not None:
-            payload["persisted"] = bool(persisted)
+        if flush_accepted is not None:
+            payload["flush_accepted"] = bool(flush_accepted)
         if dispatched is not None:
             payload["dispatched"] = bool(dispatched)
         _diagnostic_logger.info(

@@ -199,7 +199,7 @@ def execute_native_note_refresh(agent, capability, response, messages, effective
     from agent.tool_dispatch_helpers import make_tool_result_message
 
     initial_message_count = len(messages)
-    durable_saved = False
+    flush_accepted = False
     dispatch_accepted = False
     log_native_note_transition(
         "native_note_execute", "entered", agent=agent, messages=messages,
@@ -304,10 +304,10 @@ def execute_native_note_refresh(agent, capability, response, messages, effective
         ))
         if agent._flush_messages_to_session_db(messages) is False:
             raise NativeNoteRefreshFailure("maintenance pair persistence failed")
-        durable_saved = True
+        flush_accepted = True
         log_native_note_transition(
-            "native_note_publication", "durable_saved", agent=agent, messages=messages,
-            note=expected, persisted=True, dispatched=dispatch_accepted,
+            "native_note_publication", "flush_accepted", agent=agent, messages=messages,
+            note=expected, flush_accepted=True, dispatched=dispatch_accepted,
         )
         # A successful flush alone is not proof: authenticate a fresh reader of
         # the canonical database, not the mutable replay or staged note.
@@ -324,7 +324,7 @@ def execute_native_note_refresh(agent, capability, response, messages, effective
             raise NativeNoteRefreshFailure("durable tool result missing")
         log_native_note_transition(
             "native_note_publication", "readback_validated", agent=agent, messages=messages,
-            note=expected, persisted=True, dispatched=dispatch_accepted,
+            note=expected, flush_accepted=True, dispatched=dispatch_accepted,
         )
         # The staged call/result pair is deliberately outside continuity
         # source evidence. Revalidate the original replay prefix, then map it
@@ -348,14 +348,14 @@ def execute_native_note_refresh(agent, capability, response, messages, effective
             raise NativeNoteRefreshFailure("canonical maintenance replay projection failed")
         log_native_note_transition(
             "native_note_publication", "projection_bound", agent=agent, messages=messages,
-            note=expected, persisted=True, dispatched=dispatch_accepted,
+            note=expected, flush_accepted=True, dispatched=dispatch_accepted,
         )
         # The ordinary usage/accounting path still owns this physical request.
         # Give it only the validated call, not maintenance narration/refusals
         # that could trigger ordinary retry or user-facing delivery policies.
         log_native_note_transition(
             "native_note_execute", "succeeded", agent=agent, messages=messages,
-            note=expected, persisted=True, dispatched=dispatch_accepted,
+            note=expected, flush_accepted=True, dispatched=dispatch_accepted,
         )
         return SimpleNamespace(
             output=[deepcopy(call)], status="completed",
@@ -370,8 +370,8 @@ def execute_native_note_refresh(agent, capability, response, messages, effective
         del messages[initial_message_count:]
         log_native_note_transition(
             "native_note_execute",
-            "failed_after_durable_save" if durable_saved else "failed_before_durable_save",
-            agent=agent, messages=messages, persisted=durable_saved, dispatched=dispatch_accepted,
+            "failed_after_flush_accepted" if flush_accepted else "failed_before_flush_accepted",
+            agent=agent, messages=messages, flush_accepted=flush_accepted, dispatched=dispatch_accepted,
         )
         if isinstance(exc, NativeNoteRefreshFailure):
             raise

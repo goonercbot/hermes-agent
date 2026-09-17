@@ -10,6 +10,8 @@ import pytest
 from agent.native_incremental_handoff import (
     bind_native_incremental_replay_projection,
     create_native_incremental_note,
+    _native_incremental_operation_messages,
+    _protected_tail_since_note,
     native_note_refresh_required,
     record_native_incremental_note_from_tool_call,
     restore_native_incremental_note,
@@ -460,6 +462,99 @@ def test_native_canonical_source_keeps_sqlite_structured_content_exact(tmp_path)
 def test_persistence_disabled_fork_is_never_maintenance_eligible():
     fork = NS(_persist_disabled=True, _session_db=None)
     assert not native_note_refresh_required(fork, [{"role": "user", "content": "x" * 200000}])
+
+
+def _agent_with_authenticated_prefix_note(messages, *, cursor=2):
+    agent = NS(session_id=SID, native_incremental_handoff_enabled=True)
+    recorded = json.loads(record_native_incremental_note_from_tool_call(agent, ARGS, messages[:cursor]))
+    assert recorded["ok"] is True
+    assert agent._native_incremental_handoff_note["source_cursor"] == cursor
+    return agent
+
+
+def test_checkpoint_carrier_latest_user_is_protected_but_not_refreshed_again():
+    """Public shape of the retained child before repeated forced maintenance."""
+    history = _synthetic_checkpoint_child_with_historical_pair(pair_in_tail=True)
+    history.append({"role": "user", "content": "latest required correction " * 6000})
+    agent = NS(session_id=SID)
+
+    note = restore_native_incremental_note(agent, history)
+
+    assert note is not None and note["source_cursor"] == 2
+    assert not native_note_refresh_required(agent, history)
+    protected = _protected_tail_since_note(history, note)
+    assert protected[-1] == history[-1]
+
+
+def test_authenticated_note_freshness_keeps_older_and_post_user_evidence():
+    initial = [
+        {"role": "user", "content": "initial objective"},
+        {"role": "assistant", "content": "initial completion"},
+    ]
+    older_large = [
+        *initial,
+        {"role": "user", "content": "older retained evidence " * 6000},
+        {"role": "assistant", "content": "ordinary completion"},
+        {"role": "user", "content": "small latest correction"},
+    ]
+    post_user_tool_output = [
+        *initial,
+        {"role": "user", "content": "small latest correction"},
+        {"role": "assistant", "content": "", "tool_calls": [{
+            "id": "large-result", "type": "function",
+            "function": {"name": "terminal", "arguments": "{}"},
+        }]},
+        {"role": "tool", "tool_call_id": "large-result", "name": "terminal",
+         "content": "post-user operational result " * 6000},
+    ]
+    non_user_large = [
+        *initial,
+        {"role": "user", "content": "small latest correction"},
+        {"role": "assistant", "content": "non-user evidence " * 8000},
+    ]
+
+    assert native_note_refresh_required(_agent_with_authenticated_prefix_note(older_large), older_large)
+    assert native_note_refresh_required(
+        _agent_with_authenticated_prefix_note(post_user_tool_output), post_user_tool_output,
+    )
+    assert native_note_refresh_required(_agent_with_authenticated_prefix_note(non_user_large), non_user_large)
+
+
+def test_latest_user_exclusion_uses_direct_and_noncanonical_projection_cursors():
+    direct = [
+        {"role": "user", "content": "initial objective"},
+        {"role": "assistant", "content": "initial completion"},
+        {"role": "user", "content": "latest required correction " * 6000},
+    ]
+    direct_agent = _agent_with_authenticated_prefix_note(direct)
+    _source, direct_is_canonical = _native_incremental_operation_messages(direct_agent, direct)
+    assert direct_is_canonical
+    assert not native_note_refresh_required(direct_agent, direct)
+
+    source = [
+        {"role": "user", "content": "initial objective"},
+        {"role": "assistant", "content": "", "tool_calls": [{
+            "id": "projection-tool", "type": "function",
+            "function": {"name": "terminal", "arguments": "{}"},
+        }]},
+        {"role": "tool", "tool_call_id": "projection-tool", "name": "terminal",
+         "content": "canonical tool result"},
+        {"role": "user", "content": "latest required correction " * 6000},
+    ]
+    replay = deepcopy(source)
+    replay[2]["content"] = "replay-only tool result"
+    projection_agent = _agent_with_authenticated_prefix_note(source)
+    assert bind_native_incremental_replay_projection(
+        projection_agent, source_messages=source, replay_messages=replay,
+    )
+    _source, projection_is_canonical = _native_incremental_operation_messages(projection_agent, replay)
+    assert not projection_is_canonical
+    assert not native_note_refresh_required(projection_agent, replay)
+
+
+def test_initial_no_note_still_uses_full_size_accounting():
+    messages = [{"role": "user", "content": "initial required input " * 6000}]
+    assert native_note_refresh_required(NS(), messages)
 
 
 def test_projection_binding_keeps_valid_source_for_fresh_reload():

@@ -983,6 +983,21 @@ def native_note_refresh_required(agent: Any, messages: List[Dict[str, Any]]) -> 
     else:
         cursor = getattr(agent, "_native_incremental_handoff_projection_cursor", None)
         tail = messages[cursor if cursor is not None else note["source_cursor"]:]
+    if note is not None:
+        # _protected_tail_since_note retains the latest real user row outside
+        # this size guard. Exclude that one independently protected input, but
+        # keep every older row and every post-user operation/result accountable.
+        latest_user_index = next(
+            (
+                index for index in range(len(tail) - 1, -1, -1)
+                if isinstance(tail[index], dict)
+                and tail[index].get("role") == "user"
+                and not tail[index].get("_todo_snapshot_synthetic")
+            ),
+            None,
+        )
+        if latest_user_index is not None:
+            tail = tail[:latest_user_index] + tail[latest_user_index + 1:]
     return _native_message_size(tail) > 128_000
 
 

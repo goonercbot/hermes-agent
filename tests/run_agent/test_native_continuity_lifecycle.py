@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from copy import deepcopy
 from types import SimpleNamespace as NS
 
@@ -437,6 +438,191 @@ def test_untrimmed_replay_refresh_advances_next_request_and_compacts_canonical_s
     finally:
         agent.close()
         db.close()
+
+
+def test_native_note_transition_diagnostics_are_correlated_private_and_neutral(
+    tmp_path, monkeypatch, caplog, blocking_router,
+):
+    """Real prepare/execute boundaries expose state without logging note contents."""
+    from hermes_state import SessionDB
+    from run_agent import AIAgent
+    from agent.native_incremental_handoff import prepare_native_note_refresh_request
+    import agent.native_incremental_handoff as handoff
+    import agent.native_note_refresh as refresh
+
+    private_session = "PRIVATE_SESSION_SENTINEL"
+    private_request = "PRIVATE_REQUEST_SENTINEL"
+    private_message = "PRIVATE_MESSAGE_SENTINEL"
+    private_note = {
+        "objective": "PRIVATE_OBJECTIVE_SENTINEL",
+        "current_plan": "PRIVATE_PLAN_SENTINEL",
+        "next_action": "PRIVATE_ACTION_SENTINEL",
+        "blockers": ["PRIVATE_BLOCKER_SENTINEL"],
+    }
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        "compression:\n  enabled: true\n  codex_responses_native: true\n"
+        "  native_incremental_handoff: true\n"
+    )
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session(private_session, "subagent", model="gpt-5.6-terra")
+    agent = AIAgent(
+        api_key="fixture", base_url="https://chatgpt.com/backend-api/codex",
+        api_mode="codex_responses", model="gpt-5.6-terra", provider="openai-codex",
+        session_db=db, session_id=private_session, platform="subagent", quiet_mode=True,
+        skip_memory=True, skip_context_files=True, skip_background_review=True,
+        enabled_toolsets=["continuity"],
+    )
+    agent._end_session_on_close = False  # type: ignore[attr-defined]
+    try:
+        db.append_message(private_session, "user", private_message)
+        db.append_message(private_session, "assistant", "public initial evidence")
+        db.append_message(private_session, "assistant", "", tool_calls=[{
+            "id": "old-note", "type": "function",
+            "function": {"name": "continuity_note", "arguments": json.dumps(private_note)},
+        }])
+        source = db.get_messages_as_conversation(private_session, repair_alternation=False)
+        db.append_message(
+            private_session, "tool",
+            record_native_incremental_note_from_tool_call(agent, private_note, source),
+            tool_call_id="old-note", tool_name="continuity_note",
+        )
+        db.append_message(private_session, "assistant", "public stale evidence " * 9000)
+        replay = db.get_messages_as_conversation(private_session, repair_alternation=False)
+        assert restore_native_incremental_note(agent, replay) is not None
+
+        with caplog.at_level(logging.INFO, logger="agent.native_continuity.diagnostics"):
+            for number in (1, 2):
+                setattr(agent, "_current_api_request_id", f"{private_request}:api:{number}")
+                request = {"instructions": "ordinary", "tools": []}
+                capability = prepare_native_note_refresh_request(agent, replay, request)
+                assert capability is not False
+                capability.bind_request(request)
+                execute_native_note_refresh(
+                    agent, capability,
+                    reply(NS(type="function_call", id=f"fc-{number}", call_id=f"note-{number}",
+                             name="continuity_note", arguments=json.dumps(private_note))),
+                    replay, private_session,
+                )
+                if number == 1:
+                    db.append_message(private_session, "assistant", "public next evidence " * 9000)
+                    replay.append({"role": "assistant", "content": "public next evidence " * 9000})
+
+            # This second physical request shares an authenticated cursor with
+            # the first and must preserve the existing guard rejection.
+            db.append_message(private_session, "assistant", "public guard evidence " * 9000)
+            replay.append({"role": "assistant", "content": "public guard evidence " * 9000})
+            setattr(agent, "_current_api_request_id", f"{private_request}-guard:api:1")
+            assert prepare_native_note_refresh_request(agent, replay, {"instructions": "ordinary", "tools": []})
+            setattr(agent, "_current_api_request_id", f"{private_request}-guard:api:2")
+            with pytest.raises(NativeNoteRefreshFailure, match="did not advance"):
+                prepare_native_note_refresh_request(agent, replay, {"instructions": "ordinary", "tools": []})
+
+        events = [
+            json.loads(record.getMessage().split(" ", 1)[1])
+            for record in caplog.records
+            if record.name == "agent.native_continuity.diagnostics"
+        ]
+        pairs = {(event["event"], event["disposition"]) for event in events}
+        assert ("native_note_issue", "issued") in pairs
+        assert ("native_note_execute", "entered") in pairs
+        assert ("native_note_publication", "durable_saved") in pairs
+        assert ("native_note_publication", "projection_bound") in pairs
+        assert ("native_note_execute", "succeeded") in pairs
+        assert ("native_note_prepare", "guard_rejected") in pairs
+        assert all(set(event) <= {
+            "event", "disposition", "message_count", "source_cursor", "capability_present",
+            "projection_present", "request_digest", "session_digest", "prefix_digest",
+            "persisted", "dispatched", "turn_digest", "staged_note_present",
+            "staged_source_cursor", "staged_prefix_digest",
+        } for event in events)
+        assert [event["source_cursor"] for event in events if event["event"] == "native_note_execute"
+                and event["disposition"] == "succeeded"] == sorted(
+                    event["source_cursor"] for event in events if event["event"] == "native_note_execute"
+                    and event["disposition"] == "succeeded"
+                )
+        diagnostic_text = "\n".join(record.getMessage() for record in caplog.records)
+        for sentinel in (*private_note.values(), private_session, private_request, private_message):
+            if isinstance(sentinel, list):
+                for item in sentinel:
+                    assert item not in diagnostic_text
+            else:
+                assert sentinel not in diagnostic_text
+
+        # A durable save followed by readback invalidation must emit the save
+        # and fixed failure disposition, without exposing the raised detail.
+        db.append_message(private_session, "assistant", "public failure evidence " * 9000)
+        replay.append({"role": "assistant", "content": "public failure evidence " * 9000})
+        setattr(agent, "_current_api_request_id", f"{private_request}-failure:api:1")
+        failed = prepare_native_note_refresh_request(agent, replay, {"instructions": "ordinary", "tools": []})
+        assert failed is not False
+        failed.bind_request({})
+        with monkeypatch.context() as patched:
+            patched.setattr(refresh, "restore_native_incremental_note", lambda *_a, **_k: None)
+            with pytest.raises(NativeNoteRefreshFailure, match="readback failed"):
+                execute_native_note_refresh(
+                    agent, failed,
+                    reply(NS(type="function_call", id="fc-failure", call_id="note-failure",
+                             name="continuity_note", arguments=json.dumps(private_note))),
+                    replay, private_session,
+                )
+        failure_events = [
+            json.loads(record.getMessage().split(" ", 1)[1])
+            for record in caplog.records
+            if record.name == "agent.native_continuity.diagnostics"
+        ]
+        assert ("native_note_publication", "durable_saved") in {
+            (event["event"], event["disposition"]) for event in failure_events
+        }
+        assert failure_events[-1]["disposition"] == "failed_after_durable_save"
+        failure_text = "\n".join(record.getMessage() for record in caplog.records)
+        for sentinel in (*private_note.values(), private_session, private_request, private_message):
+            for value in sentinel if isinstance(sentinel, list) else [sentinel]:
+                assert value not in failure_text
+
+        # Diagnostics failures are inert even on the production preparation path.
+        from tests.run_agent.test_native_incremental_handoff import _agent, _note
+        neutral_agent, _ = _agent([])
+        neutral_agent._current_api_request_id = "neutral:api:1"
+        neutral_messages = [{"role": "user", "content": "fixed synthetic input"}]
+        _note(neutral_agent, neutral_messages)
+        neutral_messages.append({"role": "assistant", "content": "fixed evidence " * 30000})
+        with monkeypatch.context() as patched:
+            patched.setattr(handoff._diagnostic_logger, "info", lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("private log failure")))
+            neutral = prepare_native_note_refresh_request(
+                neutral_agent, neutral_messages, {"instructions": "ordinary", "tools": []},
+            )
+        assert neutral is not False
+        neutral.close()
+    finally:
+        agent.close()
+        db.close()
+
+
+def test_native_note_diagnostics_do_not_authenticate_disabled_route(monkeypatch, caplog):
+    import agent.native_incremental_handoff as handoff
+    from tests.run_agent.test_native_incremental_handoff import _agent
+
+    agent, _ = _agent([])
+    agent._current_api_request_id = "private-turn:api:1"
+    agent._native_incremental_handoff_projection_cursor = 77
+    agent._native_incremental_handoff_note = {
+        "source_cursor": 12, "source_prefix_fence": "private-prefix",
+    }
+    monkeypatch.setattr(handoff, "native_incremental_continuity_capable", lambda *_a, **_k: False)
+    def forbidden(*_a, **_k):
+        pytest.fail("diagnostics must not invoke stateful authentication")
+    monkeypatch.setattr(handoff, "_staged_note", forbidden)
+    with caplog.at_level(logging.INFO, logger="agent.native_continuity.diagnostics"):
+        assert handoff.prepare_native_note_refresh_request(agent, [], {}) is False
+    assert agent._native_incremental_handoff_projection_cursor == 77
+    events = [json.loads(r.getMessage().split(" ", 1)[1]) for r in caplog.records
+              if r.name == "agent.native_continuity.diagnostics"]
+    assert [e["disposition"] for e in events] == ["attempted", "not_required"]
+    assert all(e["staged_source_cursor"] == 12 for e in events)
+    assert all("source_cursor" not in e for e in events)
+    assert all(e["turn_digest"] == handoff._native_note_diagnostic_digest("private-turn") for e in events)
+    assert "private-turn" not in caplog.text and "private-prefix" not in caplog.text
 
 
 def test_native_canonical_source_keeps_sqlite_structured_content_exact(tmp_path):

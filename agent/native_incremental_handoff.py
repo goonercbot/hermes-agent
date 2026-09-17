@@ -30,6 +30,93 @@ from agent.native_compaction import (
 )
 
 logger = logging.getLogger(__name__)
+_diagnostic_logger = logging.getLogger("agent.native_continuity.diagnostics")
+
+# This deliberately remains a narrow event log rather than a general telemetry
+# surface. The payload admits only fixed state names, bounded counts/booleans,
+# and one-way correlations for logical identifiers.
+_NATIVE_NOTE_DIAGNOSTIC_EVENTS = frozenset({
+    "native_note_prepare", "native_note_issue", "native_note_execute", "native_note_publication",
+})
+_NATIVE_NOTE_DIAGNOSTIC_DISPOSITIONS = frozenset({
+    "attempted", "not_required", "guard_rejected", "issued", "entered",
+    "dispatch_accepted", "dispatch_rejected", "durable_saved", "readback_validated", "projection_bound",
+    "succeeded", "failed_before_durable_save", "failed_after_durable_save",
+})
+
+
+def _native_note_diagnostic_digest(value: Any) -> Optional[str]:
+    """Return a correlation digest without rendering private identifiers."""
+    if not isinstance(value, str) or not value:
+        return None
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
+
+
+def log_native_note_transition(
+    event: str, disposition: str, *, agent: Any = None, messages: Any = None,
+    note: Any = None, prefix: Any = None, persisted: Optional[bool] = None,
+    dispatched: Optional[bool] = None,
+) -> None:
+    """Best-effort, privacy-safe native continuity transition diagnostic.
+
+    Diagnostics are intentionally unable to affect a maintenance transaction:
+    logging failures and malformed diagnostic inputs are swallowed here.
+    """
+    try:
+        if (
+            event not in _NATIVE_NOTE_DIAGNOSTIC_EVENTS
+            or disposition not in _NATIVE_NOTE_DIAGNOSTIC_DISPOSITIONS
+        ):
+            return
+        payload: Dict[str, Any] = {"event": event, "disposition": disposition}
+        if isinstance(messages, list):
+            payload["message_count"] = len(messages)
+        if isinstance(note, dict):
+            cursor = note.get("source_cursor")
+            if isinstance(cursor, int) and not isinstance(cursor, bool) and cursor >= 0:
+                payload["source_cursor"] = cursor
+            prefix = note.get("source_prefix_fence") if prefix is None else prefix
+        if agent is not None:
+            # Observe raw host state without re-running authentication: the
+            # authenticator also updates the projection cursor.
+            staged = getattr(agent, "_native_incremental_handoff_note", None)
+            payload["staged_note_present"] = isinstance(staged, dict)
+            if isinstance(staged, dict):
+                cursor = staged.get("source_cursor")
+                if isinstance(cursor, int) and not isinstance(cursor, bool) and cursor >= 0:
+                    payload["staged_source_cursor"] = cursor
+                staged_digest = _native_note_diagnostic_digest(staged.get("source_prefix_fence"))
+                if staged_digest is not None:
+                    payload["staged_prefix_digest"] = staged_digest
+            payload["capability_present"] = bool(
+                getattr(agent, "_native_note_refresh_capability", None)
+            )
+            payload["projection_present"] = isinstance(
+                getattr(agent, "_native_incremental_replay_projection", None), dict
+            )
+            request_id = getattr(agent, "_current_api_request_id", None)
+            request_digest = _native_note_diagnostic_digest(request_id)
+            if isinstance(request_id, str) and ":api:" in request_id:
+                payload["turn_digest"] = _native_note_diagnostic_digest(request_id.partition(":api:")[0])
+            session_digest = _native_note_diagnostic_digest(getattr(agent, "session_id", None))
+            if request_digest is not None:
+                payload["request_digest"] = request_digest
+            if session_digest is not None:
+                payload["session_digest"] = session_digest
+        prefix_digest = _native_note_diagnostic_digest(prefix)
+        if prefix_digest is not None:
+            payload["prefix_digest"] = prefix_digest
+        if persisted is not None:
+            payload["persisted"] = bool(persisted)
+        if dispatched is not None:
+            payload["dispatched"] = bool(dispatched)
+        _diagnostic_logger.info(
+            "native_continuity_transition %s",
+            json.dumps(payload, sort_keys=True, separators=(",", ":")),
+        )
+    except Exception:
+        pass
+
 
 NATIVE_INCREMENTAL_NOTE_VERSION = 1
 NATIVE_INCREMENTAL_MODEL = "gpt-5.6-luna"
@@ -1009,11 +1096,17 @@ def prepare_native_note_refresh_request(agent: Any, messages: List[Dict[str, Any
         NativeNoteRefreshFailure, close_native_note_refresh, issue_native_note_refresh,
     )
     close_native_note_refresh(agent)
+    log_native_note_transition(
+        "native_note_prepare", "attempted", agent=agent, messages=messages,
+    )
     route = classify_responses_route(agent)
     if not native_incremental_continuity_capable(
         agent, is_codex_backend=route.is_codex_backend,
         is_xai_responses=route.is_xai_responses, is_github_responses=route.is_github_responses,
     ) or not native_note_refresh_required(agent, messages):
+        log_native_note_transition(
+            "native_note_prepare", "not_required", agent=agent, messages=messages,
+        )
         return False
     request_id = getattr(agent, "_current_api_request_id", None)
     if isinstance(request_id, str) and ":api:" in request_id:
@@ -1021,6 +1114,9 @@ def prepare_native_note_refresh_request(agent: Any, messages: List[Dict[str, Any
         identity = (request_id.partition(":api:")[0], note.get("source_prefix_fence"))
         previous = getattr(agent, "_native_note_refresh_request_guard", None)
         if previous and previous[0] == identity and previous[1] != request_id:
+            log_native_note_transition(
+                "native_note_prepare", "guard_rejected", agent=agent, messages=messages, note=note,
+            )
             raise NativeNoteRefreshFailure("did not advance its authenticated cursor; stopping repeated maintenance requests")
         agent._native_note_refresh_request_guard = (identity, request_id)
     # The note is a registered, host-bound maintenance tool. No executable

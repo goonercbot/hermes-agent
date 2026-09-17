@@ -14,6 +14,7 @@ from agent.native_incremental_handoff import (
     _projection_source_for_messages,
     _staged_note,
     create_native_incremental_note,
+    log_native_note_transition,
     record_native_incremental_note,
     record_native_incremental_note_from_tool_call,
     restore_native_incremental_note,
@@ -99,6 +100,10 @@ def issue_native_note_refresh(agent, messages):
     capability = _NoteRefreshCapability(agent, messages)
     _LIVE_CAPABILITIES.add(capability)
     agent._native_note_refresh_capability = capability
+    log_native_note_transition(
+        "native_note_issue", "issued", agent=agent, messages=messages,
+        note=capability.previous_note,
+    )
     return capability
 
 
@@ -194,6 +199,11 @@ def execute_native_note_refresh(agent, capability, response, messages, effective
     from agent.tool_dispatch_helpers import make_tool_result_message
 
     initial_message_count = len(messages)
+    durable_saved = False
+    dispatch_accepted = False
+    log_native_note_transition(
+        "native_note_execute", "entered", agent=agent, messages=messages,
+    )
     try:
         if type(capability) is not _NoteRefreshCapability:
             raise NativeNoteRefreshFailure("forged maintenance capability")
@@ -275,6 +285,12 @@ def execute_native_note_refresh(agent, capability, response, messages, effective
             effective_task_id=effective_task_id, tool_call_id=call_id,
             execute=record, maintenance_capability=capability,
         )
+        dispatch_accepted = bool(managed.dispatched and not managed.blocked)
+        log_native_note_transition(
+            "native_note_execute",
+            "dispatch_accepted" if dispatch_accepted else "dispatch_rejected",
+            agent=agent, messages=messages, note=expected, dispatched=dispatch_accepted,
+        )
         capability.check(agent)
         if (
             managed.blocked or not managed.dispatched
@@ -288,6 +304,11 @@ def execute_native_note_refresh(agent, capability, response, messages, effective
         ))
         if agent._flush_messages_to_session_db(messages) is False:
             raise NativeNoteRefreshFailure("maintenance pair persistence failed")
+        durable_saved = True
+        log_native_note_transition(
+            "native_note_publication", "durable_saved", agent=agent, messages=messages,
+            note=expected, persisted=True, dispatched=dispatch_accepted,
+        )
         # A successful flush alone is not proof: authenticate a fresh reader of
         # the canonical database, not the mutable replay or staged note.
         stored = agent._session_db.get_messages_as_conversation(
@@ -301,6 +322,10 @@ def execute_native_note_refresh(agent, capability, response, messages, effective
             and row.get("content") == managed.result for row in stored
         ):
             raise NativeNoteRefreshFailure("durable tool result missing")
+        log_native_note_transition(
+            "native_note_publication", "readback_validated", agent=agent, messages=messages,
+            note=expected, persisted=True, dispatched=dispatch_accepted,
+        )
         # The staged call/result pair is deliberately outside continuity
         # source evidence. Revalidate the original replay prefix, then map it
         # back to canonical history; using ``messages[:-1]`` would include the
@@ -321,9 +346,17 @@ def execute_native_note_refresh(agent, capability, response, messages, effective
             agent, source_messages=stored, replay_messages=messages,
         ):
             raise NativeNoteRefreshFailure("canonical maintenance replay projection failed")
+        log_native_note_transition(
+            "native_note_publication", "projection_bound", agent=agent, messages=messages,
+            note=expected, persisted=True, dispatched=dispatch_accepted,
+        )
         # The ordinary usage/accounting path still owns this physical request.
         # Give it only the validated call, not maintenance narration/refusals
         # that could trigger ordinary retry or user-facing delivery policies.
+        log_native_note_transition(
+            "native_note_execute", "succeeded", agent=agent, messages=messages,
+            note=expected, persisted=True, dispatched=dispatch_accepted,
+        )
         return SimpleNamespace(
             output=[deepcopy(call)], status="completed",
             usage=_item_value(response, "usage"), model=_item_value(response, "model"),
@@ -335,6 +368,11 @@ def execute_native_note_refresh(agent, capability, response, messages, effective
         # auditable, restart-safe recovery rather than rewriting user/task/tool
         # history; the recovery gate accepts only the narrow known pair shape.
         del messages[initial_message_count:]
+        log_native_note_transition(
+            "native_note_execute",
+            "failed_after_durable_save" if durable_saved else "failed_before_durable_save",
+            agent=agent, messages=messages, persisted=durable_saved, dispatched=dispatch_accepted,
+        )
         if isinstance(exc, NativeNoteRefreshFailure):
             raise
         raise NativeNoteRefreshFailure("maintenance execution or persistence failed") from exc

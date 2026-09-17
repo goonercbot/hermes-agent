@@ -148,3 +148,86 @@ class TestOpenLockPatience:
             SessionDB(db_path=bad_path)
         # Must fail well before a full patience window (loose bound).
         assert time.monotonic() - t0 < 15.0
+
+
+class TestWriteBusyTimeoutRestoration:
+    @staticmethod
+    def _writer_busy_timeout(db):
+        with db._lock:
+            return int(db._conn.execute("PRAGMA busy_timeout").fetchone()[0])
+
+    @pytest.mark.parametrize("configured_timeout", [0, 237])
+    def test_successful_begin_restores_exact_configured_timeout(self, db, configured_timeout):
+        with db._lock:
+            db._conn.execute(f"PRAGMA busy_timeout={configured_timeout}")
+
+        db.set_meta("timeout-success", str(configured_timeout))
+
+        assert self._writer_busy_timeout(db) == configured_timeout
+
+    @pytest.mark.parametrize("failure", [RuntimeError, KeyboardInterrupt])
+    def test_callback_failure_rolls_back_and_restores_timeout(self, db, failure):
+        configured_timeout = 337
+        with db._lock:
+            db._conn.execute(f"PRAGMA busy_timeout={configured_timeout}")
+
+        def mutate_then_fail(conn):
+            conn.execute("INSERT INTO state_meta (key, value) VALUES ('timeout-failure', 'pending')")
+            raise failure("callback stopped")
+
+        with pytest.raises(failure, match="callback stopped"):
+            db._execute_write(mutate_then_fail)
+
+        assert db.get_meta("timeout-failure") is None
+        assert self._writer_busy_timeout(db) == configured_timeout
+
+    def test_failed_begin_restores_timeout_before_deadline_error(self, db, monkeypatch):
+        configured_timeout = 421
+        with db._lock:
+            db._conn.execute(f"PRAGMA busy_timeout={configured_timeout}")
+        monkeypatch.setattr(SessionDB, "_WRITE_PATIENCE_S", 0.0)
+
+        started = threading.Event()
+        holder = threading.Thread(
+            target=_hold_write_lock, args=(db.db_path, 0.5, started)
+        )
+        holder.start()
+        try:
+            assert started.wait(5.0)
+            with pytest.raises(sqlite3.OperationalError, match="another Hermes process"):
+                db.set_meta("timeout-failed-begin", "no")
+        finally:
+            holder.join(timeout=10.0)
+        assert not holder.is_alive()
+        assert self._writer_busy_timeout(db) == configured_timeout
+
+    def test_reopen_uses_new_connection_and_preserves_its_timeout(self, db):
+        original = db._conn
+        db.close()
+
+        db.set_meta("timeout-reopen", "yes")
+
+        assert db._conn is not original
+        assert self._writer_busy_timeout(db) == 1000
+
+    def test_direct_vacuum_waits_after_ordinary_write(self, db):
+        """Maintenance uses the writer's configured SQLite grace, not a leaked write deadline zero."""
+        db.set_meta("timeout-maintenance", "written")
+        assert self._writer_busy_timeout(db) == 1000
+
+        started = threading.Event()
+        holder = threading.Thread(
+            target=_hold_write_lock, args=(db.db_path, 0.35, started)
+        )
+        holder.start()
+        try:
+            assert started.wait(5.0)
+            began = time.monotonic()
+            with db._lock:
+                db._conn.execute("VACUUM")
+            elapsed = time.monotonic() - began
+        finally:
+            holder.join(timeout=10.0)
+        assert not holder.is_alive()
+        assert 0.15 <= elapsed < 2.0
+        assert self._writer_busy_timeout(db) == 1000

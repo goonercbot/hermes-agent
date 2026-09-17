@@ -338,12 +338,15 @@ def execute_native_note_refresh(agent, capability, response, messages, effective
         if current_source is None or _note_fence(current_source) != source_fence:
             raise NativeNoteRefreshFailure("maintenance source changed during dispatch")
         record_native_incremental_note(agent, expected, source)
-        # Keep the raw provider replay only as a fenced projection. The source
-        # is the just-read canonical DB history, including the published pair,
-        # so the next note check and automatic compaction authenticate the same
-        # bytes that durable readback used without rewriting historical rows.
+        # Preserve an unequal repaired prefix boundary: the published pair is a
+        # shared suffix, so rebinding it would move the just-recorded note
+        # cursor into an ambiguous interior position. Equal-length projections
+        # retain the full durable binding, including the exact DB row metadata.
+        unequal_prefix = len(stored_before) != initial_message_count
         if not bind_native_incremental_replay_projection(
-            agent, source_messages=stored, replay_messages=messages,
+            agent,
+            source_messages=stored_before if unequal_prefix else stored,
+            replay_messages=(messages[:initial_message_count] if unequal_prefix else messages),
         ):
             raise NativeNoteRefreshFailure("canonical maintenance replay projection failed")
         log_native_note_transition(

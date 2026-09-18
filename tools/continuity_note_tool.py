@@ -17,8 +17,10 @@ CONTINUITY_NOTE_SCHEMA = {
     "description": (
         "Record the accumulated active task's objective, plan, next action, and "
         "blockers for the opt-in native incremental continuity route. Preserve each "
-        "unfinished objective and its identifying facts or constraints when recording "
-        "additive results in verified work state. An explicit user replacement or "
+        "unfinished objective and its identifying facts or constraints. Preserve task "
+        "identifiers, routes, version strings, and other exact-match values verbatim, "
+        "including spelling and punctuation; do not paraphrase them. Record additive "
+        "results in verified work state. An explicit user replacement or "
         "cancellation, completed work, or a genuinely new substantive task supersedes "
         "prior goals. Current user instructions always take precedence over this "
         "agent-authored note. "
@@ -29,7 +31,7 @@ CONTINUITY_NOTE_SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
-            "objective": {"type": "string", "description": "Accumulated active objective, retaining unfinished identifying facts and constraints."},
+            "objective": {"type": "string", "description": "Accumulated active objective, retaining unfinished identifying facts, constraints, and exact-match values verbatim."},
             "current_plan": {"type": "string", "description": "Current concise plan for the accumulated active task."},
             "next_action": {"type": "string", "description": "Single next action for the accumulated active task."},
             "blockers": {

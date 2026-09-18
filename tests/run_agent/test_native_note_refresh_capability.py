@@ -84,11 +84,14 @@ def test_maintenance_contract_accumulates_active_work_and_limits_supersession():
     instructions = request['instructions']
     description = CONTINUITY_NOTE_SCHEMA['description']
     assert 'preserve every unfinished objective and its identifying facts or constraints' in instructions
+    assert 'Preserve task identifiers, routes, version strings, and other exact-match values verbatim, including spelling and punctuation; do not paraphrase them' in instructions
     assert 'add new results to verified work state rather than replacing that objective' in instructions
     assert 'explicitly replaces or cancels the goal, completed work, or a genuinely new substantive task' in instructions
     assert 'Preserve each unfinished objective and its identifying facts or constraints' in description
+    assert ('Preserve task identifiers, routes, version strings, and other exact-match values '
+            'verbatim, including spelling and punctuation; do not paraphrase them.') in description
     assert 'explicit user replacement or cancellation, completed work, or a genuinely new substantive task' in description
     assert CONTINUITY_NOTE_SCHEMA['parameters']['properties']['objective']['description'] == (
-        'Accumulated active objective, retaining unfinished identifying facts and constraints.'
+        'Accumulated active objective, retaining unfinished identifying facts, constraints, and exact-match values verbatim.'
     )
 

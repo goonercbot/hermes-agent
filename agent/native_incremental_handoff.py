@@ -1136,7 +1136,9 @@ def prepare_native_note_refresh_request(agent: Any, messages: List[Dict[str, Any
     request["instructions"] = str(request.get("instructions", "")) + (
         "\nContext maintenance: call continuity_note now with a concise accumulated "
         "active task: preserve every unfinished objective and its identifying facts "
-        "or constraints, and add new results to verified work state rather than "
+        "or constraints. Preserve task identifiers, routes, version strings, and "
+        "other exact-match values verbatim, including spelling and punctuation; do "
+        "not paraphrase them; add new results to verified work state rather than "
         "replacing that objective. A user instruction that explicitly replaces or "
         "cancels the goal, completed work, or a genuinely new substantive task "
         "supersedes prior goals. Record the current plan, next action, and unresolved "

@@ -169,18 +169,36 @@ def build_api_request(
             api_messages, tools_for_api=tools_for_api, **_native_continuity_kwargs
         )
     _native_note_refresh_request = False
-    if _native_continuity_kwargs and isinstance(api_kwargs.get("input"), list):
-        from agent.native_incremental_handoff import native_incremental_resume_instructions
-
-        if any(isinstance(item, dict) and item.get("type") == "compaction" for item in api_kwargs["input"]):
-            api_kwargs["instructions"] = native_incremental_resume_instructions(
-                api_kwargs.get("instructions", ""),
-                _native_continuity_kwargs["native_continuity_source_messages"],
-            )
     if agent.api_mode == "codex_responses" and getattr(agent, "native_incremental_handoff_enabled", False):
         from agent.native_incremental_handoff import prepare_native_note_refresh_request
 
         _native_note_refresh_request = prepare_native_note_refresh_request(agent, messages, api_kwargs)
+    resume_pending = bool(getattr(agent, "_native_note_refresh_resume_pending", False))
+    current_request_id = getattr(agent, "_current_api_request_id", None)
+    if resume_pending and getattr(agent, "_native_note_refresh_resume_request_id", None) not in {
+        None, current_request_id,
+    }:
+        # A normal request was already prepared.  Do not keep injecting the
+        # maintenance boundary into later tool rounds or future user turns.
+        agent._native_note_refresh_resume_pending = False
+        resume_pending = False
+    if (
+        not _native_note_refresh_request
+        and _native_continuity_kwargs
+        and isinstance(api_kwargs.get("input"), list)
+        and (
+            resume_pending
+            or any(isinstance(item, dict) and item.get("type") == "compaction" for item in api_kwargs["input"])
+        )
+    ):
+        from agent.native_incremental_handoff import native_incremental_resume_instructions
+
+        api_kwargs["instructions"] = native_incremental_resume_instructions(
+            api_kwargs.get("instructions", ""),
+            _native_continuity_kwargs["native_continuity_source_messages"],
+        )
+        if resume_pending:
+            agent._native_note_refresh_resume_request_id = current_request_id
     # Surrogate chokepoint: tool descriptions, extra_body and kwargs strings can carry
     # invalid code points (HTTP 400). One walk makes the payload json.dumps()-safe.
     # Outbound-request surrogate chokepoint (#50959): the messages were scrubbed above, but the rest of the

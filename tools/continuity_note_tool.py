@@ -17,7 +17,10 @@ CONTINUITY_NOTE_SCHEMA = {
     "description": (
         "Record the current objective, plan, next action, and blockers for the "
         "opt-in native incremental continuity route. Use during active work; "
-        "current user instructions always take precedence over this agent-authored note."
+        "current user instructions always take precedence over this agent-authored note. "
+        "When the host advertises only this tool for one maintenance request, that "
+        "single-tool inventory is intentional and request-local: it is not evidence "
+        "that ordinary task tools are unavailable or permanently blocked."
     ),
     "parameters": {
         "type": "object",

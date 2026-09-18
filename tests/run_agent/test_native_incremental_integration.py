@@ -226,8 +226,9 @@ def test_tool_search_deferred_note_persist_restart_compact_first_turn(tmp_path,m
         assert [c['model'] for c in calls]==['gpt-5.6-luna','gpt-6-astra','gpt-6-astra']
         assert 'Perform native context compaction only.' not in calls[0]['instructions']
         assert 'reply exactly NATIVE_COMPACTION_COMPLETE' not in calls[0]['instructions']
+        assert 'request-local context-maintenance operation' in calls[0]['instructions']
         for ordinary in calls[1:]:
-            assert 'The previous compaction-only operation is finished.' in ordinary['instructions']
+            assert 'preceding native continuity maintenance operation is finished.' in ordinary['instructions']
             assert any(i.get('type')=='compaction' for i in ordinary['input'])
         assert 'max_output_tokens' not in calls[0]
         assert calls[0]['reasoning']=={'effort':'low'}
@@ -364,12 +365,12 @@ def test_native_full_repair_keeps_unsealed_tool_pair_past_stale_cursor():
     split = deepcopy(protected)
     repair_end = max(stale_cursor, sealed_end)
     split_prefix = split[:repair_end]
-    split_repairs = repair_message_sequence(producer, split_prefix)
+    repair_message_sequence(producer, split_prefix)
     split = split_prefix + split[repair_end:]
-    # The old prefix-only split corrupts the protected boundary and must be
-    # rejected before it can send an orphaned result to the provider.
-    assert split_repairs > 0  # Repair counts vary with release alternation rules.
-    with pytest.raises(ValueError, match="boundary validation"):
+    # The host-owned role boundary keeps the sealed checkpoint tail intact, and
+    # the native validator still rejects the remaining orphaned tool result
+    # rather than sending it to the provider.
+    with pytest.raises(ValueError, match="boundary validation: orphan tool result"):
         _chat_messages_to_responses_input(split, native_compaction_eligible=True)
 
     # v0.21.1 moved this logic out of run_conversation into iteration prep.

@@ -132,13 +132,16 @@ def test_stale_note_forces_ordinary_refresh_then_commits_and_continues(tmp_path,
         ordinary_tools = deepcopy(a.tools)
 
         calls=[]
+        maintenance_blocker = 'Only continuity recording is available; terminal tools are unavailable.'
+        contaminated = {**ARGS, 'next_action': 'Wait until terminal is available', 'blockers': [maintenance_blocker]}
         def request(req):
             calls.append(deepcopy(req))
             if len(calls)==1:
                 assert req['model']=='gpt-6-astra','Must refresh before paying for a futile native request'
                 assert req['tool_choice']==dict(type='function',name='continuity_note')
                 assert [t['name'] for t in req['tools']]==['continuity_note']
-                return reply(NS(type='function_call',id='fc-refresh',call_id='fresh-note',name='continuity_note',arguments=json.dumps(ARGS)))
+                assert 'temporary inventory is not evidence that ordinary tools are unavailable' in req['instructions']
+                return reply(NS(type='function_call',id='fc-refresh',call_id='fresh-note',name='continuity_note',arguments=json.dumps(contaminated)))
             if len(calls)==2:
                 assert a._native_incremental_handoff_note['source_cursor'] > old_cursor
                 assert a._native_note_refresh_capability is None
@@ -149,6 +152,8 @@ def test_stale_note_forces_ordinary_refresh_then_commits_and_continues(tmp_path,
             assert req.get('tool_choice')!=dict(type='function',name='continuity_note')
             assert 'terminal' in {tool['name'] for tool in req['tools']}
             assert 'Context maintenance: call continuity_note now' not in req['instructions']
+            assert 'single-tool inventory was request-local' in req['instructions']
+            assert 'harmless relevant advertised tool is available, verify that claim' in req['instructions']
             if len(calls)==3:
                 assert blocking_router.module._ROUTER.active_count()==0
                 return reply(NS(type='function_call',id='fc-route',call_id='route',name='tool_call',arguments=json.dumps({'name':'fleet_route_task','arguments':{'work_shape':'direct','consequence':'routine','reason_codes':['known_short_path'],'proof_target':'focused_test'}})),tokens=600)
@@ -167,6 +172,7 @@ def test_stale_note_forces_ordinary_refresh_then_commits_and_continues(tmp_path,
             assert a.session_api_calls == 4  # refresh, route, terminal, reply; Luna is separate
             assert [c[0] for c in blocking_router.calls] == ['continuity_note','fleet_route_task','terminal']
             assert a._native_note_refresh_capability is None
+            assert getattr(a, '_native_incremental_handoff_note')['blockers'] == [maintenance_blocker]
             stored=db.get_messages_as_conversation(a.session_id)
             terminal_result=next(row for row in stored if row.get('role')=='tool' and (row.get('name') or row.get('tool_name'))=='terminal')
             terminal_result=json.loads(terminal_result['content'])

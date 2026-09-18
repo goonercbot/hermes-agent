@@ -1111,8 +1111,11 @@ def validate_persisted_native_compaction_history(messages: Any) -> Dict[int, str
     metadata = checkpoint.get(NATIVE_COMPACTION_METADATA_KEY)
     if not isinstance(encrypted, str) or not encrypted.strip() or not isinstance(metadata, dict):
         raise ValueError("protected native compaction checkpoint failed boundary validation: ciphertext or metadata")
+    allowed_metadata = {
+        "version", "identity", "handoff", "tail_count", "tail_fence", "maintenance_suffix_count",
+    }
     if (
-        set(metadata) != {"version", "identity", "handoff", "tail_count", "tail_fence"}
+        not set(metadata) <= allowed_metadata
         or metadata.get("version") != NATIVE_COMPACTION_VERSION
         or not isinstance(metadata.get("identity"), str)
         or not metadata["identity"].strip()
@@ -1122,6 +1125,14 @@ def validate_persisted_native_compaction_history(messages: Any) -> Dict[int, str
         or isinstance(metadata.get("tail_count"), bool)
         or metadata["tail_count"] < 0
         or not isinstance(metadata.get("tail_fence"), str)
+    ):
+        raise ValueError("protected native compaction checkpoint failed boundary validation: metadata")
+    suffix_count = metadata.get("maintenance_suffix_count", 0)
+    if (
+        not isinstance(suffix_count, int)
+        or isinstance(suffix_count, bool)
+        or suffix_count < 0
+        or suffix_count > metadata["tail_count"]
     ):
         raise ValueError("protected native compaction checkpoint failed boundary validation: metadata")
     if index + 1 >= len(messages):
@@ -1139,6 +1150,23 @@ def validate_persisted_native_compaction_history(messages: Any) -> Dict[int, str
         metadata["tail_fence"], tail
     ):
         raise ValueError("protected native compaction checkpoint failed boundary validation: tail mismatch")
+    # Rows appended after the sealed tail remain ordinary task history, but a
+    # tool result still needs its exact live assistant call.  Reject a prefix
+    # repair that drops that call while leaving its result for provider replay;
+    # do not silently delete either operational record.
+    from agent.message_sanitization import tool_call_id_variants, tool_result_id_variants
+
+    live_call_ids = set()
+    for message in messages[index + 2:]:
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") == "assistant":
+            for call in message.get("tool_calls") or []:
+                live_call_ids.update(tool_call_id_variants(call))
+        elif message.get("role") == "tool":
+            result_ids = tool_result_id_variants(message.get("tool_call_id"))
+            if result_ids and not (result_ids & live_call_ids):
+                raise ValueError("protected native compaction checkpoint failed boundary validation: orphan tool result")
     return {id(checkpoint): metadata["handoff"]}
 
 

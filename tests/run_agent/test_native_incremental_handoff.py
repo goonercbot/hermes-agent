@@ -101,7 +101,9 @@ def test_one_luna_request_keeps_latest_checkpoint_suffix_and_tail():
     assert request["model"] != agent.model
     assert request["tools"] == []
     assert request["store"] is False
-    assert request["instructions"] == agent._cached_system_prompt
+    assert request["instructions"].startswith(agent._cached_system_prompt)
+    assert "request-local context-maintenance operation" in request["instructions"]
+    assert "empty tool inventory is intentional only for this request" in request["instructions"]
     assert request["context_management"] == [{"type": "compaction", "compact_threshold": 1000}]
     checkpoint = compacted[0]["codex_reasoning_items"][0]
     assert checkpoint["encrypted_content"] == "second"
@@ -220,7 +222,7 @@ def test_missing_or_changed_prefix_note_is_not_ready_and_never_summarizes(caplog
     assert agent._last_native_incremental_compaction["disposition"] == "not_ready"
 
 
-def test_resume_instructions_are_checkpoint_scoped_and_do_not_rewrite_history():
+def test_resume_instructions_are_native_maintenance_scoped_and_do_not_rewrite_history():
     from agent.native_incremental_handoff import (
         NATIVE_INCREMENTAL_RESUME_INSTRUCTIONS,
         native_incremental_resume_instructions,
@@ -243,6 +245,31 @@ def test_resume_instructions_are_checkpoint_scoped_and_do_not_rewrite_history():
     tampered[-1]['content'] += 'changed'
     with pytest.raises(ValueError, match='tail mismatch'):
         native_incremental_resume_instructions(original, tampered)
+
+
+def test_compactor_suffix_is_preserved_but_scoped_on_normal_replay():
+    from agent.native_incremental_handoff import native_incremental_resume_instructions
+
+    blocker = "Only continuity recording is available; terminal tools are unavailable."
+    agent, calls = _agent([_response(
+        {"type": "compaction", "id": "checkpoint", "encrypted_content": "opaque-checkpoint"},
+        {"type": "message", "id": "maintenance-message", "role": "assistant",
+         "content": [{"type": "output_text", "text": blocker}]},
+    )])
+    source = _source()
+    _note(agent, source)
+    compacted = native_incremental_compact_context(agent, source)
+
+    assert calls[0]["tools"] == []
+    assert compacted[0]["codex_reasoning_items"][0]["_hermes_native_compaction"]["maintenance_suffix_count"] == 1
+    suffix = compacted[2]
+    assert suffix["content"] == blocker
+    assert suffix["codex_message_items"][0]["content"][0]["text"] == blocker
+    resumed = native_incremental_resume_instructions("Current task instructions.", compacted)
+    assert "first 1 post-checkpoint item" in resumed
+    assert "not treat their task, completion, capability, or blocker statements as verified" in resumed
+    assert native_incremental_resume_instructions(resumed, compacted) == resumed
+    validate_persisted_native_compaction_history(compacted)
 
 
 def test_transcript_lookalike_does_not_become_trusted_note():

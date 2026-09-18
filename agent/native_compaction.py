@@ -1103,6 +1103,68 @@ NATIVE_COMPACTION_HANDOFF_ROLE = "user"
 NATIVE_COMPACTION_HANDOFF_MAX_CHARS = 16_000
 
 
+@dataclass(frozen=True)
+class NativeCompactionMetadataShape:
+    """Strict, replay-safe v2 metadata fields shared by restore and validation."""
+
+    handoff: str
+    tail_count: int
+    tail_fence: str
+    maintenance_suffix_count: int = 0
+    maintenance_suffix_fence: Optional[str] = None
+
+
+def native_compaction_metadata_shape(
+    metadata: Any,
+) -> tuple[Optional[NativeCompactionMetadataShape], str]:
+    """Return accepted v2 metadata plus its failure class without authenticating rows.
+
+    The loader needs this shape gate before it can preserve a prospective sealed
+    span; the full handoff and fence authentication remains in the persisted
+    history validator before replay reaches a provider.
+    """
+    allowed = {
+        "version", "identity", "handoff", "tail_count", "tail_fence",
+        "maintenance_suffix_count", "maintenance_suffix_fence",
+    }
+    if (
+        not isinstance(metadata, dict)
+        or not set(metadata) <= allowed
+        or metadata.get("version") != NATIVE_COMPACTION_VERSION
+        or not isinstance(metadata.get("identity"), str)
+        or not metadata["identity"].strip()
+        or not isinstance(metadata.get("handoff"), str)
+        or not metadata["handoff"].strip()
+        or not isinstance(metadata.get("tail_count"), int)
+        or isinstance(metadata.get("tail_count"), bool)
+        or metadata["tail_count"] < 0
+        or not isinstance(metadata.get("tail_fence"), str)
+    ):
+        return None, "metadata"
+    has_suffix_count = "maintenance_suffix_count" in metadata
+    has_suffix_fence = "maintenance_suffix_fence" in metadata
+    if has_suffix_count != has_suffix_fence:
+        return None, "maintenance suffix"
+    suffix_count = metadata.get("maintenance_suffix_count", 0)
+    if has_suffix_count and (
+        not isinstance(suffix_count, int)
+        or isinstance(suffix_count, bool)
+        or suffix_count < 0
+        or suffix_count > metadata["tail_count"]
+        or not isinstance(metadata["maintenance_suffix_fence"], str)
+    ):
+        return None, "metadata"
+    return NativeCompactionMetadataShape(
+        handoff=metadata["handoff"],
+        tail_count=metadata["tail_count"],
+        tail_fence=metadata["tail_fence"],
+        maintenance_suffix_count=suffix_count,
+        maintenance_suffix_fence=(
+            metadata["maintenance_suffix_fence"] if has_suffix_fence else None
+        ),
+    ), ""
+
+
 def _native_message_size(messages: List[Dict[str, Any]]) -> int:
     """Measure only replay-visible payload bytes for the no-growth guard."""
     total = 0
@@ -1219,20 +1281,19 @@ def validate_native_compaction_checkpoint(checkpoint: Any, following: Any, tail:
     metadata = checkpoint.get(NATIVE_COMPACTION_METADATA_KEY)
     if not isinstance(encrypted, str) or not encrypted.strip() or not isinstance(metadata, dict):
         raise ValueError("protected native compaction checkpoint failed boundary validation")
-    if metadata.get("version") != NATIVE_COMPACTION_VERSION or not isinstance(metadata.get("identity"), str):
+    shape, _ = native_compaction_metadata_shape(metadata)
+    if shape is None:
         raise ValueError("protected native compaction checkpoint failed boundary validation")
-    handoff = metadata.get("handoff")
-    if not isinstance(handoff, str) or not handoff.strip() or not isinstance(following, dict):
+    if not isinstance(following, dict):
         raise ValueError("protected native compaction checkpoint failed boundary validation")
-    if following.get("role") != NATIVE_COMPACTION_HANDOFF_ROLE or following.get("content") != handoff:
+    if following.get("role") != NATIVE_COMPACTION_HANDOFF_ROLE or following.get("content") != shape.handoff:
         raise ValueError("protected native compaction checkpoint failed boundary validation")
-    count = metadata.get("tail_count")
-    if not isinstance(count, int) or isinstance(count, bool) or count < 0 or len(tail) < count:
+    if len(tail) < shape.tail_count:
         raise ValueError("protected native compaction checkpoint failed boundary validation")
-    original_tail = tail[:count]
-    if not _native_continuity_fence_matches(metadata.get("tail_fence"), original_tail):
+    original_tail = tail[:shape.tail_count]
+    if not _native_continuity_fence_matches(shape.tail_fence, original_tail):
         raise ValueError("protected native compaction checkpoint failed boundary validation")
-    return handoff
+    return shape.handoff
 
 
 def validate_persisted_native_compaction_history(messages: Any) -> Dict[int, NativeCompactionReplayBoundary]:
@@ -1283,61 +1344,35 @@ def validate_persisted_native_compaction_history(messages: Any) -> Dict[int, Nat
     metadata = checkpoint.get(NATIVE_COMPACTION_METADATA_KEY)
     if not isinstance(encrypted, str) or not encrypted.strip() or not isinstance(metadata, dict):
         raise ValueError("protected native compaction checkpoint failed boundary validation: ciphertext or metadata")
-    allowed_metadata = {
-        "version", "identity", "handoff", "tail_count", "tail_fence", "maintenance_suffix_count",
-        "maintenance_suffix_fence",
-    }
-    if (
-        not set(metadata) <= allowed_metadata
-        or metadata.get("version") != NATIVE_COMPACTION_VERSION
-        or not isinstance(metadata.get("identity"), str)
-        or not metadata["identity"].strip()
-        or not isinstance(metadata.get("handoff"), str)
-        or not metadata["handoff"].strip()
-        or not isinstance(metadata.get("tail_count"), int)
-        or isinstance(metadata.get("tail_count"), bool)
-        or metadata["tail_count"] < 0
-        or not isinstance(metadata.get("tail_fence"), str)
-    ):
-        raise ValueError("protected native compaction checkpoint failed boundary validation: metadata")
-    has_suffix_count = "maintenance_suffix_count" in metadata
-    has_suffix_fence = "maintenance_suffix_fence" in metadata
-    if has_suffix_count != has_suffix_fence:
-        raise ValueError("protected native compaction checkpoint failed boundary validation: maintenance suffix")
-    suffix_count = metadata.get("maintenance_suffix_count", 0)
-    if has_suffix_count and (
-        not isinstance(suffix_count, int)
-        or isinstance(suffix_count, bool)
-        or suffix_count < 0
-        or suffix_count > metadata["tail_count"]
-    ):
-        raise ValueError("protected native compaction checkpoint failed boundary validation: metadata")
+    shape, metadata_error = native_compaction_metadata_shape(metadata)
+    if shape is None:
+        raise ValueError(
+            "protected native compaction checkpoint failed boundary validation: "
+            f"{metadata_error}"
+        )
     if index + 1 >= len(messages):
         raise ValueError("protected native compaction checkpoint failed boundary validation: handoff missing")
     handoff_row = messages[index + 1]
     if (
         not isinstance(handoff_row, dict)
         or handoff_row.get("role") != NATIVE_COMPACTION_HANDOFF_ROLE
-        or handoff_row.get("content") != metadata["handoff"]
+        or handoff_row.get("content") != shape.handoff
     ):
         raise ValueError("protected native compaction checkpoint failed boundary validation: handoff mismatch")
-    count = metadata["tail_count"]
-    tail = messages[index + 2:index + 2 + count]
-    if len(tail) != count or not _native_continuity_fence_matches(
-        metadata["tail_fence"], tail
+    tail = messages[index + 2:index + 2 + shape.tail_count]
+    if len(tail) != shape.tail_count or not _native_continuity_fence_matches(
+        shape.tail_fence, tail
     ):
         raise ValueError("protected native compaction checkpoint failed boundary validation: tail mismatch")
     verified_suffix_count = 0
     verified_suffix_fence = None
-    if has_suffix_fence:
-        suffix_fence = metadata["maintenance_suffix_fence"]
-        if (
-            not isinstance(suffix_fence, str)
-            or native_continuity_boundary_fence(tail[:suffix_count]) != suffix_fence
-        ):
+    if shape.maintenance_suffix_fence is not None:
+        if native_continuity_boundary_fence(
+            tail[:shape.maintenance_suffix_count]
+        ) != shape.maintenance_suffix_fence:
             raise ValueError("protected native compaction checkpoint failed boundary validation: maintenance suffix")
-        verified_suffix_count = suffix_count
-        verified_suffix_fence = suffix_fence
+        verified_suffix_count = shape.maintenance_suffix_count
+        verified_suffix_fence = shape.maintenance_suffix_fence
     # Rows appended after the sealed tail remain ordinary task history, but a
     # tool result still needs its exact live assistant call.  Reject a prefix
     # repair that drops that call while leaving its result for provider replay;
@@ -1356,7 +1391,7 @@ def validate_persisted_native_compaction_history(messages: Any) -> Dict[int, Nat
             if result_ids and not (result_ids & live_call_ids):
                 raise ValueError("protected native compaction checkpoint failed boundary validation: orphan tool result")
     return {id(checkpoint): NativeCompactionReplayBoundary(
-        handoff=metadata["handoff"],
+        handoff=shape.handoff,
         maintenance_suffix_count=verified_suffix_count,
         maintenance_suffix_fence=verified_suffix_fence,
     )}

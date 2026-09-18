@@ -808,24 +808,16 @@ class SessionMessagesMixin:
             return 0
         checkpoint = items[0]
         metadata = checkpoint.get("_hermes_native_compaction")
+        from agent.native_compaction import native_compaction_metadata_shape
+        shape, _ = native_compaction_metadata_shape(metadata)
         if not (
             checkpoint.get("type") == "compaction"
             and isinstance(checkpoint.get("encrypted_content"), str)
             and checkpoint["encrypted_content"].strip()
-            and isinstance(metadata, dict)
-            and set(metadata) == {"version", "identity", "handoff", "tail_count", "tail_fence"}
-            and metadata.get("version") == 2
-            and isinstance(metadata.get("identity"), str)
-            and metadata["identity"].strip()
-            and isinstance(metadata.get("handoff"), str)
-            and metadata["handoff"].strip()
-            and isinstance(metadata.get("tail_count"), int)
-            and not isinstance(metadata.get("tail_count"), bool)
-            and metadata["tail_count"] >= 0
-            and isinstance(metadata.get("tail_fence"), str)
+            and shape is not None
         ):
             return 0
-        protected_count = 1 + metadata["tail_count"]
+        protected_count = 1 + shape.tail_count
         return protected_count if protected_count <= remaining_rows else 0
 
     def get_messages_as_conversation(self, session_id: str, include_ancestors: bool = False,
@@ -931,9 +923,30 @@ class SessionMessagesMixin:
             if protected_following_count:
                 protected_native_message_ids.add(id(msg))
                 protected_native_rows_remaining = protected_following_count
-        # Defense-in-depth: strip a background-review harness turn (older builds shared the parent's
-        # session_id) plus its curator reply, and bare tool-call marker content ("[memory]") persisted as an answer.
-        messages = _strip_stale_tool_call_markers(_strip_background_review_harness(messages))
+        # Defense-in-depth cleanup must never alter a shaped v2 carrier or its
+        # prospective sealed rows. Full fence authentication still fails closed
+        # before provider replay; this only prevents load-time mutation first.
+        if protected_native_message_ids:
+            cleaned_messages = []
+            ordinary_span = []
+            for message in messages:
+                if id(message) in protected_native_message_ids:
+                    if ordinary_span:
+                        cleaned_messages.extend(_strip_stale_tool_call_markers(
+                            _strip_background_review_harness(ordinary_span)))
+                        ordinary_span = []
+                    cleaned_messages.append(message)
+                else:
+                    ordinary_span.append(message)
+            if ordinary_span:
+                cleaned_messages.extend(_strip_stale_tool_call_markers(
+                    _strip_background_review_harness(ordinary_span)))
+            messages = cleaned_messages
+        else:
+            # Strip a background-review harness turn (older builds shared the
+            # parent's session_id) plus its curator reply, and bare tool-call
+            # marker content ("[memory]") persisted as an answer.
+            messages = _strip_stale_tool_call_markers(_strip_background_review_harness(messages))
         if repair_alternation and messages:
             from agent.agent_runtime_helpers import repair_message_sequence
             if protected_native_message_ids:

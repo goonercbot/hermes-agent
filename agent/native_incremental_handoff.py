@@ -1271,6 +1271,7 @@ def native_incremental_compact_context(
                 "tail_count": 0,
                 "tail_fence": "",
                 "maintenance_suffix_count": len(suffix),
+                "maintenance_suffix_fence": native_continuity_boundary_fence(suffix),
             },
         }],
     }

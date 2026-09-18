@@ -330,7 +330,7 @@ def _assistant_message_item(raw: Dict[str, Any], content: List[Dict[str, Any]], 
 
 def _replay_reasoning_items(
     msg: Dict[str, Any], *, seen_item_ids: set, current_issuer_kind: Optional[str], native_compaction_eligible: bool,
-    protected_native_handoffs: Optional[Dict[int, str]] = None,
+    protected_native_handoffs: Optional[Dict[int, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """Replay persisted encrypted reasoning/compaction items for one assistant turn. Skips duplicate
     ids, ``compaction`` checkpoints unless THIS request carries ``context_management`` (else a persisted
@@ -360,12 +360,14 @@ def _replay_reasoning_items(
             # fields plus its already-authenticated handoff until the native
             # pruner positions the matching replay boundary.  Metadata must
             # never reach the Responses API itself.
-            handoff = protected_native_handoffs.get(id(ri))
-            if handoff is not None:
+            boundary = protected_native_handoffs.get(id(ri))
+            if boundary is not None:
                 replayed.append({
                     "type": "compaction",
                     "encrypted_content": ri["encrypted_content"],
-                    "_hermes_native_handoff": handoff,
+                    "_hermes_native_handoff": boundary.handoff,
+                    "_hermes_native_maintenance_suffix_count": boundary.maintenance_suffix_count,
+                    "_hermes_native_maintenance_suffix_fence": boundary.maintenance_suffix_fence,
                 })
                 if item_id:
                     seen_item_ids.add(item_id)
@@ -800,11 +802,16 @@ def _preflight_codex_input_items(
     sanitize_text = _neutralize_harmony_tokens if sanitize_harmony_tokens else (lambda text: text)
     ctx = _PreflightCtx(sanitize_text, sanitize_harmony_tokens, is_github_responses, set())
     normalized: List[Dict[str, Any]] = []
+    maintenance_suffix_open: Optional[int] = None
     for idx, item in enumerate(raw_items):
         if not isinstance(item, dict):
             raise ValueError(f"Codex Responses input[{idx}] must be an object.")
         if item.get("role") == "developer":
-            from agent.native_compaction import NATIVE_INCREMENTAL_REPLAY_BOUNDARY
+            from agent.native_compaction import (
+                NATIVE_INCREMENTAL_REPLAY_BOUNDARY,
+                native_incremental_maintenance_suffix_end_count,
+                native_incremental_maintenance_suffix_start_count,
+            )
 
             # The protected host boundary is the sole allowed developer item:
             # arbitrary developer history is unsupported, while the canonical
@@ -819,6 +826,28 @@ def _preflight_codex_input_items(
                     "content": NATIVE_INCREMENTAL_REPLAY_BOUNDARY,
                 })
                 continue
+            content = item.get("content")
+            # The adapter has already authenticated and constructed this
+            # framing.  Preflight only recognizes its exact rendering so the
+            # private provenance metadata never reaches the provider API.
+            if isinstance(content, str):
+                start_count = native_incremental_maintenance_suffix_start_count(content)
+                if (
+                    start_count is not None
+                    and maintenance_suffix_open is None
+                    and len(normalized) >= 3
+                    and normalized[-1].get("role") == "user"
+                    and normalized[-2].get("content") == NATIVE_INCREMENTAL_REPLAY_BOUNDARY
+                    and normalized[-3].get("type") == "compaction"
+                ):
+                    maintenance_suffix_open = start_count
+                    normalized.append({"role": "developer", "content": content})
+                    continue
+                end_count = native_incremental_maintenance_suffix_end_count(content)
+                if end_count is not None and maintenance_suffix_open == end_count:
+                    maintenance_suffix_open = None
+                    normalized.append({"role": "developer", "content": content})
+                    continue
         item_type = item.get("type")
         handler = _PREFLIGHT_ITEM_HANDLERS.get(item_type) if isinstance(item_type, str) else None
         normalized_item = (handler or _preflight_role_message)(item, idx, ctx)

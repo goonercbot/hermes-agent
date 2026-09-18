@@ -271,8 +271,132 @@ def test_compactor_suffix_is_preserved_but_scoped_on_normal_replay():
         compacted, native_compaction_eligible=True, current_issuer_kind="openai_codex"
     )
     assert wire[1] == {"role": "developer", "content": NATIVE_INCREMENTAL_REPLAY_BOUNDARY}
-    assert blocker in str(wire[2:])
+    start = next(
+        index for index, item in enumerate(wire)
+        if item.get("role") == "developer"
+        and item.get("content", "").startswith("Host replay provenance: the next 1 post-checkpoint record")
+    )
+    end = next(
+        index for index, item in enumerate(wire)
+        if item.get("role") == "developer"
+        and item.get("content", "").startswith("Host replay provenance end: the preceding 1 post-checkpoint record")
+    )
+    assert wire[start + 1:end] == [{
+        "type": "message", "role": "assistant", "status": "completed",
+        "id": "maintenance-message",
+        "content": [{"type": "output_text", "text": blocker}],
+    }]
+    assert end == start + 2
     validate_persisted_native_compaction_history(compacted)
+
+
+def test_suffix_boundary_ends_before_real_user_and_tool_history():
+    from agent.codex_responses_adapter import _chat_messages_to_responses_input
+
+    maintenance = ["maintenance one", "maintenance two"]
+    agent, _calls = _agent([_response(
+        {"type": "compaction", "id": "checkpoint", "encrypted_content": "opaque-checkpoint"},
+        *[
+            {"type": "message", "id": f"maintenance-{index}", "role": "assistant",
+             "content": [{"type": "output_text", "text": text}]}
+            for index, text in enumerate(maintenance, 1)
+        ],
+    )])
+    source = _source()
+    _note(agent, source)
+    compacted = native_incremental_compact_context(agent, source)
+    metadata = compacted[0]["codex_reasoning_items"][0][NATIVE_COMPACTION_METADATA_KEY]
+    assert metadata["maintenance_suffix_count"] == 2
+    assert metadata["maintenance_suffix_fence"]
+
+    wire = _chat_messages_to_responses_input(
+        compacted, native_compaction_eligible=True, current_issuer_kind="openai_codex"
+    )
+    start = next(index for index, item in enumerate(wire) if isinstance(item.get("content"), str) and item["content"].startswith(
+        "Host replay provenance: the next 2 post-checkpoint records"
+    ))
+    end = next(index for index, item in enumerate(wire) if isinstance(item.get("content"), str) and item["content"].startswith(
+        "Host replay provenance end: the preceding 2 post-checkpoint records"
+    ))
+    assert [item["content"][0]["text"] for item in wire[start + 1:end]] == maintenance
+    assert [item["id"] for item in wire[start + 1:end]] == ["maintenance-1", "maintenance-2"]
+    # The retained current correction and genuine terminal result follow the
+    # closing marker; neither is relabeled as tool-less maintenance output.
+    correction = next(index for index, item in enumerate(wire) if item.get("content") == source[2]["content"])
+    tool_result = next(index for index, item in enumerate(wire) if item.get("type") == "function_call_output")
+    assert end < correction < tool_result
+
+
+def test_legacy_checkpoint_without_suffix_metadata_loads_without_provenance_or_rewrite():
+    from agent.codex_responses_adapter import _chat_messages_to_responses_input
+
+    agent, _calls = _agent([_response(
+        {"type": "compaction", "encrypted_content": "opaque-checkpoint"},
+        {"type": "message", "id": "legacy-suffix", "role": "assistant",
+         "content": [{"type": "output_text", "text": "legacy maintenance"}]},
+    )])
+    source = _source()
+    _note(agent, source)
+    legacy = native_incremental_compact_context(agent, source)
+    metadata = legacy[0]["codex_reasoning_items"][0][NATIVE_COMPACTION_METADATA_KEY]
+    del metadata["maintenance_suffix_count"]
+    del metadata["maintenance_suffix_fence"]
+    before = deepcopy(legacy)
+
+    wire = _chat_messages_to_responses_input(
+        legacy, native_compaction_eligible=True, current_issuer_kind="openai_codex"
+    )
+    validate_persisted_native_compaction_history(legacy)
+    assert not any(
+        isinstance(item.get("content"), str)
+        and item["content"].startswith("Host replay provenance:")
+        for item in wire
+    )
+    assert legacy == before
+
+
+def test_zero_maintenance_suffix_has_no_dynamic_replay_provenance():
+    from agent.codex_responses_adapter import _chat_messages_to_responses_input
+
+    agent, _calls = _agent([_response(
+        {"type": "compaction", "encrypted_content": "opaque-checkpoint"},
+    )])
+    source = _source()
+    _note(agent, source)
+    compacted = native_incremental_compact_context(agent, source)
+    metadata = compacted[0]["codex_reasoning_items"][0][NATIVE_COMPACTION_METADATA_KEY]
+    assert metadata["maintenance_suffix_count"] == 0
+    wire = _chat_messages_to_responses_input(
+        compacted, native_compaction_eligible=True, current_issuer_kind="openai_codex"
+    )
+    assert not any(
+        isinstance(item.get("content"), str)
+        and item["content"].startswith("Host replay provenance:")
+        for item in wire
+    )
+
+
+@pytest.mark.parametrize("field, value", [
+    ("maintenance_suffix_count", True),
+    ("maintenance_suffix_fence", "forged-fence"),
+])
+def test_invalid_maintenance_suffix_metadata_fails_closed(field, value):
+    from agent.codex_responses_adapter import _chat_messages_to_responses_input
+
+    agent, _calls = _agent([_response(
+        {"type": "compaction", "encrypted_content": "opaque-checkpoint"},
+        {"type": "message", "role": "assistant",
+         "content": [{"type": "output_text", "text": "maintenance"}]},
+    )])
+    source = _source()
+    _note(agent, source)
+    tampered = native_incremental_compact_context(agent, source)
+    tampered[0]["codex_reasoning_items"][0][NATIVE_COMPACTION_METADATA_KEY][field] = value
+
+    with pytest.raises(ValueError, match="boundary validation: (metadata|maintenance suffix)"):
+        _chat_messages_to_responses_input(
+            tampered, native_compaction_eligible=True, current_issuer_kind="openai_codex"
+        )
 
 
 def test_transcript_lookalike_does_not_become_trusted_note():

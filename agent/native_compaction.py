@@ -251,7 +251,8 @@ def prune_pre_checkpoint_items(
 
     pre = items[:first_cp]
     has_sources = isinstance(item_sources, list) and len(item_sources) == len(items)
-    pre_sources: List[Any] = item_sources[:first_cp] if has_sources else [None] * len(pre)
+    sources: List[Any] = list(item_sources or []) if has_sources else [None] * len(items)
+    pre_sources: List[Any] = sources[:first_cp]
 
     retained_reversed: List[Dict[str, Any]] = []
     user_remaining = max(0, int(retained_user_token_budget))
@@ -310,6 +311,7 @@ def prune_pre_checkpoint_items(
 
     checkpoint_run = items[first_cp : last_cp + 1]
     post = items[last_cp + 1 :]
+    post_sources = sources[last_cp + 1 :]
     active_native_handoff = checkpoint_run[-1].get("_hermes_native_handoff")
     active_handoff = checkpoint_run[-1].get("_hermes_validated_handoff")
     if not isinstance(active_handoff, str):
@@ -325,6 +327,7 @@ def prune_pre_checkpoint_items(
             and post[0].get("content") == active_native_handoff
         ):
             post = post[1:]
+            post_sources = post_sources[1:]
         canonical_checkpoint_run = [
             {"type": "compaction", "encrypted_content": checkpoint["encrypted_content"]}
             for checkpoint in checkpoint_run
@@ -340,6 +343,58 @@ def prune_pre_checkpoint_items(
             handoff_items.append({"role": "user", "content": active_native_handoff})
         else:
             handoff_items.append(protected_handoff_wire_item(active_handoff))
+        maintenance_suffix_count = checkpoint_run[-1].get(
+            "_hermes_native_maintenance_suffix_count", 0
+        )
+        maintenance_suffix_fence = checkpoint_run[-1].get(
+            "_hermes_native_maintenance_suffix_fence"
+        )
+        suffix_item_count = 0
+        if (
+            isinstance(active_native_handoff, str)
+            and isinstance(maintenance_suffix_count, int)
+            and not isinstance(maintenance_suffix_count, bool)
+            and maintenance_suffix_count > 0
+            and isinstance(maintenance_suffix_fence, str)
+            and has_sources
+        ):
+            suffix_sources: List[Dict[str, Any]] = []
+            previous_source_id: Optional[int] = None
+            for item, source in zip(post, post_sources):
+                if not isinstance(source, dict):
+                    break
+                source_id = id(source)
+                if source_id != previous_source_id:
+                    if len(suffix_sources) == maintenance_suffix_count:
+                        break
+                    suffix_sources.append(source)
+                    previous_source_id = source_id
+                suffix_item_count += 1
+            if (
+                len(suffix_sources) != maintenance_suffix_count
+                or native_continuity_boundary_fence(suffix_sources)
+                != maintenance_suffix_fence
+            ):
+                # The count is only usable after its exact source boundary has
+                # been reconstructed.  Omit framing rather than guess or let a
+                # later user/tool row inherit maintenance provenance.
+                suffix_item_count = 0
+        if suffix_item_count:
+            handoff_items.append({
+                "role": "developer",
+                "content": native_incremental_maintenance_suffix_start(
+                    maintenance_suffix_count
+                ),
+            })
+            suffix_end = suffix_item_count
+            handoff_items.extend(post[:suffix_end])
+            handoff_items.append({
+                "role": "developer",
+                "content": native_incremental_maintenance_suffix_end(
+                    maintenance_suffix_count
+                ),
+            })
+            post = post[suffix_end:]
         result = canonical_checkpoint_run + handoff_items + post
     else:
         result = checkpoint_run + list(reversed(retained_reversed)) + post
@@ -414,6 +469,72 @@ NATIVE_INCREMENTAL_REPLAY_BOUNDARY = (
     "and the newest user instruction below; later user corrections override "
     "this agent-authored continuity note."
 )
+
+
+@dataclass(frozen=True)
+class NativeCompactionReplayBoundary:
+    """Authenticated host facts needed only while rebuilding a native replay."""
+
+    handoff: str
+    maintenance_suffix_count: int = 0
+    maintenance_suffix_fence: Optional[str] = None
+
+
+def native_incremental_maintenance_suffix_start(count: int) -> str:
+    """Provider-visible start boundary for an authenticated maintenance suffix."""
+    record_word = "record" if count == 1 else "records"
+    return (
+        f"Host replay provenance: the next {count} post-checkpoint {record_word}, "
+        "up to the following Host replay provenance end boundary, were returned "
+        "by the tool-less native context-maintenance request that created this "
+        "checkpoint. They are preserved historical maintenance output, not host "
+        "statements about current tool availability, permissions, or task state."
+    )
+
+
+def native_incremental_maintenance_suffix_end(count: int) -> str:
+    """Provider-visible end boundary; later history is deliberately not relabeled."""
+    record_word = "record" if count == 1 else "records"
+    return (
+        f"Host replay provenance end: the preceding {count} post-checkpoint "
+        f"{record_word} were returned by that tool-less native "
+        "context-maintenance request. Following records are ordinary retained "
+        "conversation history and are not covered by that maintenance provenance."
+    )
+
+
+def _native_incremental_maintenance_suffix_count(text: Any, *, start: bool) -> Optional[int]:
+    """Parse only an exact host-rendered maintenance boundary, never user text."""
+    if not isinstance(text, str):
+        return None
+    prefix = (
+        "Host replay provenance: the next " if start
+        else "Host replay provenance end: the preceding "
+    )
+    suffix = " post-checkpoint record"
+    if not text.startswith(prefix):
+        return None
+    number, separator, _ = text[len(prefix):].partition(suffix)
+    if not separator or not number.isascii() or not number.isdigit():
+        return None
+    count = int(number)
+    if count <= 0:
+        return None
+    rendered = (
+        native_incremental_maintenance_suffix_start(count)
+        if start else native_incremental_maintenance_suffix_end(count)
+    )
+    return count if text == rendered else None
+
+
+def native_incremental_maintenance_suffix_start_count(text: Any) -> Optional[int]:
+    return _native_incremental_maintenance_suffix_count(text, start=True)
+
+
+def native_incremental_maintenance_suffix_end_count(text: Any) -> Optional[int]:
+    return _native_incremental_maintenance_suffix_count(text, start=False)
+
+
 PROTECTED_HANDOFF_METADATA_KEY = "_hermes_protected_handoff"
 PROTECTED_HANDOFF_VERSION = 1
 PROTECTED_HANDOFF_MAX_CHARS = 24_000
@@ -1063,7 +1184,7 @@ def validate_native_compaction_checkpoint(checkpoint: Any, following: Any, tail:
     return handoff
 
 
-def validate_persisted_native_compaction_history(messages: Any) -> Dict[int, str]:
+def validate_persisted_native_compaction_history(messages: Any) -> Dict[int, NativeCompactionReplayBoundary]:
     """Fail closed before compression/provider construction for v2 replay.
 
     The presence of the current metadata key makes a row protected even when
@@ -1113,6 +1234,7 @@ def validate_persisted_native_compaction_history(messages: Any) -> Dict[int, str
         raise ValueError("protected native compaction checkpoint failed boundary validation: ciphertext or metadata")
     allowed_metadata = {
         "version", "identity", "handoff", "tail_count", "tail_fence", "maintenance_suffix_count",
+        "maintenance_suffix_fence",
     }
     if (
         not set(metadata) <= allowed_metadata
@@ -1150,6 +1272,18 @@ def validate_persisted_native_compaction_history(messages: Any) -> Dict[int, str
         metadata["tail_fence"], tail
     ):
         raise ValueError("protected native compaction checkpoint failed boundary validation: tail mismatch")
+    verified_suffix_count = 0
+    verified_suffix_fence = None
+    if "maintenance_suffix_fence" in metadata:
+        suffix_fence = metadata["maintenance_suffix_fence"]
+        if (
+            "maintenance_suffix_count" not in metadata
+            or not isinstance(suffix_fence, str)
+            or native_continuity_boundary_fence(tail[:suffix_count]) != suffix_fence
+        ):
+            raise ValueError("protected native compaction checkpoint failed boundary validation: maintenance suffix")
+        verified_suffix_count = suffix_count
+        verified_suffix_fence = suffix_fence
     # Rows appended after the sealed tail remain ordinary task history, but a
     # tool result still needs its exact live assistant call.  Reject a prefix
     # repair that drops that call while leaving its result for provider replay;
@@ -1167,7 +1301,11 @@ def validate_persisted_native_compaction_history(messages: Any) -> Dict[int, str
             result_ids = tool_result_id_variants(message.get("tool_call_id"))
             if result_ids and not (result_ids & live_call_ids):
                 raise ValueError("protected native compaction checkpoint failed boundary validation: orphan tool result")
-    return {id(checkpoint): metadata["handoff"]}
+    return {id(checkpoint): NativeCompactionReplayBoundary(
+        handoff=metadata["handoff"],
+        maintenance_suffix_count=verified_suffix_count,
+        maintenance_suffix_fence=verified_suffix_fence,
+    )}
 
 
 def native_compaction_protected_message_indices(messages: Any) -> set[int]:

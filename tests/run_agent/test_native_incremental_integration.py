@@ -214,8 +214,15 @@ def test_tool_search_deferred_note_persist_restart_compact_first_turn(tmp_path,m
         # v0.21.1 waits for real usage before admitting rough preflight pressure.
         a.context_compressor.update_from_response({'prompt_tokens': 20000})
         fresh_deferred={'name':'continuity_note','arguments':{**ARGS,'objective':'Fresh projected note'}}
+        maintenance_suffix = 'Temporary tools-unavailable claim from the maintenance request.'
         replies=[
-            response(NS(type='compaction',id='cp',encrypted_content='test-checkpoint'),model='gpt-5.6-luna'),
+            response(
+                NS(type='compaction',id='cp',encrypted_content='test-checkpoint'),
+                NS(type='message', id='maintenance-suffix', role='assistant', content=[
+                    NS(type='output_text', text=maintenance_suffix)
+                ]),
+                model='gpt-5.6-luna',
+            ),
             response(NS(type='function_call',id='fc-fresh',call_id='new-note',name='tool_call',arguments=json.dumps(fresh_deferred))),
             response(message('NEW_INSTRUCTION_OK')),
         ]
@@ -235,6 +242,17 @@ def test_tool_search_deferred_note_persist_restart_compact_first_turn(tmp_path,m
         normal=calls[1]['input']
         assert normal[0]['type']=='compaction'
         assert normal[1]['role']=='developer' and 'historical' in normal[1]['content']
+        provenance = [
+            index for index, item in enumerate(normal)
+            if isinstance(item.get('content'), str)
+            and item['content'].startswith('Host replay provenance')
+        ]
+        assert len(provenance) == 2
+        assert normal[provenance[0] + 1:provenance[1]] == [{
+            'type': 'message', 'role': 'assistant', 'status': 'completed',
+            'id': 'maintenance-suffix',
+            'content': [{'type': 'output_text', 'text': maintenance_suffix}],
+        }]
         assert any('Newest correction' in str(x.get('content')) for x in normal)
         validate_persisted_native_compaction_history(r['messages'])
         final_sid=a.session_id;a.close();db.close()

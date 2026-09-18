@@ -415,6 +415,37 @@ def test_sanitize_consumes_all_responses_id_variants_for_duplicate_result():
     ]
 
 
+def test_explicit_parallel_responses_pairing_ids_survive_preflight_and_dedupe():
+    """A raw fc item id must not synthesize another call's explicit pairing id."""
+    from copy import deepcopy
+
+    from agent.agent_runtime_helpers import _dedupe_tool_call_ids
+    from agent.transports.codex import ResponsesApiTransport
+
+    rows = [
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "fc_second", "call_id": "call_first", "type": "function",
+             "function": {"name": "terminal", "arguments": '{"command":"first"}'}},
+            {"id": "fc_other", "call_id": "call_second", "type": "function",
+             "function": {"name": "terminal", "arguments": '{"command":"second"}'}},
+        ]},
+        {"role": "tool", "tool_call_id": "call_first", "content": "first verified result"},
+        {"role": "tool", "tool_call_id": "call_second", "content": "second verified result"},
+    ]
+
+    transport = ResponsesApiTransport()
+    wire = transport.build_kwargs(
+        "gpt-6-astra", rows, instructions="ordinary", provider="openai-codex",
+        is_codex_backend=True, base_url="https://chatgpt.com/backend-api/codex",
+    )
+    wire = transport.preflight_kwargs(wire, allow_stream=False)
+
+    assert [item["call_id"] for item in wire["input"]] == [
+        "call_first", "call_second", "call_first", "call_second",
+    ]
+    assert _dedupe_tool_call_ids(deepcopy(rows)) == rows
+
+
 def test_tool_executor_uses_canonical_responses_pairing_id():
     """The executor must emit the id used by the normalized assistant turn."""
     from types import SimpleNamespace

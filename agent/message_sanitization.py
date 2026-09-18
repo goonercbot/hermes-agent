@@ -291,7 +291,7 @@ __all__ = [
     "_strip_non_ascii", "_sanitize_messages_non_ascii", "_sanitize_tools_non_ascii",
     "_strip_images_from_messages", "_sanitize_structure_non_ascii",
     # call_id policy owners
-    "deterministic_call_id", "coalesce_tool_call_id", "tool_call_id_variants",
+    "deterministic_call_id", "canonical_responses_call_id_from_fc", "coalesce_tool_call_id", "tool_call_id_variants",
     "tool_result_id_variants", "uniquify_tool_call_ids",
     # reasoning_content policy owners
     "reasoning_echo_family", "matches_reasoning_echo_family", "needs_reasoning_echo",
@@ -332,6 +332,17 @@ def deterministic_call_id(fn_name: str, arguments: str, index: int = 0) -> str:
     return f"call_{hashlib.sha256(seed.encode('utf-8', errors='replace')).hexdigest()[:12]}"
 
 
+def canonical_responses_call_id_from_fc(response_item_id: Any) -> str:
+    """Map a bare Responses ``fc_…`` item id to its canonical ``call_…`` pairing id.
+
+    Responses stores a function-call item's ``fc_`` id separately from the
+    ``call_`` id used by its output.  Keep this conversion beside all other
+    pairing aliases so validation and wire conversion cannot disagree.
+    """
+    value = response_item_id.strip() if isinstance(response_item_id, str) else ""
+    return f"call_{value[3:]}" if value.startswith("fc_") and len(value) > 3 else ""
+
+
 def _expand_tool_id_variants(values: tuple[Any, ...]) -> frozenset[str]:
     """Every wire spelling of one tool-call identifier: Responses bridges may expose the pairing
     id and response-item id separately or as ``call_id|response_item_id``; all alias ONE call."""
@@ -341,6 +352,10 @@ def _expand_tool_id_variants(values: tuple[Any, ...]) -> frozenset[str]:
         if value:
             variants.add(value)
             variants.update(p for p in (part.strip() for part in value.split("|")) if p)
+    variants.update(
+        canonical for value in tuple(variants)
+        if (canonical := canonical_responses_call_id_from_fc(value))
+    )
     return frozenset(variants)
 
 

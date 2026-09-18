@@ -12,7 +12,7 @@ import uuid
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, Iterator, List, NamedTuple, Optional, TypeGuard
 
-from agent.message_sanitization import deterministic_call_id
+from agent.message_sanitization import canonical_responses_call_id_from_fc, deterministic_call_id
 from agent.prompt_builder import DEFAULT_AGENT_IDENTITY
 
 logger = logging.getLogger(__name__)
@@ -239,9 +239,7 @@ def _sanitize_replayed_fn_name(name: str) -> str:
 def _canonical_call_id_from_fc(response_item_id: Any) -> Optional[str]:
     """Map an ``fc_…`` item id to its canonical ``call_<suffix>``. Both sides of a replayed
     pair must derive the SAME call_id, or an oversized pair clamps to two surrogates."""
-    if isinstance(response_item_id, str) and response_item_id.startswith("fc_") and len(response_item_id) > 3:
-        return f"call_{response_item_id[3:]}"
-    return None
+    return canonical_responses_call_id_from_fc(response_item_id) or None
 
 
 def _split_responses_tool_id(raw_id: Any) -> tuple[Optional[str], Optional[str]]:
@@ -525,16 +523,21 @@ def _chat_messages_to_responses_input(
     # directly — the converted `item` can be a lossy shape (stale exact-replay, or a typed
     # `function_call_output` wrapper) that no longer carries it (#90976).
     item_sources: List[Optional[Dict[str, Any]]] = []
+    # Keep source indexes as well as source objects: a valid source can emit
+    # zero items (foreign issuer) or several items (reasoning + call), so
+    # object repetition alone cannot reconstruct a protected source boundary.
+    item_source_positions: List[int] = []
     seen_item_ids: set = set()
-    def emit(new_items: List[Dict[str, Any]], msg: Dict[str, Any]) -> None:
+    def emit(new_items: List[Dict[str, Any]], msg: Dict[str, Any], source_position: int) -> None:
         items.extend(new_items)
         item_sources.extend([msg] * len(new_items))
-    for msg in messages:
+        item_source_positions.extend([source_position] * len(new_items))
+    for source_position, msg in enumerate(messages):
         if not isinstance(msg, dict):
             continue
         role = msg.get("role")
         if role == "tool":
-            emit(_tool_output_items(msg), msg)
+            emit(_tool_output_items(msg), msg, source_position)
             continue
         if role not in {"user", "assistant"}:
             continue
@@ -546,16 +549,16 @@ def _chat_messages_to_responses_input(
             if isinstance(content, list) else _str_or_empty(content)
         )
         if role == "user":
-            emit([{"role": role, "content": content_parts or content_text}], msg)
+            emit([{"role": role, "content": content_parts or content_text}], msg, source_position)
             continue
         reasoning_items = [] if not replay_encrypted_reasoning else _replay_reasoning_items(
             msg, seen_item_ids=seen_item_ids, current_issuer_kind=current_issuer_kind,
             native_compaction_eligible=native_compaction_eligible,
             protected_native_handoffs=protected_native_handoffs,
         )
-        emit(reasoning_items, msg)
+        emit(reasoning_items, msg, source_position)
         message_items = _replay_message_items(msg, is_github_responses=is_github_responses)
-        emit(message_items, msg)
+        emit(message_items, msg, source_position)
         if not message_items:
             # Every reasoning item needs a following item (else missing_following_item), hence the "" fallback.
             has_protected_handoff = any(
@@ -569,8 +572,8 @@ def _chat_messages_to_responses_input(
                 else "" if reasoning_items and not has_protected_handoff else None
             )
             if fallback is not None:
-                emit([{"role": "assistant", "content": fallback}], msg)
-        emit(_replay_tool_call_items(msg, start_index=len(items)), msg)
+                emit([{"role": "assistant", "content": fallback}], msg, source_position)
+        emit(_replay_tool_call_items(msg, start_index=len(items)), msg, source_position)
     # The server renders nothing placed before a compaction item, so pre-checkpoint history is
     # dead weight and plaintext asks / merged summaries silently vanish. Keep the newest checkpoint
     # first, retain pre-checkpoint USER and SUMMARY messages within a token budget, leave the tail.
@@ -588,7 +591,12 @@ def _chat_messages_to_responses_input(
     if not native_compaction_eligible:
         return items
     from agent.native_compaction import prune_pre_checkpoint_items
-    return prune_pre_checkpoint_items(items, item_sources=item_sources)
+    return prune_pre_checkpoint_items(
+        items,
+        item_sources=item_sources,
+        item_source_positions=item_source_positions,
+        source_messages=messages,
+    )
 
 
 class ResponsesRouteFlags(NamedTuple):

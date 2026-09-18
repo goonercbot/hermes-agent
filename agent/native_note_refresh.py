@@ -349,11 +349,6 @@ def execute_native_note_refresh(agent, capability, response, messages, effective
             replay_messages=(messages[:initial_message_count] if unequal_prefix else messages),
         ):
             raise NativeNoteRefreshFailure("canonical maintenance replay projection failed")
-        # The next ordinary request receives one host-owned scope boundary even
-        # when compaction is not selected.  This is process-local state, not a
-        # durable permission or an addition to the agent-authored note.
-        agent._native_note_refresh_resume_pending = True
-        agent._native_note_refresh_resume_request_id = None
         log_native_note_transition(
             "native_note_publication", "projection_bound", agent=agent, messages=messages,
             note=expected, flush_accepted=True, dispatched=dispatch_accepted,

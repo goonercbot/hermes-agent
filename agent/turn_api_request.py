@@ -83,6 +83,25 @@ def _authenticated_native_continuity_kwargs(agent: Any, messages: Any) -> dict[s
     }
 
 
+def _native_incremental_ordinary_request(agent: Any) -> bool:
+    """Whether this request uses the fixed native-continuity ordinary prefix."""
+    if (
+        getattr(agent, "api_mode", None) != "codex_responses"
+        or not bool(getattr(agent, "native_incremental_handoff_enabled", False))
+    ):
+        return False
+    from agent.codex_responses_adapter import classify_responses_route
+    from agent.native_incremental_handoff import native_incremental_continuity_capable
+
+    route = classify_responses_route(agent)
+    return native_incremental_continuity_capable(
+        agent,
+        is_codex_backend=route.is_codex_backend,
+        is_xai_responses=route.is_xai_responses,
+        is_github_responses=route.is_github_responses,
+    )
+
+
 def _fire_pre_api_request_hook(
     agent: Any, api_kwargs: Any, api_messages: Any, _llm_middleware_trace: Any, *, messages: Any,
     original_user_message: Any, approx_tokens: Any, total_chars: Any, retry_count: Any,
@@ -168,37 +187,18 @@ def build_api_request(
         api_kwargs = agent._build_api_kwargs(
             api_messages, tools_for_api=tools_for_api, **_native_continuity_kwargs
         )
+    if _native_incremental_ordinary_request(agent):
+        from agent.native_incremental_handoff import native_incremental_ordinary_instructions
+
+        api_kwargs["instructions"] = native_incremental_ordinary_instructions(
+            str(api_kwargs.get("instructions", ""))
+        )
     _native_note_refresh_request = False
     if agent.api_mode == "codex_responses" and getattr(agent, "native_incremental_handoff_enabled", False):
         from agent.native_incremental_handoff import prepare_native_note_refresh_request
 
         _native_note_refresh_request = prepare_native_note_refresh_request(agent, messages, api_kwargs)
-    resume_pending = bool(getattr(agent, "_native_note_refresh_resume_pending", False))
-    current_request_id = getattr(agent, "_current_api_request_id", None)
-    if resume_pending and getattr(agent, "_native_note_refresh_resume_request_id", None) not in {
-        None, current_request_id,
-    }:
-        # A normal request was already prepared.  Do not keep injecting the
-        # maintenance boundary into later tool rounds or future user turns.
-        agent._native_note_refresh_resume_pending = False
-        resume_pending = False
-    if (
-        not _native_note_refresh_request
-        and _native_continuity_kwargs
-        and isinstance(api_kwargs.get("input"), list)
-        and (
-            resume_pending
-            or any(isinstance(item, dict) and item.get("type") == "compaction" for item in api_kwargs["input"])
-        )
-    ):
-        from agent.native_incremental_handoff import native_incremental_resume_instructions
 
-        api_kwargs["instructions"] = native_incremental_resume_instructions(
-            api_kwargs.get("instructions", ""),
-            _native_continuity_kwargs["native_continuity_source_messages"],
-        )
-        if resume_pending:
-            agent._native_note_refresh_resume_request_id = current_request_id
     # Surrogate chokepoint: tool descriptions, extra_body and kwargs strings can carry
     # invalid code points (HTTP 400). One walk makes the payload json.dumps()-safe.
     # Outbound-request surrogate chokepoint (#50959): the messages were scrubbed above, but the rest of the

@@ -228,7 +228,7 @@ def test_tool_search_deferred_note_persist_restart_compact_first_turn(tmp_path,m
         assert 'reply exactly NATIVE_COMPACTION_COMPLETE' not in calls[0]['instructions']
         assert 'request-local context-maintenance operation' in calls[0]['instructions']
         for ordinary in calls[1:]:
-            assert 'preceding native continuity maintenance operation is finished.' in ordinary['instructions']
+            assert 'single-tool inventory was request-local' in ordinary['instructions']
             assert any(i.get('type')=='compaction' for i in ordinary['input'])
         assert 'max_output_tokens' not in calls[0]
         assert calls[0]['reasoning']=={'effort':'low'}

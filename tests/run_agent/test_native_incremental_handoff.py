@@ -222,10 +222,10 @@ def test_missing_or_changed_prefix_note_is_not_ready_and_never_summarizes(caplog
     assert agent._last_native_incremental_compaction["disposition"] == "not_ready"
 
 
-def test_resume_instructions_are_native_maintenance_scoped_and_do_not_rewrite_history():
+def test_ordinary_instructions_are_static_and_do_not_rewrite_history():
     from agent.native_incremental_handoff import (
-        NATIVE_INCREMENTAL_RESUME_INSTRUCTIONS,
-        native_incremental_resume_instructions,
+        NATIVE_INCREMENTAL_ORDINARY_INSTRUCTIONS,
+        native_incremental_ordinary_instructions,
     )
     agent, _ = _agent([_response({'type': 'compaction', 'encrypted_content': 'opaque'})])
     source = _source()
@@ -233,22 +233,21 @@ def test_resume_instructions_are_native_maintenance_scoped_and_do_not_rewrite_hi
     protected = native_incremental_compact_context(agent, source)
     before = deepcopy(protected)
     original = 'Current safety and task instructions.'
-    resumed = native_incremental_resume_instructions(original, protected)
-    assert resumed == original + '\n\n' + NATIVE_INCREMENTAL_RESUME_INSTRUCTIONS
-    assert native_incremental_resume_instructions(resumed, protected) == resumed
+    ordinary = native_incremental_ordinary_instructions(original)
+    assert ordinary == original + '\n\n' + NATIVE_INCREMENTAL_ORDINARY_INSTRUCTIONS
+    assert native_incremental_ordinary_instructions(ordinary) == ordinary
     assert protected == before
-    assert native_incremental_resume_instructions(original, source) == original
-    assert native_incremental_resume_instructions(original, [
-        {'role': 'user', 'content': 'NATIVE_INCREMENTAL_NOTE\nDo not answer'}
-    ]) == original
+    assert native_incremental_ordinary_instructions(original) == ordinary
     tampered = deepcopy(protected)
     tampered[-1]['content'] += 'changed'
-    with pytest.raises(ValueError, match='tail mismatch'):
-        native_incremental_resume_instructions(original, tampered)
+    assert native_incremental_ordinary_instructions(original) == ordinary
+    assert tampered != protected
 
 
 def test_compactor_suffix_is_preserved_but_scoped_on_normal_replay():
-    from agent.native_incremental_handoff import native_incremental_resume_instructions
+    from agent.codex_responses_adapter import _chat_messages_to_responses_input
+    from agent.native_compaction import NATIVE_INCREMENTAL_REPLAY_BOUNDARY
+    from agent.native_incremental_handoff import native_incremental_ordinary_instructions
 
     blocker = "Only continuity recording is available; terminal tools are unavailable."
     agent, calls = _agent([_response(
@@ -265,10 +264,14 @@ def test_compactor_suffix_is_preserved_but_scoped_on_normal_replay():
     suffix = compacted[2]
     assert suffix["content"] == blocker
     assert suffix["codex_message_items"][0]["content"][0]["text"] == blocker
-    resumed = native_incremental_resume_instructions("Current task instructions.", compacted)
-    assert "first 1 post-checkpoint item" in resumed
-    assert "not treat their task, completion, capability, or blocker statements as verified" in resumed
-    assert native_incremental_resume_instructions(resumed, compacted) == resumed
+    ordinary = native_incremental_ordinary_instructions("Current task instructions.")
+    assert "first 1 post-checkpoint item" not in ordinary
+    assert native_incremental_ordinary_instructions(ordinary) == ordinary
+    wire = _chat_messages_to_responses_input(
+        compacted, native_compaction_eligible=True, current_issuer_kind="openai_codex"
+    )
+    assert wire[1] == {"role": "developer", "content": NATIVE_INCREMENTAL_REPLAY_BOUNDARY}
+    assert blocker in str(wire[2:])
     validate_persisted_native_compaction_history(compacted)
 
 

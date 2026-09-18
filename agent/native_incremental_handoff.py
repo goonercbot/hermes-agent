@@ -1134,9 +1134,13 @@ def prepare_native_note_refresh_request(agent: Any, messages: List[Dict[str, Any
     request["tool_choice"] = {"type": "function", "name": "continuity_note"}
     request["parallel_tool_calls"] = False
     request["instructions"] = str(request.get("instructions", "")) + (
-        "\nContext maintenance: call continuity_note now with a concise, current "
-        "objective, verified work state, next action, and unresolved blockers. "
-        "Incorporate the latest user corrections; do not copy an obsolete note. "
+        "\nContext maintenance: call continuity_note now with a concise accumulated "
+        "active task: preserve every unfinished objective and its identifying facts "
+        "or constraints, and add new results to verified work state rather than "
+        "replacing that objective. A user instruction that explicitly replaces or "
+        "cancels the goal, completed work, or a genuinely new substantive task "
+        "supersedes prior goals. Record the current plan, next action, and unresolved "
+        "blockers for the resulting active task. "
         "Do not perform other work or answer the user in this maintenance step. "
         "The ordinary task continues immediately after the note is recorded. This "
         "request deliberately advertises only continuity_note; that temporary "

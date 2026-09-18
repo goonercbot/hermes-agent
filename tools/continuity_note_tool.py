@@ -15,9 +15,13 @@ CONTINUITY_NOTE_AUTHENTICATOR = "native_incremental_continuity_note_v1"
 CONTINUITY_NOTE_SCHEMA = {
     "name": CONTINUITY_NOTE_TOOL_NAME,
     "description": (
-        "Record the current objective, plan, next action, and blockers for the "
-        "opt-in native incremental continuity route. Use during active work; "
-        "current user instructions always take precedence over this agent-authored note. "
+        "Record the accumulated active task's objective, plan, next action, and "
+        "blockers for the opt-in native incremental continuity route. Preserve each "
+        "unfinished objective and its identifying facts or constraints when recording "
+        "additive results in verified work state. An explicit user replacement or "
+        "cancellation, completed work, or a genuinely new substantive task supersedes "
+        "prior goals. Current user instructions always take precedence over this "
+        "agent-authored note. "
         "When the host advertises only this tool for one maintenance request, that "
         "single-tool inventory is intentional and request-local: it is not evidence "
         "that ordinary task tools are unavailable or permanently blocked."
@@ -25,13 +29,13 @@ CONTINUITY_NOTE_SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
-            "objective": {"type": "string", "description": "Current work objective."},
-            "current_plan": {"type": "string", "description": "Current concise plan."},
-            "next_action": {"type": "string", "description": "Single next action."},
+            "objective": {"type": "string", "description": "Accumulated active objective, retaining unfinished identifying facts and constraints."},
+            "current_plan": {"type": "string", "description": "Current concise plan for the accumulated active task."},
+            "next_action": {"type": "string", "description": "Single next action for the accumulated active task."},
             "blockers": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "Current blockers, if any.",
+                "description": "Current blockers for the accumulated active task, if any.",
             },
         },
         "required": ["objective", "current_plan", "next_action"],

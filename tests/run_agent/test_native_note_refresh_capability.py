@@ -65,3 +65,30 @@ def test_capability_requires_exact_live_consumed_dispatch():
     for forged in (None, True, {}, NS(authorized=True), object(), object.__new__(type(capability))):
         assert not proof(agent, forged)
 
+
+def test_maintenance_contract_accumulates_active_work_and_limits_supersession():
+    """The maintenance-only instruction must not treat additive evidence as a goal swap."""
+    from tools.continuity_note_tool import CONTINUITY_NOTE_SCHEMA
+
+    from tests.run_agent.test_native_incremental_handoff import _agent, _note
+
+    agent, _ = _agent([])
+    messages = [{'role': 'user', 'content': 'original'}]
+    _note(agent, messages)
+    messages.append({'role': 'assistant', 'content': 'verified evidence ' * 30000})
+    request = {'instructions': 'ordinary', 'tools': []}
+    agent._current_api_request_id = 'contract:api:1'
+    capability = prepare_native_note_refresh_request(agent, messages, request)
+    assert capability is not False
+
+    instructions = request['instructions']
+    description = CONTINUITY_NOTE_SCHEMA['description']
+    assert 'preserve every unfinished objective and its identifying facts or constraints' in instructions
+    assert 'add new results to verified work state rather than replacing that objective' in instructions
+    assert 'explicitly replaces or cancels the goal, completed work, or a genuinely new substantive task' in instructions
+    assert 'Preserve each unfinished objective and its identifying facts or constraints' in description
+    assert 'explicit user replacement or cancellation, completed work, or a genuinely new substantive task' in description
+    assert CONTINUITY_NOTE_SCHEMA['parameters']['properties']['objective']['description'] == (
+        'Accumulated active objective, retaining unfinished identifying facts and constraints.'
+    )
+

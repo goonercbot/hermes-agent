@@ -69,6 +69,8 @@ class NativeNoteRefreshFailure(RuntimeError):
 _LIVE_CAPABILITIES = weakref.WeakSet()
 _UNEXPECTED_FAILURE_REASONS = {
     "response_validation": "maintenance response validation host failure",
+    "canonical_source_validation": "canonical maintenance source validation host failure",
+    "canonical_database_read": "canonical maintenance database read host failure",
     "middleware_dispatch": "maintenance middleware host failure",
     "persistence": "maintenance persistence host failure",
     "durable_readback": "maintenance durable readback host failure",
@@ -245,7 +247,7 @@ def execute_native_note_refresh(agent, capability, response, messages, effective
     initial_message_count = len(messages)
     flush_accepted = False
     dispatch_accepted = False
-    phase = "response_validation"
+    phase = "canonical_source_validation"
     log_native_note_transition(
         "native_note_execute", "entered", agent=agent, messages=messages,
     )
@@ -255,12 +257,18 @@ def execute_native_note_refresh(agent, capability, response, messages, effective
         capability.check(agent)
         if capability.call_id is not None or _note_fence(messages) != capability.source_fence:
             raise NativeNoteRefreshFailure("maintenance source changed or response duplicated")
-        validate_persisted_native_compaction_history(messages)
+        try:
+            validate_persisted_native_compaction_history(messages)
+        except ValueError as exc:
+            raise NativeNoteRefreshFailure(
+                "canonical maintenance history rejected", phase="canonical_source_validation",
+            ) from exc
         source, _ = _projection_source_for_messages(agent, messages)
         if source is None or _note_fence(source) != capability.canonical_source_fence:
             raise NativeNoteRefreshFailure("canonical maintenance source changed")
         if getattr(agent, "_interrupt_requested", False):
             raise NativeNoteRefreshFailure("maintenance cancelled")
+        phase = "response_validation"
         output = _item_value(response, "output")
         if _item_value(response, "status") != "completed" or not isinstance(output, list):
             raise NativeNoteRefreshFailure("maintenance response incomplete")
@@ -290,15 +298,33 @@ def execute_native_note_refresh(agent, capability, response, messages, effective
         # The call/result pair is not itself continuity evidence. This catches
         # a queued follow-up whose replay omitted a newly durable async row
         # before any maintenance rows can be published.
+        phase = "canonical_source_validation"
         source, _ = _projection_source_for_messages(agent, messages)
         if source is None:
             raise NativeNoteRefreshFailure("canonical maintenance source unauthenticated")
-        validate_persisted_native_compaction_history(source)
-        stored_before = agent._session_db.get_messages_as_conversation(
-            agent.session_id, repair_alternation=False,
-        )
-        validate_persisted_native_compaction_history(stored_before)
-        source = canonical_native_incremental_source_messages(source, stored_before)
+        try:
+            validate_persisted_native_compaction_history(source)
+        except ValueError as exc:
+            raise NativeNoteRefreshFailure(
+                "canonical maintenance history rejected", phase="canonical_source_validation",
+            ) from exc
+        phase = "canonical_database_read"
+        try:
+            stored_before = agent._session_db.get_messages_as_conversation(
+                agent.session_id, repair_alternation=False,
+            )
+        except Exception as exc:
+            raise NativeNoteRefreshFailure(
+                "canonical maintenance database read failed", phase="canonical_database_read",
+            ) from exc
+        phase = "canonical_source_validation"
+        try:
+            validate_persisted_native_compaction_history(stored_before)
+            source = canonical_native_incremental_source_messages(source, stored_before)
+        except ValueError as exc:
+            raise NativeNoteRefreshFailure(
+                "canonical maintenance history rejected", phase="canonical_source_validation",
+            ) from exc
         source_fence = _note_fence(source)
         if _note_fence(stored_before) != source_fence:
             raise NativeNoteRefreshFailure(

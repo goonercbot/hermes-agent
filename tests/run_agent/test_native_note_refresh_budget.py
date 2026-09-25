@@ -1,6 +1,8 @@
 """End-to-end budget recovery for host-owned native continuity notes."""
 from copy import deepcopy
 import json
+import logging
+import sqlite3
 from types import SimpleNamespace as NS
 from unittest.mock import patch
 
@@ -236,3 +238,86 @@ def test_second_oversized_note_fails_closed_without_ordinary_work(stale_agent):
     assert len(calls) == 2
     stored = db.get_messages_as_conversation(sid, repair_alternation=False)
     assert "oversized-" not in json.dumps(stored)
+
+
+def test_two_independent_refresh_events_each_receive_one_correction(stale_agent, blocking_router):
+    """A corrected event must not consume the next stale tail's allowance."""
+    agent, db, sid, source, tmp_path = stale_agent
+    maintenance = []
+    ordinary = []
+    capabilities = []
+
+    def provider(request):
+        if request.get("tool_choice") == {"type": "function", "name": "continuity_note"}:
+            maintenance.append(deepcopy(request))
+            capabilities.append(agent._native_note_refresh_capability)
+            args = _oversized_args(sid, source) if len(maintenance) % 2 else ARGS
+            return reply(NS(
+                type="function_call", id=f"note-{len(maintenance)}", call_id=f"note-{len(maintenance)}",
+                name="continuity_note", arguments=json.dumps(args),
+            ))
+        ordinary.append(deepcopy(request))
+        if len(ordinary) == 1:
+            # This real-loop fixture deliberately grows the authenticated tail,
+            # creating a separate maintenance event without changing thresholds.
+            return reply(
+                NS(type="message", role="assistant", content=[
+                    NS(type="output_text", text="additional verified public evidence " * 20000),
+                ]),
+                NS(type="function_call", id="route", call_id="route", name="tool_call", arguments=json.dumps({
+                    "name": "fleet_route_task", "arguments": {
+                        "work_shape": "direct", "consequence": "routine",
+                        "reason_codes": ["known_short_path"], "proof_target": "focused_test",
+                    },
+                })),
+                tokens=220000,
+            )
+        return reply(NS(type="message", role="assistant", content=[
+            NS(type="output_text", text="TWO_CORRECTIONS_DONE"),
+        ]), tokens=600)
+
+    agent._interruptible_api_call = provider
+    result = agent.run_conversation("Continue the approved exact task.", conversation_history=source)
+    assert result.get("completed") and result.get("final_response") == "TWO_CORRECTIONS_DONE"
+    assert len(maintenance) == 4
+    assert capabilities[0] is not capabilities[1]
+    assert capabilities[2] is not capabilities[3]
+    stored = db.get_messages_as_conversation(sid, repair_alternation=False)
+    assert sum(row.get("tool_call_id") == call_id for row in stored for call_id in ("note-2", "note-4")) == 2
+    assert all(call_id not in json.dumps(stored) for call_id in ("note-1", "note-3"))
+
+
+def test_canonical_database_failure_is_safe_in_executor_and_loop(stale_agent, caplog):
+    """Database and history classes must survive the generic exception boundary."""
+    from agent.native_note_refresh import (
+        NativeNoteRefreshFailure, execute_native_note_refresh, issue_native_note_refresh,
+    )
+    from agent.native_incremental_handoff import bind_native_incremental_replay_projection
+
+    agent, db, sid, source, _tmp_path = stale_agent
+    agent._current_api_request_id = "database-failure:api:1"
+    assert bind_native_incremental_replay_projection(agent, source_messages=source, replay_messages=source)
+    capability = issue_native_note_refresh(agent, source)
+    response = reply(NS(
+        type="function_call", id="database-failure", call_id="database-failure",
+        name="continuity_note", arguments=json.dumps(ARGS),
+    ))
+    with patch.object(db, "get_messages_as_conversation", side_effect=sqlite3.OperationalError("private synthetic failure")):
+        with pytest.raises(NativeNoteRefreshFailure) as caught:
+            execute_native_note_refresh(agent, capability, response, source, sid)
+    assert caught.value.reason == "canonical maintenance database read failed"
+    assert caught.value.phase == "canonical_database_read"
+
+    # Recreate the normal real-loop path and assert the returned/logged class;
+    # raw database text is never surfaced in the result or warning.
+    source = db.get_messages_as_conversation(sid, repair_alternation=False)
+    agent._interruptible_api_call = lambda _request: reply(NS(
+        type="function_call", id="database-loop", call_id="database-loop",
+        name="continuity_note", arguments=json.dumps(ARGS),
+    ))
+    with patch.object(db, "get_messages_as_conversation", side_effect=sqlite3.OperationalError("private synthetic failure")):
+        with caplog.at_level(logging.WARNING, logger="agent.conversation_loop"):
+            result = agent.run_conversation("Continue safely.", conversation_history=source)
+    assert result["failed"] and result["maintenance_failure"] == "canonical maintenance database read failed"
+    assert result["maintenance_phase"] == "canonical_database_read"
+    assert "private synthetic failure" not in caplog.text

@@ -1620,6 +1620,10 @@ def run_conversation(
             # A durably advanced note, not an arbitrary request retry, clears
             # only the stale-tail admission latch.  The next normal iteration
             # rebuilds its tools from agent.tools, restoring ordinary tools.
+            # A correction budget belongs to the just-published maintenance
+            # event. A later independently stale tail in this same user turn
+            # receives its own one-shot correction allowance.
+            s.native_note_refresh_correction_attempts = 0
             s._preflight_compression_blocked = False
             s._last_preflight_pressure = None
             agent._session_messages = s.messages

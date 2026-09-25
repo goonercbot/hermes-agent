@@ -21,15 +21,59 @@ from agent.native_incremental_handoff import (
 )
 
 
+def _native_note_failure_phase(reason: str) -> str:
+    """Classify only fixed host failures; never render provider or note content."""
+    if reason in {
+        "maintenance cancelled",
+    }:
+        return "interrupted"
+    if reason in {
+        "invalid or expired maintenance capability", "forged maintenance capability",
+        "maintenance request changed after preparation", "maintenance source changed or response duplicated",
+        "canonical maintenance source changed", "canonical maintenance source unauthenticated",
+        "canonical maintenance source diverged before publication",
+    }:
+        return "authorization_or_source_validation"
+    if reason in {
+        "maintenance response incomplete", "expected exactly one direct continuity_note call",
+        "invalid, wrapped or reused maintenance call",
+    }:
+        return "response_validation"
+    if reason in {
+        "maintenance call changed or duplicated", "maintenance recorder arguments changed",
+        "blocked, failed or unchanged authenticated note",
+    }:
+        return "middleware_dispatch"
+    if reason in {
+        "durable maintenance persistence unavailable", "maintenance pair persistence failed",
+    }:
+        return "persistence"
+    if reason in {
+        "durable note readback failed authentication", "durable tool result missing",
+        "maintenance source changed during dispatch", "canonical maintenance replay projection failed",
+    }:
+        return "post_flush_verification"
+    return "pre_publication"
+
+
 class NativeNoteRefreshFailure(RuntimeError):
     """Local maintenance failure; never a provider retry/fallback signal."""
 
-    def __init__(self, reason):
+    def __init__(self, reason, *, phase=None, correctable=False):
         self.reason = reason
+        self.phase = _native_note_failure_phase(reason) if phase is None else phase
+        self.correctable = bool(correctable)
         super().__init__(f"Continuity-note refresh failed: {reason}")
 
 
 _LIVE_CAPABILITIES = weakref.WeakSet()
+_UNEXPECTED_FAILURE_REASONS = {
+    "response_validation": "maintenance response validation host failure",
+    "middleware_dispatch": "maintenance middleware host failure",
+    "persistence": "maintenance persistence host failure",
+    "durable_readback": "maintenance durable readback host failure",
+    "projection_binding": "maintenance projection binding host failure",
+}
 
 
 # Kept as a private compatibility alias for existing direct callers. The
@@ -201,6 +245,7 @@ def execute_native_note_refresh(agent, capability, response, messages, effective
     initial_message_count = len(messages)
     flush_accepted = False
     dispatch_accepted = False
+    phase = "response_validation"
     log_native_note_transition(
         "native_note_execute", "entered", agent=agent, messages=messages,
     )
@@ -259,9 +304,18 @@ def execute_native_note_refresh(agent, capability, response, messages, effective
             raise NativeNoteRefreshFailure(
                 "canonical maintenance source diverged before publication"
             )
-        expected = create_native_incremental_note(
-            session_id=agent.session_id, source_messages=source, **arguments,
-        )
+        try:
+            expected = create_native_incremental_note(
+                session_id=agent.session_id, source_messages=source, **arguments,
+            )
+        except ValueError as exc:
+            if str(exc) == "native incremental note exceeds host serialized size budget":
+                raise NativeNoteRefreshFailure(
+                    "continuity note exceeds host serialized size budget",
+                    phase="pre_publication_validation", correctable=True,
+                ) from exc
+            raise
+        phase = "middleware_dispatch"
         # Maintenance prose/reasoning is not ordinary assistant output. Stage
         # only the exact call and host-authenticated result, with no UI
         # emission. The pair is flushed once, atomically, after dispatch.
@@ -302,6 +356,7 @@ def execute_native_note_refresh(agent, capability, response, messages, effective
         messages.append(make_tool_result_message(
             "continuity_note", managed.result, call_id, effect_disposition="none",
         ))
+        phase = "persistence"
         if agent._flush_messages_to_session_db(messages) is False:
             raise NativeNoteRefreshFailure("maintenance pair persistence failed")
         flush_accepted = True
@@ -311,6 +366,7 @@ def execute_native_note_refresh(agent, capability, response, messages, effective
         )
         # A successful flush alone is not proof: authenticate a fresh reader of
         # the canonical database, not the mutable replay or staged note.
+        phase = "durable_readback"
         stored = agent._session_db.get_messages_as_conversation(
             agent.session_id, repair_alternation=False,
         )
@@ -330,6 +386,7 @@ def execute_native_note_refresh(agent, capability, response, messages, effective
         # source evidence. Revalidate the original replay prefix, then map it
         # back to canonical history; using ``messages[:-1]`` would include the
         # staged call and make every successful direct refresh self-conflict.
+        phase = "projection_binding"
         current_source, _ = _projection_source_for_messages(
             agent, messages[:initial_message_count]
         )
@@ -360,6 +417,7 @@ def execute_native_note_refresh(agent, capability, response, messages, effective
             "native_note_execute", "succeeded", agent=agent, messages=messages,
             note=expected, flush_accepted=True, dispatched=dispatch_accepted,
         )
+        agent._native_note_refresh_correction_requested = False
         return SimpleNamespace(
             output=[deepcopy(call)], status="completed",
             usage=_item_value(response, "usage"), model=_item_value(response, "model"),
@@ -378,7 +436,10 @@ def execute_native_note_refresh(agent, capability, response, messages, effective
         )
         if isinstance(exc, NativeNoteRefreshFailure):
             raise
-        raise NativeNoteRefreshFailure("maintenance execution or persistence failed") from exc
+        raise NativeNoteRefreshFailure(
+            _UNEXPECTED_FAILURE_REASONS.get(phase, "maintenance pre-publication host failure"),
+            phase=phase,
+        ) from exc
     finally:
         if type(capability) is _NoteRefreshCapability:
             capability.close()

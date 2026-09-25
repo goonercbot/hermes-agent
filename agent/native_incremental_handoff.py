@@ -123,7 +123,13 @@ NATIVE_INCREMENTAL_MODEL = "gpt-5.6-luna"
 # Leave enough room for the rendered checkpoint. An overly small target can
 # trigger repeated provider compactions inside a single Responses request.
 NATIVE_INCREMENTAL_COMPACT_THRESHOLD = 128_000
-NATIVE_INCREMENTAL_NOTE_MAX_CHARS = 8_000
+# This is the complete persisted note, not merely model-authored field text.
+# The immutable session/cursor/fence envelope is deliberately inside the same
+# deterministic budget so a note that passes the tool boundary can be stored.
+NATIVE_INCREMENTAL_NOTE_MAX_SERIALIZED_CHARS = 8_000
+# Compatibility name for existing callers. New consumers should name what is
+# actually bounded: the canonical serialized host envelope.
+NATIVE_INCREMENTAL_NOTE_MAX_CHARS = NATIVE_INCREMENTAL_NOTE_MAX_SERIALIZED_CHARS
 # A compacted Responses turn may legitimately emit many alternating reasoning
 # and message records after its final checkpoint. Keep a bounded replay window
 # that exceeds observed real-provider streams, while bounding both structural
@@ -457,10 +463,14 @@ def create_native_incremental_note(
         **values,
         "blockers": list(blockers),
     }
-    canonical = json.dumps(note, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    if len(canonical) > NATIVE_INCREMENTAL_NOTE_MAX_CHARS:
-        raise ValueError("native incremental note exceeds bounded size")
+    if native_incremental_note_serialized_size(note) > NATIVE_INCREMENTAL_NOTE_MAX_SERIALIZED_CHARS:
+        raise ValueError("native incremental note exceeds host serialized size budget")
     return note
+
+
+def native_incremental_note_serialized_size(note: Dict[str, Any]) -> int:
+    """Measure the exact canonical note envelope that the host persists."""
+    return len(json.dumps(note, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
 
 
 def record_native_incremental_note(
@@ -1133,6 +1143,14 @@ def prepare_native_note_refresh_request(agent: Any, messages: List[Dict[str, Any
     request["tools"] = [{"type": "function", **deepcopy(CONTINUITY_NOTE_SCHEMA)}]
     request["tool_choice"] = {"type": "function", "name": "continuity_note"}
     request["parallel_tool_calls"] = False
+    correction_requested = bool(getattr(agent, "_native_note_refresh_correction_requested", False))
+    correction_guidance = (
+        " The prior valid continuity_note exceeded the host serialized-note budget. "
+        f"Submit one corrected concise note that preserves all active facts and fits the complete "
+        f"host envelope within {NATIVE_INCREMENTAL_NOTE_MAX_SERIALIZED_CHARS} serialized characters; "
+        "JSON escaping counts and non-ASCII text is serialized without ASCII escaping."
+        if correction_requested else ""
+    )
     request["instructions"] = str(request.get("instructions", "")) + (
         "\nContext maintenance: call continuity_note now with a concise accumulated "
         "active task: preserve every unfinished objective and its identifying facts "
@@ -1147,7 +1165,11 @@ def prepare_native_note_refresh_request(agent: Any, messages: List[Dict[str, Any
         "The ordinary task continues immediately after the note is recorded. This "
         "request deliberately advertises only continuity_note; that temporary "
         "inventory is not evidence that ordinary tools are unavailable, denied, or "
-        "broken, and must not be recorded as a durable blocker."
+        "broken, and must not be recorded as a durable blocker. "
+        f"The complete host-persisted continuity-note envelope has a deterministic budget of "
+        f"{NATIVE_INCREMENTAL_NOTE_MAX_SERIALIZED_CHARS} serialized characters; be concise because "
+        "the immutable host envelope and JSON escaping count toward it."
+        + correction_guidance
     )
     return issue_native_note_refresh(agent, messages)
 

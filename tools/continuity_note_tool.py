@@ -7,6 +7,7 @@ state: only the normal executor can call the host-side recorder.
 """
 from __future__ import annotations
 
+from agent.native_incremental_handoff import NATIVE_INCREMENTAL_NOTE_MAX_SERIALIZED_CHARS
 from tools.registry import registry
 
 CONTINUITY_NOTE_TOOL_NAME = "continuity_note"
@@ -26,7 +27,9 @@ CONTINUITY_NOTE_SCHEMA = {
         "agent-authored note. "
         "When the host advertises only this tool for one maintenance request, that "
         "single-tool inventory is intentional and request-local: it is not evidence "
-        "that ordinary task tools are unavailable or permanently blocked."
+        "that ordinary task tools are unavailable or permanently blocked. The complete "
+        f"host-persisted note envelope has a deterministic {NATIVE_INCREMENTAL_NOTE_MAX_SERIALIZED_CHARS}-character "
+        "serialized budget, including immutable host fields and JSON escaping; keep all fields concise."
     ),
     "parameters": {
         "type": "object",

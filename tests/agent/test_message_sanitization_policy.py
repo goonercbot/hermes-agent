@@ -19,6 +19,8 @@ from agent.message_sanitization import (
     needs_reasoning_echo,
     reapply_reasoning_echo,
     reasoning_echo_family,
+    tool_call_id_variants,
+    tool_result_id_variants,
     uniquify_tool_call_ids,
 )
 
@@ -82,6 +84,30 @@ class TestCoalesceToolCallId:
         from run_agent import AIAgent
         tc = {"call_id": "c9", "id": "i9"}
         assert AIAgent._get_tool_call_id_static(tc) == coalesce_tool_call_id(tc)
+
+
+# ---------------------------------------------------------------------------
+# Responses call/result aliases
+# ---------------------------------------------------------------------------
+
+class TestResponsesToolIdVariants:
+    def test_bare_fc_call_gets_only_its_canonical_fallback(self):
+        variants = tool_call_id_variants({"id": "fc_fallback"})
+        assert variants == {"fc_fallback", "call_fallback"}
+        assert tool_result_id_variants("call_fallback") == {"call_fallback"}
+        assert tool_result_id_variants("fc_fallback") == {"fc_fallback"}
+        assert variants & tool_result_id_variants("call_fallback")
+        assert variants & tool_result_id_variants("fc_fallback")
+
+    def test_explicit_call_id_prevents_fc_alias_from_claiming_another_call(self):
+        call = {"call_id": "manual-pairing", "id": "fc_other"}
+        assert tool_call_id_variants(call) == {"manual-pairing", "fc_other"}
+        assert tool_result_id_variants("fc_other") == {"fc_other"}
+
+    def test_composite_id_preserves_literal_and_split_aliases_without_new_pairing(self):
+        assert tool_call_id_variants({"id": "call_pair|fc_item"}) == {
+            "call_pair|fc_item", "call_pair", "fc_item",
+        }
 
 
 # ---------------------------------------------------------------------------

@@ -1356,6 +1356,7 @@ class _LoopState:
     _llm_middleware_trace: Any = None
     native_note_refresh_request: Any = False
     native_note_refresh_completed: bool = False
+    native_note_refresh_correction_attempts: int = 0
     api_duration: Any = None
     assistant_message: Any = None
 
@@ -1410,8 +1411,8 @@ def _run_api_retry_loop(agent, s: _LoopState) -> Optional[Dict[str, Any]]:
         # Reasons are fixed host-side failure classes; retain them in the local
         # log so a generic user-facing preservation response remains diagnosable.
         logger.warning(
-            "Native continuity-note refresh failed (session=%s): %s",
-            getattr(agent, "session_id", None) or "-", error.reason,
+            "Native continuity-note refresh failed (session=%s): %s [phase=%s]",
+            getattr(agent, "session_id", None) or "-", error.reason, error.phase,
         )
         if account_usage:
             try:
@@ -1426,6 +1427,7 @@ def _run_api_retry_loop(agent, s: _LoopState) -> Optional[Dict[str, Any]]:
             "Continuity-note refresh did not complete; conversation preserved without running other work.",
             s.messages, s.api_call_count, failed=True,
             error="native_note_refresh_failed", maintenance_failure=error.reason,
+            maintenance_phase=error.phase,
         )
 
     while s.retry_count < s.max_retries:
@@ -1464,6 +1466,28 @@ def _run_api_retry_loop(agent, s: _LoopState) -> Optional[Dict[str, Any]]:
             if _rc.action == "break":
                 return None
         except NativeNoteRefreshFailure as maintenance_error:
+            if maintenance_error.correctable and s.native_note_refresh_correction_attempts < 1:
+                if not isinstance(maintenance_error.budget_breakdown, dict):
+                    return _maintenance_failure(NativeNoteRefreshFailure(
+                        "continuity note correction measurement unavailable",
+                        phase="pre_publication_validation",
+                    ))
+                s.native_note_refresh_correction_attempts += 1
+                agent._native_note_refresh_correction_requested = True
+                agent._native_note_refresh_budget_breakdown = maintenance_error.budget_breakdown
+                # The correction is a fresh host-authorized maintenance request,
+                # not a retry of the consumed capability or ordinary work.
+                agent._native_note_refresh_request_guard = None
+                try:
+                    account_failed_native_note_refresh(agent, s.response)
+                except Exception:
+                    logger.debug("native note correction usage accounting failed", exc_info=True)
+                return None
+            if maintenance_error.correctable:
+                maintenance_error = NativeNoteRefreshFailure(
+                    "continuity note remains over host serialized size budget after correction",
+                    phase="pre_publication_validation",
+                )
             return _maintenance_failure(maintenance_error)
         except InterruptedError:
             if _run_phase(handle_api_interrupt, agent, s).action == "break":
@@ -1559,6 +1583,8 @@ def run_conversation(
     agent._ephemeral_reasoning_off = False
     agent._auth_pool_refresh_counts = {}
     agent._last_turn_usage = None
+    agent._native_note_refresh_correction_requested = False
+    agent._native_note_refresh_budget_breakdown = None
 
     s = _LoopState(
         system_message=system_message, moa_config=moa_config,
@@ -1601,8 +1627,20 @@ def run_conversation(
             # A durably advanced note, not an arbitrary request retry, clears
             # only the stale-tail admission latch.  The next normal iteration
             # rebuilds its tools from agent.tools, restoring ordinary tools.
+            # A correction budget belongs to the just-published maintenance
+            # event. A later independently stale tail in this same user turn
+            # receives its own one-shot correction allowance.
+            s.native_note_refresh_correction_attempts = 0
             s._preflight_compression_blocked = False
             s._last_preflight_pressure = None
+            agent._session_messages = s.messages
+            continue
+
+        if s.native_note_refresh_correction_attempts and getattr(
+            agent, "_native_note_refresh_correction_requested", False
+        ):
+            # Do not normalize or dispatch the rejected note response. The next
+            # iteration mints a new request id and a new one-shot capability.
             agent._session_messages = s.messages
             continue
 

@@ -123,7 +123,13 @@ NATIVE_INCREMENTAL_MODEL = "gpt-5.6-luna"
 # Leave enough room for the rendered checkpoint. An overly small target can
 # trigger repeated provider compactions inside a single Responses request.
 NATIVE_INCREMENTAL_COMPACT_THRESHOLD = 128_000
-NATIVE_INCREMENTAL_NOTE_MAX_CHARS = 8_000
+# This is the complete persisted note, not merely model-authored field text.
+# The immutable session/cursor/fence envelope is deliberately inside the same
+# deterministic budget so a note that passes the tool boundary can be stored.
+NATIVE_INCREMENTAL_NOTE_MAX_SERIALIZED_CHARS = 8_000
+# Compatibility name for existing callers. New consumers should name what is
+# actually bounded: the canonical serialized host envelope.
+NATIVE_INCREMENTAL_NOTE_MAX_CHARS = NATIVE_INCREMENTAL_NOTE_MAX_SERIALIZED_CHARS
 # A compacted Responses turn may legitimately emit many alternating reasoning
 # and message records after its final checkpoint. Keep a bounded replay window
 # that exceeds observed real-provider streams, while bounding both structural
@@ -131,27 +137,35 @@ NATIVE_INCREMENTAL_NOTE_MAX_CHARS = 8_000
 NATIVE_INCREMENTAL_SUFFIX_MAX_ITEMS = 256
 NATIVE_INCREMENTAL_SUFFIX_MAX_BYTES = 512 * 1024
 
-# Inline compaction is still a model turn: its temporary task instructions can
-# survive in opaque state. Explicitly end that maintenance task on every normal
-# replay, including old checkpoints minted with the unscoped no-answer prompt.
-NATIVE_INCREMENTAL_RESUME_INSTRUCTIONS = (
-    "The previous compaction-only operation is finished. Any prior instruction "
-    "to avoid answering was scoped to that finished operation, not this turn. "
-    "Answer the latest user message normally, following current instructions "
-    "and tool permissions."
+# Native maintenance is still a model turn: temporary tool inventories and task
+# instructions can survive in opaque state.  Every eligible ordinary request
+# carries this fixed boundary from the first request onward, whether or not a
+# maintenance turn has happened yet.  That makes the normal prefix restart-safe
+# and cache-stable without trusting an agent-authored note or rewriting history.
+NATIVE_INCREMENTAL_ORDINARY_INSTRUCTIONS = (
+    "Native continuity maintenance, when present, is request-local. Any "
+    "maintenance-only instruction not to answer, task-completion conclusion, or "
+    "single-tool inventory was request-local and is not a durable operational "
+    "claim. For this ordinary turn, follow current instructions and use only the "
+    "tools actually advertised here, subject to their real availability, approval, "
+    "and safety checks. Do not infer that any tool is enabled, healthy, authorized, "
+    "or unavailable from maintenance alone. If a maintenance-authored continuity "
+    "note claims a tool-access blocker and a harmless relevant advertised tool is "
+    "available, verify that claim with that tool before relying on it."
 )
-
-
-def native_incremental_resume_instructions(
-    instructions: str, source_messages: List[Dict[str, Any]]
-) -> str:
-    """Scope maintenance instructions without rewriting checkpoint/history."""
-    handoffs = validate_persisted_native_compaction_history(source_messages)
-    if not any(text.startswith("NATIVE_INCREMENTAL_NOTE\n") for text in handoffs.values()):
+NATIVE_INCREMENTAL_COMPACTION_INSTRUCTIONS = (
+    "\n\nThis is one request-local context-maintenance operation. The empty tool "
+    "inventory is intentional only for this request; do not infer any ordinary "
+    "tool failure, denial, or durable task blocker. Do not claim the user task is "
+    "complete or operationally failed. Any assistant or reasoning output produced "
+    "after the checkpoint is maintenance artifact, not verified task history; the "
+    "next normal request will use its own advertised tools and current instructions."
+)
+def native_incremental_ordinary_instructions(instructions: str) -> str:
+    """Add the fixed ordinary-route boundary without reading mutable history."""
+    if instructions.endswith(NATIVE_INCREMENTAL_ORDINARY_INSTRUCTIONS):
         return instructions
-    if instructions.endswith(NATIVE_INCREMENTAL_RESUME_INSTRUCTIONS):
-        return instructions
-    return instructions + "\n\n" + NATIVE_INCREMENTAL_RESUME_INSTRUCTIONS
+    return instructions + "\n\n" + NATIVE_INCREMENTAL_ORDINARY_INSTRUCTIONS
 
 
 def native_incremental_continuity_capable(
@@ -403,7 +417,7 @@ def _projection_cursor_for_source_cursor(
     return replay_base_count + (source_cursor - source_base_count)
 
 
-def create_native_incremental_note(
+def _build_native_incremental_note(
     *,
     session_id: Any,
     source_messages: List[Dict[str, Any]],
@@ -412,7 +426,7 @@ def create_native_incremental_note(
     next_action: Any,
     blockers: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    """Create bounded agent-authored state for ordinary-work continuity.
+    """Build agent-authored state before the host applies its size boundary.
 
     The exact *prefix* at ``source_cursor`` is authenticated.  Later ordinary
     messages may append without staling the note; the compactor retains every
@@ -449,10 +463,130 @@ def create_native_incremental_note(
         **values,
         "blockers": list(blockers),
     }
-    canonical = json.dumps(note, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    if len(canonical) > NATIVE_INCREMENTAL_NOTE_MAX_CHARS:
-        raise ValueError("native incremental note exceeds bounded size")
     return note
+
+
+def create_native_incremental_note(
+    *,
+    session_id: Any,
+    source_messages: List[Dict[str, Any]],
+    objective: Any,
+    current_plan: Any,
+    next_action: Any,
+    blockers: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Create bounded agent-authored state for ordinary-work continuity."""
+    note = _build_native_incremental_note(
+        session_id=session_id, source_messages=source_messages, objective=objective,
+        current_plan=current_plan, next_action=next_action, blockers=blockers,
+    )
+    if native_incremental_note_serialized_size(note) > NATIVE_INCREMENTAL_NOTE_MAX_SERIALIZED_CHARS:
+        raise ValueError("native incremental note exceeds host serialized size budget")
+    return note
+
+
+def native_incremental_note_serialized_size(note: Dict[str, Any]) -> int:
+    """Measure the exact canonical note envelope that the host persists."""
+    return len(json.dumps(note, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+
+
+def native_incremental_note_budget_breakdown(note: Dict[str, Any]) -> Dict[str, Any]:
+    """Return privacy-safe accounting for one already-built canonical note.
+
+    Values are deliberately not retained.  The correction request needs the
+    exact serialized cost of its rejected draft, but a rejected draft must not
+    become a second durable copy in logs, history, or host state.
+    """
+    if not isinstance(note, dict):
+        raise ValueError("native incremental note budget requires a note object")
+    fields = ("objective", "current_plan", "next_action", "blockers")
+    if any(field not in note for field in fields):
+        raise ValueError("native incremental note budget requires all note fields")
+    serialized_chars = native_incremental_note_serialized_size(note)
+    field_value_chars = {
+        field: len(json.dumps(note[field], ensure_ascii=False, separators=(",", ":")))
+        for field in fields
+    }
+    non_field_value_chars = serialized_chars - sum(field_value_chars.values())
+    return {
+        "serialized_chars": serialized_chars,
+        "budget_chars": NATIVE_INCREMENTAL_NOTE_MAX_SERIALIZED_CHARS,
+        "over_budget_chars": max(0, serialized_chars - NATIVE_INCREMENTAL_NOTE_MAX_SERIALIZED_CHARS),
+        "field_value_budget_chars": NATIVE_INCREMENTAL_NOTE_MAX_SERIALIZED_CHARS - non_field_value_chars,
+        "non_field_value_chars": non_field_value_chars,
+        "field_value_chars": field_value_chars,
+    }
+
+
+def native_incremental_note_construction_guidance(
+    session_id: Any, source_messages: List[Dict[str, Any]],
+) -> Optional[str]:
+    """Measure source-specific field headroom before the first maintenance call.
+
+    The only honest pre-generation guidance is a total field-value allowance:
+    task facts can require space in any field, so host-enforced per-field caps
+    would silently make valid continuity state unrepresentable.
+    """
+    try:
+        probe = _build_native_incremental_note(
+            session_id=session_id, source_messages=source_messages,
+            objective="x", current_plan="x", next_action="x", blockers=[],
+        )
+        breakdown = native_incremental_note_budget_breakdown(probe)
+    except (TypeError, ValueError):
+        return None
+    if (
+        breakdown["serialized_chars"] != sum(breakdown["field_value_chars"].values())
+        + breakdown["non_field_value_chars"]
+        or breakdown["field_value_budget_chars"] != NATIVE_INCREMENTAL_NOTE_MAX_SERIALIZED_CHARS
+        - breakdown["non_field_value_chars"]
+        or breakdown["field_value_budget_chars"] < 0
+    ):
+        return None
+    return (
+        f" For this prepared authenticated source, immutable envelope and field-key overhead measures "
+        f"{breakdown['non_field_value_chars']} serialized characters. All four JSON-serialized field values "
+        f"together therefore have at most {breakdown['field_value_budget_chars']} characters within the "
+        f"{NATIVE_INCREMENTAL_NOTE_MAX_SERIALIZED_CHARS}-character host envelope. This is a combined allowance, "
+        "not per-field caps: retain every required fact and let the host validate the exact final envelope."
+    )
+
+
+def native_incremental_note_budget_correction_guidance(breakdown: Any) -> Optional[str]:
+    """Render fixed-size feedback only; never echo a rejected note's contents."""
+    if not isinstance(breakdown, dict):
+        return None
+    fields = ("objective", "current_plan", "next_action", "blockers")
+    values = breakdown.get("field_value_chars")
+    required = (
+        "serialized_chars", "budget_chars", "over_budget_chars",
+        "field_value_budget_chars", "non_field_value_chars",
+    )
+    if (
+        not isinstance(values, dict)
+        or any(type(breakdown.get(key)) is not int or breakdown[key] < 0 for key in required)
+        or any(type(values.get(field)) is not int or values[field] < 0 for field in fields)
+        or breakdown["budget_chars"] != NATIVE_INCREMENTAL_NOTE_MAX_SERIALIZED_CHARS
+        or breakdown["serialized_chars"] <= breakdown["budget_chars"]
+        or breakdown["over_budget_chars"] != breakdown["serialized_chars"] - breakdown["budget_chars"]
+        or breakdown["serialized_chars"] != sum(values[field] for field in fields)
+        + breakdown["non_field_value_chars"]
+        or breakdown["field_value_budget_chars"] != breakdown["budget_chars"]
+        - breakdown["non_field_value_chars"]
+    ):
+        return None
+    return (
+        f" The immediately preceding draft was rejected before dispatch: its complete canonical envelope "
+        f"measured {breakdown['serialized_chars']} serialized characters, "
+        f"{breakdown['over_budget_chars']} over the {breakdown['budget_chars']} limit. "
+        f"Its field-value costs were objective={values['objective']}, "
+        f"current_plan={values['current_plan']}, next_action={values['next_action']}, "
+        f"blockers={values['blockers']} characters; immutable envelope and field-key overhead was "
+        f"{breakdown['non_field_value_chars']} characters, leaving "
+        f"{breakdown['field_value_budget_chars']} characters for all serialized field values. "
+        "Do not repeat the rejected draft. Build one replacement that removes at least the measured "
+        "overage while preserving every required active fact."
+    )
 
 
 def record_native_incremental_note(
@@ -1125,12 +1259,46 @@ def prepare_native_note_refresh_request(agent: Any, messages: List[Dict[str, Any
     request["tools"] = [{"type": "function", **deepcopy(CONTINUITY_NOTE_SCHEMA)}]
     request["tool_choice"] = {"type": "function", "name": "continuity_note"}
     request["parallel_tool_calls"] = False
+    correction_requested = bool(getattr(agent, "_native_note_refresh_correction_requested", False))
+    source_messages, _replay_base_count = _projection_source_for_messages(agent, messages)
+    construction_guidance = native_incremental_note_construction_guidance(
+        getattr(agent, "session_id", None), source_messages,
+    ) if source_messages is not None else None
+    if construction_guidance is None:
+        raise NativeNoteRefreshFailure(
+            "continuity note construction measurement unavailable",
+            phase="authorization_or_source_validation",
+        )
+    correction_guidance = None
+    if correction_requested:
+        correction_guidance = native_incremental_note_budget_correction_guidance(
+            getattr(agent, "_native_note_refresh_budget_breakdown", None)
+        )
+        if correction_guidance is None:
+            raise NativeNoteRefreshFailure(
+                "continuity note correction measurement unavailable",
+                phase="pre_publication_validation",
+            )
     request["instructions"] = str(request.get("instructions", "")) + (
-        "\nContext maintenance: call continuity_note now with a concise, current "
-        "objective, verified work state, next action, and unresolved blockers. "
-        "Incorporate the latest user corrections; do not copy an obsolete note. "
+        "\nContext maintenance: call continuity_note now with a concise accumulated "
+        "active task: preserve every unfinished objective and its identifying facts "
+        "or constraints. Preserve task identifiers, routes, version strings, and "
+        "other exact-match values verbatim, including spelling and punctuation; do "
+        "not paraphrase them; add new results to verified work state rather than "
+        "replacing that objective. A user instruction that explicitly replaces or "
+        "cancels the goal, completed work, or a genuinely new substantive task "
+        "supersedes prior goals. Record the current plan, next action, and unresolved "
+        "blockers for the resulting active task. "
         "Do not perform other work or answer the user in this maintenance step. "
-        "The ordinary task continues immediately after the note is recorded."
+        "The ordinary task continues immediately after the note is recorded. This "
+        "request deliberately advertises only continuity_note; that temporary "
+        "inventory is not evidence that ordinary tools are unavailable, denied, or "
+        "broken, and must not be recorded as a durable blocker. "
+        f"The complete host-persisted continuity-note envelope has a deterministic budget of "
+        f"{NATIVE_INCREMENTAL_NOTE_MAX_SERIALIZED_CHARS} serialized characters; be concise because "
+        "the immutable host envelope and JSON escaping count toward it."
+        + construction_guidance
+        + (correction_guidance or "")
     )
     return issue_native_note_refresh(agent, messages)
 
@@ -1217,7 +1385,7 @@ def native_incremental_compact_context(
                 getattr(agent, "_cached_system_prompt", None)
                 or system_message
                 or "You are a helpful assistant. Follow the latest user request."
-            ),
+            ) + NATIVE_INCREMENTAL_COMPACTION_INSTRUCTIONS,
             "input": wire,
             "tools": [],
             "store": False,
@@ -1259,11 +1427,25 @@ def native_incremental_compact_context(
                 "handoff": handoff,
                 "tail_count": 0,
                 "tail_fence": "",
+                "maintenance_suffix_count": len(suffix),
+                "maintenance_suffix_fence": native_continuity_boundary_fence(suffix),
             },
         }],
     }
     handoff_row = {"role": NATIVE_COMPACTION_HANDOFF_ROLE, "content": handoff, "_native_compaction_handoff": identity}
-    result = [carrier, handoff_row, *suffix, *tail]
+    # A checkpoint handoff is intentionally a user row so Responses can replay
+    # it after the opaque checkpoint.  When the protected tail also begins with
+    # the latest real user correction, retain that correction verbatim but add
+    # a hidden assistant separator: SessionDB's alternation repair would
+    # otherwise merge it into the authenticated handoff and invalidate restart.
+    role_boundary = []
+    if tail and tail[0].get("role") == "user":
+        role_boundary = [{
+            "role": "assistant",
+            "content": "Host continuity boundary: the following user message is current task context.",
+            "display_kind": "hidden",
+        }]
+    result = [carrier, handoff_row, *suffix, *role_boundary, *tail]
     metadata = carrier["codex_reasoning_items"][0][NATIVE_COMPACTION_METADATA_KEY]
     metadata["tail_count"] = len(result) - 2
     metadata["tail_fence"] = native_continuity_boundary_fence(result[2:])

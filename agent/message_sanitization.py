@@ -291,7 +291,7 @@ __all__ = [
     "_strip_non_ascii", "_sanitize_messages_non_ascii", "_sanitize_tools_non_ascii",
     "_strip_images_from_messages", "_sanitize_structure_non_ascii",
     # call_id policy owners
-    "deterministic_call_id", "coalesce_tool_call_id", "tool_call_id_variants",
+    "deterministic_call_id", "canonical_responses_call_id_from_fc", "coalesce_tool_call_id", "tool_call_id_variants",
     "tool_result_id_variants", "uniquify_tool_call_ids",
     # reasoning_content policy owners
     "reasoning_echo_family", "matches_reasoning_echo_family", "needs_reasoning_echo",
@@ -332,7 +332,18 @@ def deterministic_call_id(fn_name: str, arguments: str, index: int = 0) -> str:
     return f"call_{hashlib.sha256(seed.encode('utf-8', errors='replace')).hexdigest()[:12]}"
 
 
-def _expand_tool_id_variants(values: tuple[Any, ...]) -> frozenset[str]:
+def canonical_responses_call_id_from_fc(response_item_id: Any) -> str:
+    """Map a bare Responses ``fc_…`` item id to its canonical ``call_…`` pairing id.
+
+    Responses stores a function-call item's ``fc_`` id separately from the
+    ``call_`` id used by its output.  Keep this conversion beside all other
+    pairing aliases so validation and wire conversion cannot disagree.
+    """
+    value = response_item_id.strip() if isinstance(response_item_id, str) else ""
+    return f"call_{value[3:]}" if value.startswith("fc_") and len(value) > 3 else ""
+
+
+def _expand_tool_id_variants(values: tuple[Any, ...], *, canonicalize_fc: bool = False) -> frozenset[str]:
     """Every wire spelling of one tool-call identifier: Responses bridges may expose the pairing
     id and response-item id separately or as ``call_id|response_item_id``; all alias ONE call."""
     variants: set[str] = set()
@@ -341,16 +352,52 @@ def _expand_tool_id_variants(values: tuple[Any, ...]) -> frozenset[str]:
         if value:
             variants.add(value)
             variants.update(p for p in (part.strip() for part in value.split("|")) if p)
+    if canonicalize_fc:
+        variants.update(
+            canonical for value in tuple(variants)
+            if (canonical := canonical_responses_call_id_from_fc(value))
+        )
     return frozenset(variants)
 
 
+def _tool_call_uses_fc_fallback(tc: Any) -> bool:
+    """Whether a call has no pairing id and therefore needs a bare ``fc_`` bridge.
+
+    This mirrors the Responses converter's explicit -> embedded -> bare-fc
+    precedence.  An explicit ``call_id`` is authoritative even when its item
+    id happens to have an ``fc_`` suffix that could name another call.
+    """
+    explicit_call_id = _tc_field(tc, "call_id")
+    if isinstance(explicit_call_id, str) and explicit_call_id.strip():
+        return False
+    raw_item_id = _tc_field(tc, "id")
+    if not isinstance(raw_item_id, str) or not raw_item_id.strip():
+        raw_item_id = _tc_field(tc, "response_item_id")
+    value = raw_item_id.strip() if isinstance(raw_item_id, str) else ""
+    if "|" in value:
+        embedded_call_id, response_item_id = value.split("|", 1)
+        return not embedded_call_id.strip() and bool(canonical_responses_call_id_from_fc(response_item_id))
+    return bool(canonical_responses_call_id_from_fc(value))
+
+
 def tool_call_id_variants(tc: Any) -> frozenset[str]:
-    """Return all pairing-id variants carried by a tool-call entry."""
-    return _expand_tool_id_variants(tuple(_tc_field(tc, k) for k in ("call_id", "id", "response_item_id")))
+    """Return all pairing-id variants carried by a tool-call entry.
+
+    Only an otherwise bare Responses ``fc_`` item gets its ``call_`` fallback
+    alias.  Existing explicit and composite pairing ids retain their precedence.
+    """
+    return _expand_tool_id_variants(
+        tuple(_tc_field(tc, k) for k in ("call_id", "id", "response_item_id")),
+        canonicalize_fc=_tool_call_uses_fc_fallback(tc),
+    )
 
 
 def tool_result_id_variants(tool_call_id: Any) -> frozenset[str]:
-    """Return all matching variants for a role=tool ``tool_call_id``."""
+    """Return literal/composite variants for a role=tool ``tool_call_id``.
+
+    A result has no call metadata from which to establish fc fallback; its raw
+    ``fc_`` form remains available to pair with the call's fallback alias.
+    """
     return _expand_tool_id_variants((tool_call_id,))
 
 

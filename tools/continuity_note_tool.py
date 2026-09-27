@@ -29,7 +29,10 @@ CONTINUITY_NOTE_SCHEMA = {
         "single-tool inventory is intentional and request-local: it is not evidence "
         "that ordinary task tools are unavailable or permanently blocked. The complete "
         f"host-persisted note envelope has a deterministic {NATIVE_INCREMENTAL_NOTE_MAX_SERIALIZED_CHARS}-character "
-        "serialized budget, including immutable host fields and JSON escaping; keep all fields concise."
+        "serialized budget, including immutable host fields and JSON escaping; keep all fields concise. "
+        "A maintenance request supplies source-specific combined field headroom before generation; "
+        "ordinary tool schemas stay cache-stable, so ordinary calls receive exact host validation at "
+        "dispatch rather than a mutable per-request field cap."
     ),
     "parameters": {
         "type": "object",

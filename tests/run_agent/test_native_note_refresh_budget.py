@@ -13,6 +13,7 @@ from agent.native_incremental_handoff import (
     create_native_incremental_note,
     native_incremental_note_budget_breakdown,
     native_incremental_note_budget_correction_guidance,
+    native_incremental_note_construction_guidance,
     native_incremental_note_serialized_size,
     record_native_incremental_note_from_tool_call,
     restore_native_incremental_note,
@@ -47,6 +48,7 @@ def test_serialized_note_budget_is_exact_and_includes_escaping_and_unicode():
     )
     assert native_incremental_note_serialized_size(note) == NATIVE_INCREMENTAL_NOTE_MAX_SERIALIZED_CHARS
     assert str(NATIVE_INCREMENTAL_NOTE_MAX_SERIALIZED_CHARS) in CONTINUITY_NOTE_SCHEMA["description"]
+    assert "cache-stable" in CONTINUITY_NOTE_SCHEMA["description"]
     with pytest.raises(ValueError, match="host serialized size budget"):
         create_native_incremental_note(
             session_id="budget-boundary", source_messages=source,
@@ -85,6 +87,56 @@ def test_budget_feedback_accounts_for_fields_without_echoing_rejected_contents()
     assert f"measured {breakdown['serialized_chars']} serialized characters" in guidance
     assert "current_plan=" in guidance
     assert sensitive not in guidance
+
+
+def test_construction_guidance_is_source_specific_combined_headroom_without_caps():
+    source = [{"role": "user", "content": "preserve escaped and Unicode state"}]
+    # source = [{"role": "user", "content": "preserve quoted \\" Unicode 界 identifiers"}]
+    guidance = native_incremental_note_construction_guidance("budget-guidance", source)
+    probe = create_native_incremental_note(
+        session_id="budget-guidance", source_messages=source,
+        objective="x", current_plan="x", next_action="x", blockers=[],
+    )
+    breakdown = native_incremental_note_budget_breakdown(probe)
+    assert guidance is not None
+    assert str(breakdown["non_field_value_chars"]) in guidance
+    assert str(breakdown["field_value_budget_chars"]) in guidance
+    assert "not per-field caps" in guidance
+
+
+@pytest.mark.parametrize("tamper", [
+    lambda value: {**value, "non_field_value_chars": value["non_field_value_chars"] + 1},
+    lambda value: {**value, "field_value_budget_chars": value["field_value_budget_chars"] - 1},
+    lambda value: {
+        **value,
+        "field_value_chars": {
+            **value["field_value_chars"],
+            "objective": value["field_value_chars"]["objective"] + 1,
+        },
+    },
+])
+def test_budget_feedback_rejects_tampered_arithmetic(tamper):
+    source = [{"role": "user", "content": "preserve current task"}]
+    args = _exact_budget_args("tampered-budget", source)
+    candidate = {
+        "version": 1,
+        "session_id": "tampered-budget",
+        "source_cursor": len(source),
+        "source_prefix_fence": create_native_incremental_note(
+            session_id="tampered-budget", source_messages=source,
+            objective="baseline objective", current_plan="baseline plan",
+            next_action="baseline next action", blockers=[],
+        )["source_prefix_fence"],
+        "claim_kind": "agent_authored",
+        "instruction_precedence": (
+            "Current and later user instructions supersede this historical "
+            "agent-authored continuity note."
+        ),
+        **{**args, "current_plan": args["current_plan"] + "x"},
+    }
+    assert native_incremental_note_budget_correction_guidance(
+        tamper(native_incremental_note_budget_breakdown(candidate))
+    ) is None
 
 
 @pytest.mark.parametrize(("reason", "phase"), [
@@ -173,6 +225,8 @@ def test_oversized_note_gets_one_fresh_corrective_request_then_real_tools_resume
         if len(calls) == 1:
             assert [tool["name"] for tool in request["tools"]] == ["continuity_note"]
             assert str(NATIVE_INCREMENTAL_NOTE_MAX_SERIALIZED_CHARS) in request["instructions"]
+            assert "prepared authenticated source" in request["instructions"]
+            assert "not per-field caps" in request["instructions"]
             return reply(NS(
                 type="function_call", id="oversized", call_id="oversized-note",
                 name="continuity_note", arguments=json.dumps(oversized),

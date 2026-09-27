@@ -518,6 +518,40 @@ def native_incremental_note_budget_breakdown(note: Dict[str, Any]) -> Dict[str, 
     }
 
 
+def native_incremental_note_construction_guidance(
+    session_id: Any, source_messages: List[Dict[str, Any]],
+) -> Optional[str]:
+    """Measure source-specific field headroom before the first maintenance call.
+
+    The only honest pre-generation guidance is a total field-value allowance:
+    task facts can require space in any field, so host-enforced per-field caps
+    would silently make valid continuity state unrepresentable.
+    """
+    try:
+        probe = _build_native_incremental_note(
+            session_id=session_id, source_messages=source_messages,
+            objective="x", current_plan="x", next_action="x", blockers=[],
+        )
+        breakdown = native_incremental_note_budget_breakdown(probe)
+    except (TypeError, ValueError):
+        return None
+    if (
+        breakdown["serialized_chars"] != sum(breakdown["field_value_chars"].values())
+        + breakdown["non_field_value_chars"]
+        or breakdown["field_value_budget_chars"] != NATIVE_INCREMENTAL_NOTE_MAX_SERIALIZED_CHARS
+        - breakdown["non_field_value_chars"]
+        or breakdown["field_value_budget_chars"] < 0
+    ):
+        return None
+    return (
+        f" For this prepared authenticated source, immutable envelope and field-key overhead measures "
+        f"{breakdown['non_field_value_chars']} serialized characters. All four JSON-serialized field values "
+        f"together therefore have at most {breakdown['field_value_budget_chars']} characters within the "
+        f"{NATIVE_INCREMENTAL_NOTE_MAX_SERIALIZED_CHARS}-character host envelope. This is a combined allowance, "
+        "not per-field caps: retain every required fact and let the host validate the exact final envelope."
+    )
+
+
 def native_incremental_note_budget_correction_guidance(breakdown: Any) -> Optional[str]:
     """Render fixed-size feedback only; never echo a rejected note's contents."""
     if not isinstance(breakdown, dict):
@@ -535,6 +569,10 @@ def native_incremental_note_budget_correction_guidance(breakdown: Any) -> Option
         or breakdown["budget_chars"] != NATIVE_INCREMENTAL_NOTE_MAX_SERIALIZED_CHARS
         or breakdown["serialized_chars"] <= breakdown["budget_chars"]
         or breakdown["over_budget_chars"] != breakdown["serialized_chars"] - breakdown["budget_chars"]
+        or breakdown["serialized_chars"] != sum(values[field] for field in fields)
+        + breakdown["non_field_value_chars"]
+        or breakdown["field_value_budget_chars"] != breakdown["budget_chars"]
+        - breakdown["non_field_value_chars"]
     ):
         return None
     return (
@@ -1222,6 +1260,15 @@ def prepare_native_note_refresh_request(agent: Any, messages: List[Dict[str, Any
     request["tool_choice"] = {"type": "function", "name": "continuity_note"}
     request["parallel_tool_calls"] = False
     correction_requested = bool(getattr(agent, "_native_note_refresh_correction_requested", False))
+    source_messages, _replay_base_count = _projection_source_for_messages(agent, messages)
+    construction_guidance = native_incremental_note_construction_guidance(
+        getattr(agent, "session_id", None), source_messages,
+    ) if source_messages is not None else None
+    if construction_guidance is None:
+        raise NativeNoteRefreshFailure(
+            "continuity note construction measurement unavailable",
+            phase="authorization_or_source_validation",
+        )
     correction_guidance = None
     if correction_requested:
         correction_guidance = native_incremental_note_budget_correction_guidance(
@@ -1250,6 +1297,7 @@ def prepare_native_note_refresh_request(agent: Any, messages: List[Dict[str, Any
         f"The complete host-persisted continuity-note envelope has a deterministic budget of "
         f"{NATIVE_INCREMENTAL_NOTE_MAX_SERIALIZED_CHARS} serialized characters; be concise because "
         "the immutable host envelope and JSON escaping count toward it."
+        + construction_guidance
         + (correction_guidance or "")
     )
     return issue_native_note_refresh(agent, messages)

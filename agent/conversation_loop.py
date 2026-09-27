@@ -1467,8 +1467,14 @@ def _run_api_retry_loop(agent, s: _LoopState) -> Optional[Dict[str, Any]]:
                 return None
         except NativeNoteRefreshFailure as maintenance_error:
             if maintenance_error.correctable and s.native_note_refresh_correction_attempts < 1:
+                if not isinstance(maintenance_error.budget_breakdown, dict):
+                    return _maintenance_failure(NativeNoteRefreshFailure(
+                        "continuity note correction measurement unavailable",
+                        phase="pre_publication_validation",
+                    ))
                 s.native_note_refresh_correction_attempts += 1
                 agent._native_note_refresh_correction_requested = True
+                agent._native_note_refresh_budget_breakdown = maintenance_error.budget_breakdown
                 # The correction is a fresh host-authorized maintenance request,
                 # not a retry of the consumed capability or ordinary work.
                 agent._native_note_refresh_request_guard = None
@@ -1578,6 +1584,7 @@ def run_conversation(
     agent._auth_pool_refresh_counts = {}
     agent._last_turn_usage = None
     agent._native_note_refresh_correction_requested = False
+    agent._native_note_refresh_budget_breakdown = None
 
     s = _LoopState(
         system_message=system_message, moa_config=moa_config,

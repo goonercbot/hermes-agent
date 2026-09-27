@@ -11,6 +11,8 @@ import pytest
 from agent.native_incremental_handoff import (
     NATIVE_INCREMENTAL_NOTE_MAX_SERIALIZED_CHARS,
     create_native_incremental_note,
+    native_incremental_note_budget_breakdown,
+    native_incremental_note_budget_correction_guidance,
     native_incremental_note_serialized_size,
     record_native_incremental_note_from_tool_call,
     restore_native_incremental_note,
@@ -50,6 +52,39 @@ def test_serialized_note_budget_is_exact_and_includes_escaping_and_unicode():
             session_id="budget-boundary", source_messages=source,
             **{**args, "current_plan": args["current_plan"] + "x"},
         )
+
+
+def test_budget_feedback_accounts_for_fields_without_echoing_rejected_contents():
+    source = [{"role": "user", "content": "preserve current task"}]
+    args = _exact_budget_args("budget-feedback", source)
+    sensitive = "SENSITIVE_IDENTIFIER_NOT_FOR_CORRECTION_PROMPT"
+    oversized = {**args, "current_plan": args["current_plan"] + sensitive}
+    baseline = create_native_incremental_note(
+        session_id="budget-feedback", source_messages=source,
+        objective="baseline objective", current_plan="baseline plan",
+        next_action="baseline next action", blockers=[],
+    )
+    candidate = {
+        "version": 1,
+        "session_id": "budget-feedback",
+        "source_cursor": len(source),
+        "source_prefix_fence": baseline["source_prefix_fence"],
+        "claim_kind": "agent_authored",
+        "instruction_precedence": (
+            "Current and later user instructions supersede this historical "
+            "agent-authored continuity note."
+        ),
+        **oversized,
+    }
+    breakdown = native_incremental_note_budget_breakdown(candidate)
+    guidance = native_incremental_note_budget_correction_guidance(breakdown)
+    assert breakdown["serialized_chars"] == native_incremental_note_serialized_size(candidate)
+    assert breakdown["over_budget_chars"] == len(sensitive)
+    assert sum(breakdown["field_value_chars"].values()) + breakdown["non_field_value_chars"] == breakdown["serialized_chars"]
+    assert guidance is not None
+    assert f"measured {breakdown['serialized_chars']} serialized characters" in guidance
+    assert "current_plan=" in guidance
+    assert sensitive not in guidance
 
 
 @pytest.mark.parametrize(("reason", "phase"), [
@@ -125,7 +160,12 @@ def test_oversized_note_gets_one_fresh_corrective_request_then_real_tools_resume
     ordinary_tools = deepcopy(agent.tools)
     calls = []
     capabilities = []
-    oversized = _oversized_args(sid, source)
+    rejected_marker = "REJECTED_IDENTIFIER_MUST_NOT_BE_ECHOED"
+    oversized_base = _oversized_args(sid, source)
+    oversized = {
+        **oversized_base,
+        "current_plan": oversized_base["current_plan"] + rejected_marker,
+    }
 
     def provider(request):
         calls.append(deepcopy(request))
@@ -139,7 +179,9 @@ def test_oversized_note_gets_one_fresh_corrective_request_then_real_tools_resume
             ))
         if len(calls) == 2:
             assert [tool["name"] for tool in request["tools"]] == ["continuity_note"]
-            assert "prior valid continuity_note exceeded the host serialized-note budget" in request["instructions"]
+            assert "rejected before dispatch: its complete canonical envelope measured" in request["instructions"]
+            assert "field-value costs were objective=" in request["instructions"]
+            assert rejected_marker not in request["instructions"]
             assert agent._current_api_request_id.endswith(":api:2")
             return reply(NS(
                 type="function_call", id="corrected", call_id="corrected-note",
@@ -233,6 +275,30 @@ def test_second_oversized_note_fails_closed_without_ordinary_work(stale_agent):
     result = agent.run_conversation("Continue with the active task.", conversation_history=source)
     assert result["failed"] is True
     assert result["error"] == "native_note_refresh_failed"
+    assert result["maintenance_failure"] == "continuity note correction did not reduce host serialized size"
+    assert result["maintenance_phase"] == "pre_publication_validation"
+    assert len(calls) == 2
+    stored = db.get_messages_as_conversation(sid, repair_alternation=False)
+    assert "oversized-" not in json.dumps(stored)
+
+
+def test_smaller_but_still_oversized_correction_reports_safe_exhaustion(stale_agent):
+    agent, db, sid, source, _tmp_path = stale_agent
+    smaller = _oversized_args(sid, source)
+    larger = {**smaller, "current_plan": smaller["current_plan"] + "x" * 100}
+    calls = []
+
+    def provider(request):
+        calls.append(deepcopy(request))
+        args = larger if len(calls) == 1 else smaller
+        return reply(NS(
+            type="function_call", id=f"oversized-{len(calls)}", call_id=f"oversized-{len(calls)}",
+            name="continuity_note", arguments=json.dumps(args),
+        ))
+
+    agent._interruptible_api_call = provider
+    result = agent.run_conversation("Continue with the active task.", conversation_history=source)
+    assert result["failed"] is True
     assert result["maintenance_failure"] == "continuity note remains over host serialized size budget after correction"
     assert result["maintenance_phase"] == "pre_publication_validation"
     assert len(calls) == 2

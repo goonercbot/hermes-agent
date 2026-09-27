@@ -6,6 +6,7 @@ import weakref
 
 from agent.native_compaction import validate_persisted_native_compaction_history
 from agent.native_incremental_handoff import (
+    _build_native_incremental_note,
     bind_native_incremental_replay_projection,
     canonical_native_incremental_source_messages,
     _continuity_note_arguments,
@@ -14,6 +15,7 @@ from agent.native_incremental_handoff import (
     _projection_source_for_messages,
     _staged_note,
     create_native_incremental_note,
+    native_incremental_note_budget_breakdown,
     log_native_note_transition,
     record_native_incremental_note,
     record_native_incremental_note_from_tool_call,
@@ -59,10 +61,13 @@ def _native_note_failure_phase(reason: str) -> str:
 class NativeNoteRefreshFailure(RuntimeError):
     """Local maintenance failure; never a provider retry/fallback signal."""
 
-    def __init__(self, reason, *, phase=None, correctable=False):
+    def __init__(self, reason, *, phase=None, correctable=False, budget_breakdown=None):
         self.reason = reason
         self.phase = _native_note_failure_phase(reason) if phase is None else phase
         self.correctable = bool(correctable)
+        # Numbers only: rejected note contents must never be copied into
+        # durable history or diagnostics just to inform one fresh correction.
+        self.budget_breakdown = budget_breakdown
         super().__init__(f"Continuity-note refresh failed: {reason}")
 
 
@@ -336,9 +341,26 @@ def execute_native_note_refresh(agent, capability, response, messages, effective
             )
         except ValueError as exc:
             if str(exc) == "native incremental note exceeds host serialized size budget":
+                candidate = _build_native_incremental_note(
+                    session_id=agent.session_id, source_messages=source, **arguments,
+                )
+                breakdown = native_incremental_note_budget_breakdown(candidate)
+                previous = getattr(agent, "_native_note_refresh_budget_breakdown", None)
+                previous_size = previous.get("serialized_chars") if isinstance(previous, dict) else None
+                previously_measured = type(previous_size) is int and previous_size > 0
+                if (
+                    getattr(agent, "_native_note_refresh_correction_requested", False)
+                    and previously_measured
+                    and breakdown["serialized_chars"] >= previous_size
+                ):
+                    raise NativeNoteRefreshFailure(
+                        "continuity note correction did not reduce host serialized size",
+                        phase="pre_publication_validation", budget_breakdown=breakdown,
+                    ) from exc
                 raise NativeNoteRefreshFailure(
                     "continuity note exceeds host serialized size budget",
                     phase="pre_publication_validation", correctable=True,
+                    budget_breakdown=breakdown,
                 ) from exc
             raise
         phase = "middleware_dispatch"
@@ -444,6 +466,7 @@ def execute_native_note_refresh(agent, capability, response, messages, effective
             note=expected, flush_accepted=True, dispatched=dispatch_accepted,
         )
         agent._native_note_refresh_correction_requested = False
+        agent._native_note_refresh_budget_breakdown = None
         return SimpleNamespace(
             output=[deepcopy(call)], status="completed",
             usage=_item_value(response, "usage"), model=_item_value(response, "model"),

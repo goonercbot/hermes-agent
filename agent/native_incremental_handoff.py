@@ -417,7 +417,7 @@ def _projection_cursor_for_source_cursor(
     return replay_base_count + (source_cursor - source_base_count)
 
 
-def create_native_incremental_note(
+def _build_native_incremental_note(
     *,
     session_id: Any,
     source_messages: List[Dict[str, Any]],
@@ -426,7 +426,7 @@ def create_native_incremental_note(
     next_action: Any,
     blockers: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    """Create bounded agent-authored state for ordinary-work continuity.
+    """Build agent-authored state before the host applies its size boundary.
 
     The exact *prefix* at ``source_cursor`` is authenticated.  Later ordinary
     messages may append without staling the note; the compactor retains every
@@ -463,6 +463,23 @@ def create_native_incremental_note(
         **values,
         "blockers": list(blockers),
     }
+    return note
+
+
+def create_native_incremental_note(
+    *,
+    session_id: Any,
+    source_messages: List[Dict[str, Any]],
+    objective: Any,
+    current_plan: Any,
+    next_action: Any,
+    blockers: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Create bounded agent-authored state for ordinary-work continuity."""
+    note = _build_native_incremental_note(
+        session_id=session_id, source_messages=source_messages, objective=objective,
+        current_plan=current_plan, next_action=next_action, blockers=blockers,
+    )
     if native_incremental_note_serialized_size(note) > NATIVE_INCREMENTAL_NOTE_MAX_SERIALIZED_CHARS:
         raise ValueError("native incremental note exceeds host serialized size budget")
     return note
@@ -471,6 +488,67 @@ def create_native_incremental_note(
 def native_incremental_note_serialized_size(note: Dict[str, Any]) -> int:
     """Measure the exact canonical note envelope that the host persists."""
     return len(json.dumps(note, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+
+
+def native_incremental_note_budget_breakdown(note: Dict[str, Any]) -> Dict[str, Any]:
+    """Return privacy-safe accounting for one already-built canonical note.
+
+    Values are deliberately not retained.  The correction request needs the
+    exact serialized cost of its rejected draft, but a rejected draft must not
+    become a second durable copy in logs, history, or host state.
+    """
+    if not isinstance(note, dict):
+        raise ValueError("native incremental note budget requires a note object")
+    fields = ("objective", "current_plan", "next_action", "blockers")
+    if any(field not in note for field in fields):
+        raise ValueError("native incremental note budget requires all note fields")
+    serialized_chars = native_incremental_note_serialized_size(note)
+    field_value_chars = {
+        field: len(json.dumps(note[field], ensure_ascii=False, separators=(",", ":")))
+        for field in fields
+    }
+    non_field_value_chars = serialized_chars - sum(field_value_chars.values())
+    return {
+        "serialized_chars": serialized_chars,
+        "budget_chars": NATIVE_INCREMENTAL_NOTE_MAX_SERIALIZED_CHARS,
+        "over_budget_chars": max(0, serialized_chars - NATIVE_INCREMENTAL_NOTE_MAX_SERIALIZED_CHARS),
+        "field_value_budget_chars": NATIVE_INCREMENTAL_NOTE_MAX_SERIALIZED_CHARS - non_field_value_chars,
+        "non_field_value_chars": non_field_value_chars,
+        "field_value_chars": field_value_chars,
+    }
+
+
+def native_incremental_note_budget_correction_guidance(breakdown: Any) -> Optional[str]:
+    """Render fixed-size feedback only; never echo a rejected note's contents."""
+    if not isinstance(breakdown, dict):
+        return None
+    fields = ("objective", "current_plan", "next_action", "blockers")
+    values = breakdown.get("field_value_chars")
+    required = (
+        "serialized_chars", "budget_chars", "over_budget_chars",
+        "field_value_budget_chars", "non_field_value_chars",
+    )
+    if (
+        not isinstance(values, dict)
+        or any(type(breakdown.get(key)) is not int or breakdown[key] < 0 for key in required)
+        or any(type(values.get(field)) is not int or values[field] < 0 for field in fields)
+        or breakdown["budget_chars"] != NATIVE_INCREMENTAL_NOTE_MAX_SERIALIZED_CHARS
+        or breakdown["serialized_chars"] <= breakdown["budget_chars"]
+        or breakdown["over_budget_chars"] != breakdown["serialized_chars"] - breakdown["budget_chars"]
+    ):
+        return None
+    return (
+        f" The immediately preceding draft was rejected before dispatch: its complete canonical envelope "
+        f"measured {breakdown['serialized_chars']} serialized characters, "
+        f"{breakdown['over_budget_chars']} over the {breakdown['budget_chars']} limit. "
+        f"Its field-value costs were objective={values['objective']}, "
+        f"current_plan={values['current_plan']}, next_action={values['next_action']}, "
+        f"blockers={values['blockers']} characters; immutable envelope and field-key overhead was "
+        f"{breakdown['non_field_value_chars']} characters, leaving "
+        f"{breakdown['field_value_budget_chars']} characters for all serialized field values. "
+        "Do not repeat the rejected draft. Build one replacement that removes at least the measured "
+        "overage while preserving every required active fact."
+    )
 
 
 def record_native_incremental_note(
@@ -1144,13 +1222,16 @@ def prepare_native_note_refresh_request(agent: Any, messages: List[Dict[str, Any
     request["tool_choice"] = {"type": "function", "name": "continuity_note"}
     request["parallel_tool_calls"] = False
     correction_requested = bool(getattr(agent, "_native_note_refresh_correction_requested", False))
-    correction_guidance = (
-        " The prior valid continuity_note exceeded the host serialized-note budget. "
-        f"Submit one corrected concise note that preserves all active facts and fits the complete "
-        f"host envelope within {NATIVE_INCREMENTAL_NOTE_MAX_SERIALIZED_CHARS} serialized characters; "
-        "JSON escaping counts and non-ASCII text is serialized without ASCII escaping."
-        if correction_requested else ""
-    )
+    correction_guidance = None
+    if correction_requested:
+        correction_guidance = native_incremental_note_budget_correction_guidance(
+            getattr(agent, "_native_note_refresh_budget_breakdown", None)
+        )
+        if correction_guidance is None:
+            raise NativeNoteRefreshFailure(
+                "continuity note correction measurement unavailable",
+                phase="pre_publication_validation",
+            )
     request["instructions"] = str(request.get("instructions", "")) + (
         "\nContext maintenance: call continuity_note now with a concise accumulated "
         "active task: preserve every unfinished objective and its identifying facts "
@@ -1169,7 +1250,7 @@ def prepare_native_note_refresh_request(agent: Any, messages: List[Dict[str, Any
         f"The complete host-persisted continuity-note envelope has a deterministic budget of "
         f"{NATIVE_INCREMENTAL_NOTE_MAX_SERIALIZED_CHARS} serialized characters; be concise because "
         "the immutable host envelope and JSON escaping count toward it."
-        + correction_guidance
+        + (correction_guidance or "")
     )
     return issue_native_note_refresh(agent, messages)
 

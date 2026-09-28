@@ -274,6 +274,12 @@ class GatewayNotificationsMixin:
                 "dropping injection (#55578 fail-closed).", pinned_session_id,
             )
             return None
+        if str(pinned_row.get("source") or "").strip().lower() == "subagent":
+            logger.warning(
+                "Async-delegation completion targets delegate child %s; dropping injection.",
+                pinned_session_id,
+            )
+            return None
         target_session_id = pinned_session_id
         follows_compression = False
         if pinned_row.get("ended_at"):
@@ -286,12 +292,13 @@ class GatewayNotificationsMixin:
                 )
                 return None
             if _end_reason != "compression":
-                # Idle/timeout end (scale-to-zero norm): the chat route is still valid, so deliver to its
-                # current session rather than drop (the row would be acked then silently lost).
+                # Same-session idle recovery remains supported; a foreign idle
+                # session cannot authorize a route takeover.
+                if pinned_session_id != session_entry.session_id:
+                    return None
                 logger.info(
-                    "Async-delegation completion pinned to %s-ended session %s; "
-                    "retargeting to the chat's current session %s.",
-                    _end_reason or "idle", pinned_session_id, session_entry.session_id,
+                    "Async-delegation completion resumes its %s-ended owning session %s.",
+                    _end_reason or "idle", pinned_session_id,
                 )
                 return session_entry
             follows_compression = True
@@ -302,6 +309,12 @@ class GatewayNotificationsMixin:
                 return None
         if target_session_id == session_entry.session_id:
             return session_entry
+        if not follows_compression:
+            logger.warning(
+                "Async-delegation completion targets live session %s but route %s owns %s; dropping injection.",
+                target_session_id, session_entry.session_key, session_entry.session_id,
+            )
+            return None
         prior_session_id = session_entry.session_id
         if not self._is_session_run_current(session_entry.session_key, run_generation):
             logger.warning(
@@ -956,12 +969,12 @@ class GatewayNotificationsMixin:
                 data = json.loads(path.read_text(encoding="utf-8"))
                 delivered = {tuple(target) for target in data.get("delivered_targets", [])}
                 # Owed targets come from config, not live transports: a removed home or an opt-out
-                # (gateway_restart_notification=false) must not keep the marker alive forever.
+                # must not keep the marker alive forever.
                 owed = {
                     _served_notice_target_key(
                         profile, platform.value, cfg.home_channel.chat_id, cfg.home_channel.thread_id)
                     for profile, platform, cfg in self._served_home_channel_configs()
-                    if cfg.home_channel and cfg.home_channel.chat_id and cfg.gateway_restart_notification
+                    if cfg.home_channel and cfg.home_channel.chat_id and cfg.home_channel_startup_notification
                 }
                 delivered |= await self._send_home_channel_startup_notifications(skip_targets=delivered)
                 if owed <= delivered:
@@ -997,9 +1010,9 @@ class GatewayNotificationsMixin:
             if _served_notice_target_key(profile, platform.value, home.chat_id, home.thread_id) in skipped
         }
         for profile, platform, platform_cfg, home, transport in targets:
-            if not platform_cfg.gateway_restart_notification:
+            if not platform_cfg.home_channel_startup_notification:
                 logger.info(
-                    "Home-channel startup notification suppressed: %s has gateway_restart_notification=false",
+                    "Home-channel startup notification suppressed: %s has home_channel_startup_notification=false",
                     platform.value,
                 )
                 continue

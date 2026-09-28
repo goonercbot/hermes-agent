@@ -949,6 +949,7 @@ class TurnRunner:
                             (lambda: ctx.progress_queue.put(("__reset__",))) if ctx.progress_queue is not None else None
                         ),
                         on_before_finalize=pause_typing_before_finalize,
+                        on_commentary_sent=self._track_commentary_cleanup,
                         initial_reply_to_id=ctx.event_message_id, run_still_current=ctx._run_still_current,
                     )
                     ctx.stream_consumer_holder[0] = stream_consumer
@@ -984,9 +985,40 @@ class TurnRunner:
             if stream_consumer is not None:
                 stream_consumer.on_segment_break() if already_streamed else stream_consumer.on_commentary(text)
             elif not already_streamed and ctx._status_adapter and str(text or "").strip():
-                self._send_status_text(text, ctx._status_thread_metadata, "interim_assistant_callback scheduling error")
+                future = self._schedule(
+                    ctx._status_adapter.send(ctx._status_chat_id, text, metadata=ctx._status_thread_metadata),
+                    "interim_assistant_callback scheduling error",
+                )
+                if future is not None and ctx._cleanup_progress:
+                    ctx._direct_commentary_futures.append(future)
+
+                    def _track_direct_commentary(done) -> None:
+                        with suppress(Exception):
+                            self._track_commentary_cleanup(done.result(), text)
+
+                    future.add_done_callback(_track_direct_commentary)
 
         return stream_consumer, stream_delta_cb, interim_assistant_cb, want_interim_messages
+
+    def _track_commentary_cleanup(self, result, text: str) -> None:
+        """Track successfully delivered commentary for post-final cleanup only."""
+        ctx = self._ctx
+        if not ctx._cleanup_progress or not getattr(result, "success", False):
+            return
+        candidate_ids = [getattr(result, "message_id", None)]
+        candidate_ids.extend(getattr(result, "continuation_message_ids", None) or ())
+        raw_response = getattr(result, "raw_response", None)
+        if isinstance(raw_response, dict):
+            candidate_ids.extend(raw_response.get("message_ids") or ())
+        for message_id in candidate_ids:
+            if not message_id:
+                continue
+            message_id = str(message_id)
+            if message_id not in ctx._cleanup_msg_ids:
+                ctx._cleanup_msg_ids.append(message_id)
+            entry = (message_id, str(text or ""))
+            if entry not in ctx._commentary_messages:
+                ctx._commentary_messages.append(entry)
 
     # ── agent resolution (cache reuse vs fresh build) ───────────────────────────────────────
 

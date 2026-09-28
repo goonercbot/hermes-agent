@@ -996,14 +996,33 @@ class SessionDB(
                     self._raise_if_db_replaced()
                     if self._conn is None:  # close() raced this writer
                         self._reopen_after_close_locked(context="write")
-                    self._conn.execute("BEGIN IMMEDIATE")
+                    assert self._conn is not None
+                    conn = self._conn
+                    previous_timeout = int(conn.execute("PRAGMA busy_timeout").fetchone()[0])
+                    conn.execute("PRAGMA busy_timeout=0")
                     try:
-                        fn_started = True
-                        result = fn(self._conn)
-                        self._conn.commit()
+                        conn.execute("BEGIN IMMEDIATE")
                     except BaseException:
                         try:
-                            self._conn.rollback()
+                            conn.execute(f"PRAGMA busy_timeout={previous_timeout}")
+                        except BaseException:
+                            logger.debug("Could not restore state.db busy_timeout after failed BEGIN", exc_info=True)
+                        raise
+                    try:
+                        conn.execute(f"PRAGMA busy_timeout={previous_timeout}")
+                    except BaseException:
+                        try:
+                            conn.rollback()
+                        except BaseException:
+                            logger.debug("Could not roll back state.db after busy_timeout restore failure", exc_info=True)
+                        raise
+                    try:
+                        fn_started = True
+                        result = fn(conn)
+                        conn.commit()
+                    except BaseException:
+                        try:
+                            conn.rollback()
                         except Exception:
                             pass
                         raise
@@ -1557,7 +1576,7 @@ class SessionDB(
     _TOKEN_DELTA_COST_FIELDS = ("estimated_cost_usd", "actual_cost_usd")
     _TOKEN_DELTA_ROUTE_FIELDS = (
         "model", "cost_status", "cost_source", "pricing_version", "billing_provider", "billing_base_url",
-        "billing_mode", "source",
+        "billing_mode", "source", "execution_role", "task_id", "occurred_at",
     )
 
     MAX_TITLE_LENGTH = 100

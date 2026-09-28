@@ -1652,6 +1652,11 @@ class SendResult:
     # SEND_ERROR_KINDS member (failures only) via :func:`classify_send_error`, so consumers
     # branch without substring-matching ``error``.
     error_kind: Optional[str] = None
+    # ``success`` only says that an operation succeeded. This is true only when
+    # that operation put the caller's complete requested text on screen; a
+    # truncated formatting fallback, a partial split, or a successful attachment
+    # must not promote it.
+    full_payload_delivered: bool = False
 
 
 # Longest server ``retry_after`` ``_send_with_retry`` will sleep inline. Longer penalties return the
@@ -1942,6 +1947,10 @@ class BasePlatformAdapter(ABC):
         # Post-delivery one-shots per session_key: bare callback (legacy) or ``(generation,
         # callback)`` so a stale run can't clear a fresher run's callback.
         self._post_delivery_callbacks: Dict[str, Any] = {}
+        # The one turn-local fact that progress-bubble cleanup needs.  It is set before
+        # callbacks fire and keyed by generation so an older task cannot settle a newer
+        # turn's temporary commentary.
+        self._confirmed_final_deliveries: Dict[tuple[str, int | None], bool] = {}
         self._expected_cancelled_tasks: set[asyncio.Task] = set()
         self._busy_session_handler: Optional[Callable[[MessageEvent, str], Awaitable[bool]]] = None
         # Owning multiplex profile (None on primary); see _session_key_profile.
@@ -3435,6 +3444,17 @@ class BasePlatformAdapter(ABC):
         self._post_delivery_callbacks.pop(session_key, None)
         return callback if callable(callback) else None
 
+    def _set_confirmed_final_delivery(
+        self, session_key: str, generation: int | None, delivered: bool,
+    ) -> None:
+        self._confirmed_final_deliveries[(session_key, generation)] = delivered
+
+    def _has_confirmed_final_delivery(self, session_key: str, generation: int | None) -> bool:
+        return self._confirmed_final_deliveries.get((session_key, generation), False)
+
+    def _clear_confirmed_final_delivery(self, session_key: str, generation: int | None) -> None:
+        self._confirmed_final_deliveries.pop((session_key, generation), None)
+
     # ── Processing lifecycle hooks (Discord 👀/✅/❌ reactions). Adapters exposing
     # ``_add_reaction(chat_id, message_id, emoji)`` / ``_remove_reaction(chat_id, message_id)``
     # can just set the emoji attributes; left ``None`` the hook is a no-op.
@@ -3575,7 +3595,10 @@ class BasePlatformAdapter(ABC):
             return await self._resume_partial_send(chat_id, previous, reply_to=reply_to, metadata=metadata)
 
         result = await _send(content)
-        if result.success or self._send_retry_is_final(result):
+        if result.success:
+            result.full_payload_delivered = True
+            return result
+        if self._send_retry_is_final(result):
             return result
         error_str = result.error or ""
         # A rate-limited / flood-capped send is transient: it should back off
@@ -3595,6 +3618,7 @@ class BasePlatformAdapter(ABC):
         if not is_network and self._is_timeout_error(error_str):
             return result
         if is_network:
+            previous_was_partial = self._is_partial_delivery(result)
             # A server-requested retry_after (Telegram FloodWait) overrides backoff, once per send.
             server_retry_after = result.retry_after
             for attempt in range(1, max_retries + 1):
@@ -3624,6 +3648,10 @@ class BasePlatformAdapter(ABC):
                     return result
                 result = resumed
                 if result.success:
+                    # A resumed split has a platform-specific visible head plus a
+                    # remainder. Keep final-cleanup proof conservative unless a
+                    # future resume owner can attest to the combined payload.
+                    result.full_payload_delivered = not previous_was_partial
                     logger.info("[%s] Send succeeded on retry %d", self.name, attempt)
                     return result
                 error_str = result.error or ""
@@ -3706,11 +3734,16 @@ class BasePlatformAdapter(ABC):
             self, chat_id: str, content: str, *, reply_to: Optional[str], metadata: Any) -> "SendResult":
         """Last-resort send after a non-transient failure; platforms whose markup is not the
         likely culprit override it (Photon drops rich links instead of adding the banner)."""
-        return await self.send(
+        result = await self.send(
             chat_id=chat_id, content=self.warning_text(
                 f"(Response formatting failed, plain text:)\n\n{content[:3500]}", content[:3500],
                 chat_id=chat_id, metadata=metadata),
             reply_to=reply_to, metadata=metadata)
+        # The default fallback deliberately caps long text. Its send can succeed
+        # without delivering the caller's complete final, so only a short body is
+        # eligible to settle temporary commentary.
+        result.full_payload_delivered = bool(result.success and len(content) <= 3500)
+        return result
 
     @staticmethod
     def _merge_caption(existing_text: Optional[str], new_text: str) -> str:
@@ -4284,7 +4317,7 @@ class BasePlatformAdapter(ABC):
 
     async def _send_final_text(
         self, event: MessageEvent, session_key: str, text_content: str, metadata: Dict[str, Any],
-        is_ephemeral_response: bool, ephemeral_ttl: int, record_delivery: Callable) -> None:
+        is_ephemeral_response: bool, ephemeral_ttl: int, record_delivery: Callable) -> SendResult:
         """Normal-lane final: the ledger bracket plus the message-id owner's ephemeral delete."""
         result, delivery_adapter = await self.send_final_ledgered(
             event, session_key, text_content, metadata,
@@ -4292,6 +4325,7 @@ class BasePlatformAdapter(ABC):
         record_delivery(result)
         if ephemeral_ttl and ephemeral_ttl > 0 and result.success and result.message_id:
             delivery_adapter._schedule_ephemeral_delete(event.source.chat_id, result.message_id, ephemeral_ttl)
+        return result
 
     async def _notify_turn_error(self, event: MessageEvent, e: BaseException) -> Optional[dict]:
         """Tell the user a turn failed rather than leaving radio silence (last resort:
@@ -4438,6 +4472,12 @@ class BasePlatformAdapter(ABC):
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
         """Background task that actually processes the message."""
         delivery_attempted = delivery_succeeded = False  # feeds the processing-complete hook
+        final_delivery_confirmed = False
+        # Events can be retried or reused. Legacy streamed markers remain for
+        # /loop and /goal compatibility, but may never authorize destructive
+        # commentary cleanup on a later turn.
+        with contextlib.suppress(TypeError):
+            vars(event).pop("_hermes_complete_final_delivery", None)
 
         def _record_delivery(result):
             nonlocal delivery_attempted, delivery_succeeded
@@ -4453,6 +4493,18 @@ class BasePlatformAdapter(ABC):
             await self._run_processing_hook("on_processing_start", event)
             event._turn_marker_handoff = self.gateway_runner is not None  # it can release the marker
             response = await self._message_handler(event)
+            # This is distinct from legacy ``already_sent`` and
+            # ``_streamed_final_response``. The runner stamps it only after a
+            # producer proved this generation's exact final payload complete.
+            _stream_proof = getattr(event, "_hermes_complete_final_delivery", None)
+            _generation = getattr(interrupt_event, "_hermes_run_generation", None)
+            final_delivery_confirmed = (
+                isinstance(_stream_proof, tuple)
+                and len(_stream_proof) == 2
+                and _stream_proof[0] == _generation
+                and isinstance(_stream_proof[1], str)
+                and bool(_stream_proof[1])
+            )
             # A muted diagnostic wake ran for the session; its reply is not presented. The
             # policy read binds the routed profile; delivery itself stays in the launch scope.
             with self._media_delivery_scope(event.source):
@@ -4504,9 +4556,10 @@ class BasePlatformAdapter(ABC):
                         or _tts_paths or _tts_caption_delivered:
                     self.pause_typing_for_chat(event.source.chat_id)
                 if text_content and not _tts_caption_delivered:
-                    await self._send_final_text(
+                    _final_result = await self._send_final_text(
                         event, session_key, text_content, _final_thread_metadata,
                         is_ephemeral_response, _ephemeral_ttl, _record_delivery)
+                    final_delivery_confirmed = bool(_final_result.full_payload_delivered)
                 await self._deliver_attachments(
                     event, extracted, _final_thread_metadata,
                     anything_sent=delivery_attempted or _tts_caption_delivered,
@@ -4549,7 +4602,12 @@ class BasePlatformAdapter(ABC):
             # Stop typing BEFORE the post-delivery callback: a stuck callback must not keep it
             # alive.
             await self._stop_typing_refresh(event.source.chat_id, typing_task, metadata=_thread_metadata)
-            await self._fire_post_delivery_callback(session_key, interrupt_event)
+            _delivery_generation = getattr(interrupt_event, "_hermes_run_generation", None)
+            self._set_confirmed_final_delivery(session_key, _delivery_generation, final_delivery_confirmed)
+            try:
+                await self._fire_post_delivery_callback(session_key, interrupt_event)
+            finally:
+                self._clear_confirmed_final_delivery(session_key, _delivery_generation)
             # Callback work or a late refresh may have recreated typing — one final bounded stop.
             await self._stop_typing_refresh(
                 event.source.chat_id, None, metadata=_thread_metadata, stop_attempts=1)

@@ -1438,7 +1438,11 @@ class GatewayTurnMixin:
                 turn_sidecar_notes.append(_intro_note)
 
         # One-time prompt if no home channel is set (webhooks deliver to configured targets instead).
-        if not source.platform or source.platform in (Platform.LOCAL, Platform.WEBHOOK):
+        if (
+            not source.platform
+            or source.platform in (Platform.LOCAL, Platform.WEBHOOK)
+            or str(getattr(source, "chat_type", "")).lower() not in {"dm", "private"}
+        ):
             return
         platform_name = source.platform.value
         env_key = _home_target_env_var(platform_name)
@@ -1960,6 +1964,9 @@ class GatewayTurnMixin:
             # /loop and /goal hooks that read the return value.
             with suppress(Exception):
                 event._streamed_final_response = str(response or "")
+                _proof = agent_result.get("_complete_final_delivery_payload")
+                if _proof == str(response or "") and _proof:
+                    event._hermes_complete_final_delivery = (run_generation, _proof)
             return None
 
         return response
@@ -3949,6 +3956,12 @@ class GatewayTurnMixin:
             else:
                 await self._await_stream_task(stream_task)
 
+        if turn_ctx._direct_commentary_futures:
+            await asyncio.gather(
+                *(asyncio.wrap_future(future) for future in turn_ctx._direct_commentary_futures),
+                return_exceptions=True,
+            )
+
         # Abort + bounded wait for streaming TTS: covers paths where normal finalisation was skipped.
         _stts_finally = turn_ctx.streaming_tts_consumer_holder[0]
         # See #60671.
@@ -3977,22 +3990,26 @@ class GatewayTurnMixin:
 
     async def _run_agent_edit_streamed_message(
         self, _sc, source, response, content, *, _sk, ok, fail_result, fail_exc,
-    ) -> None:
+    ) -> bool:
         """Edit the stream consumer's message in place with ``content``; on success mark
-        ``response["already_sent"]`` and log ``ok``. ``fail_result`` (None = trust the call) logs a
-        returned failure as ``(session, error)``; ``fail_exc`` logs an exception as ``(session, exc)``."""
+        ``response["already_sent"]`` and log ``ok``. A missing or failed acknowledgement is never
+        a delivery success; ``fail_result`` only controls the diagnostic copy."""
         try:
             _res = await _sc.adapter.edit_message(
                 chat_id=source.chat_id, message_id=_sc.message_id, content=content, finalize=True,
             )
         except Exception as _edit_err:
             logger.warning(fail_exc, _sk, _edit_err)
-            return
-        if fail_result is not None and not getattr(_res, "success", True):
-            logger.warning(fail_result, _sk, getattr(_res, "error", None))
-            return
+            return False
+        if not getattr(_res, "success", False):
+            if fail_result is not None:
+                logger.warning(fail_result, _sk, getattr(_res, "error", None))
+            else:
+                logger.warning("Streamed final edit failed for session %s (%s)", _sk, getattr(_res, "error", None))
+            return False
         response["already_sent"] = True
         logger.info(*ok)
+        return True
 
     async def _run_agent_mark_streamed_delivery(self, response: Any, turn_ctx: TurnContext) -> None:
         """Set ``response["already_sent"]`` when streaming already delivered the final reply.
@@ -4039,6 +4056,11 @@ class GatewayTurnMixin:
                 _sk, _streamed, _previewed, _content_delivered,
             )
             response["already_sent"] = True
+            _matcher = getattr(_sc, "delivered_final_matches", None)
+            if callable(_matcher):
+                with suppress(Exception):
+                    if _matcher(_final) is True:
+                        response["_complete_final_delivery_payload"] = _final
         elif not _transformed and _stale_finalized and _sc is not None:
             # Stale finalize: edit the streamed message up to the complete response (on failure the
             # normal send delivers). Not for split delivery — message_id is only the LAST chunk.
@@ -4049,12 +4071,13 @@ class GatewayTurnMixin:
                     _sk,
                 )
             elif _sc_msg_id and _sc_msg_id != "__no_edit__" and getattr(_sc, "adapter", None) is not None:
-                await self._run_agent_edit_streamed_message(
+                if await self._run_agent_edit_streamed_message(
                     _sc, source, response, _final, _sk=_sk,
                     ok=("Reconciled stale streamed finalize for session %s: edited message %s with the complete response (#71643).", _sk, _sc_msg_id),
                     fail_result="Stale-finalize reconciliation edit failed for session %s (%s); sending complete response via normal final send.",
                     fail_exc="Stale-finalize reconciliation edit failed for session %s: %s; sending complete response via normal final send.",
-                )
+                ):
+                    response["_complete_final_delivery_payload"] = _final
             else:
                 logger.info(
                     "Stale streamed finalize detected for session %s with no editable message; delivering complete response via normal final send (#71643).",
@@ -4063,11 +4086,12 @@ class GatewayTurnMixin:
         elif _transformed and _sc is not None:
             # Transformed after streaming: edit the streamed message instead of sending a duplicate.
             if _sc.message_id:
-                await self._run_agent_edit_streamed_message(
+                if await self._run_agent_edit_streamed_message(
                     _sc, source, response, response["final_response"], _sk=_sk,
                     ok=("Edited streamed message %s for session %s to include plugin-transformed content.", _sc.message_id, _sk),
                     fail_result=None, fail_exc="Failed to edit streamed message for session %s: %s",
-                )
+                ):
+                    response["_complete_final_delivery_payload"] = response["final_response"]
         elif _sc is not None and getattr(_sc, "stream_deltas_enabled", True):
             # DUPLICATE-RISK DIAGNOSTIC: a stream consumer existed but suppression did NOT fire; log
             # the decision inputs ("signal never set" vs "ack-pending race"). Skipped for consumers
@@ -4096,11 +4120,22 @@ class GatewayTurnMixin:
             and hasattr(_cleanup_adapter, "register_post_delivery_callback")
         ):
             return
-        _ids_snapshot = list(_cleanup_msg_ids)
+        _final_text = str(response.get("final_response") or "").strip()
+        _commentary_ids_to_keep = {
+            message_id for message_id, text in turn_ctx._commentary_messages
+            if _final_text and str(text).strip() == _final_text
+        }
+        _ids_snapshot = [message_id for message_id in _cleanup_msg_ids if message_id not in _commentary_ids_to_keep]
+        if not _ids_snapshot:
+            return
         _chat_id_snapshot = turn_ctx.source.chat_id
         _loop_snapshot = asyncio.get_running_loop()
 
         def _cleanup_temp_bubbles() -> None:
+            _confirmed = getattr(_cleanup_adapter, "_has_confirmed_final_delivery", None)
+            if not callable(_confirmed) or not _confirmed(session_key, turn_ctx.run_generation):
+                return
+
             async def _delete_all() -> None:
                 for _mid in _ids_snapshot:
                     with suppress(Exception):

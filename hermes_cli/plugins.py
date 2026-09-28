@@ -859,6 +859,77 @@ class PluginContext:
         ``pattern=`` or you swallow the core button flows."""
         self.register_platform_handler("telegram", factory)
 
+    def register_telegram_callback_handler(self, prefix: str, callback: Any) -> PluginRegistration:
+        """Register an authorization-gated Telegram callback by data prefix.
+
+        The dispatcher reads the manager registry at dispatch time, so unload and reload take effect
+        without rebuilding the Telegram application.
+        """
+        if not isinstance(prefix, str) or not prefix:
+            raise self._refuse("a Telegram callback handler with an empty prefix")
+        if not callable(callback):
+            raise self._refuse("a Telegram callback handler with a non-callable callback")
+        manager = self._manager
+        entry = (prefix, callback, self.manifest.name)
+        manager._telegram_callback_handlers.append(entry)
+
+        def _release() -> None:
+            manager._remove_identity(manager._telegram_callback_handlers, entry)
+
+        registration = self._track(
+            "telegram_callback_handler", prefix, _release,
+        )
+        factory = manager._telegram_callback_dispatch_factory
+        if factory is None:
+            def _wire(application: Any, adapter: Any) -> None:
+                callback_query_handler = importlib.import_module("telegram.ext").CallbackQueryHandler
+
+                def _matches(data: object) -> bool:
+                    return isinstance(data, str) and any(
+                        data.startswith(registered_prefix)
+                        for registered_prefix, _, _ in manager.get_telegram_callback_handlers()
+                    )
+
+                async def _dispatch(update: Any, context: Any) -> None:
+                    del context
+                    query = getattr(update, "callback_query", None)
+                    data = getattr(query, "data", None)
+                    if query is None or not isinstance(data, str):
+                        return
+                    selected = next((entry for entry in manager.get_telegram_callback_handlers()
+                                     if data.startswith(entry[0])), None)
+                    if selected is None:
+                        return
+                    selected_prefix, selected_callback, plugin_name = selected
+                    message = getattr(query, "message", None)
+                    chat = getattr(message, "chat", None)
+                    user = getattr(query, "from_user", None)
+                    if not adapter._is_callback_user_authorized(
+                        str(getattr(user, "id", "")), chat_id=getattr(message, "chat_id", None),
+                        chat_type=str(getattr(chat, "type", "")) or None,
+                        thread_id=(str(message.message_thread_id) if message is not None
+                                   and getattr(message, "message_thread_id", None) is not None else None),
+                        user_name=getattr(user, "first_name", None),
+                    ):
+                        await query.answer(text="⛔ You are not authorized to use this button.", show_alert=True)
+                        return
+                    try:
+                        result = selected_callback(update=update, query=query, adapter=adapter)
+                        if inspect.isawaitable(result):
+                            await result
+                    except Exception:
+                        logger.error("Plugin %s Telegram callback handler failed for prefix %s", plugin_name,
+                                     selected_prefix, exc_info=True)
+                        with suppress(Exception):
+                            await query.answer(text="This action failed. Please try again.", show_alert=True)
+
+                application.add_handler(callback_query_handler(_dispatch, pattern=_matches))
+            manager._telegram_callback_dispatch_factory = factory = _wire
+        factories = manager._platform_handler_factories.setdefault("telegram", [])
+        if not any(registered is factory for registered, _ in factories):
+            factories.append((factory, "hermes.callback-dispatch"))
+        return registration
+
     @_serialized_replacement
     def register_auxiliary_task(
         self, key: str, *, display_name: str, description: str,
@@ -1196,6 +1267,8 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
         self._platform_handler_factories: Dict[str, List[tuple]] = {}
         # Process-owned discovery listeners (``on_plugin_loaded``); never cleared by unload().
         self._plugin_loaded_listeners: List[Callable] = []
+        self._telegram_callback_handlers: List[tuple[str, Callable, str]] = []
+        self._telegram_callback_dispatch_factory: Optional[Callable] = None
         # Event bus: owner-tagged subscriptions (unload removes zombies); one daemon worker keeps
         # registration order while emitters never block; per-worker chain depth caps mutual emitters.
         self._subscriptions: Dict[str, List[_EventSubscription]] = {}
@@ -1499,6 +1572,10 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
         """``(factory, plugin_name)`` tuples for one platform; adapters call ``factory(native,
         adapter)`` at connect (see :meth:`PluginContext.register_platform_handler`)."""
         return list(self._platform_handler_factories.get((platform or "").strip().lower(), []))
+
+    def get_telegram_callback_handlers(self) -> List[tuple[str, Callable, str]]:
+        """Current authorized Telegram callback registrations in dispatch order."""
+        return list(self._telegram_callback_handlers)
 
     def get_telegram_handler_factories(self) -> List[tuple]:
         """Back-compat alias for ``get_platform_handler_factories("telegram")``."""

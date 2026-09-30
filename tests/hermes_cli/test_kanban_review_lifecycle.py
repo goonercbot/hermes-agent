@@ -803,6 +803,85 @@ def test_active_pr_dependency_release_requires_fresh_related_progress(
         assert kbd.check_respawn_guard(conn, tied_owner) == "active_pr"
 
 
+def test_dependency_release_survives_infrastructure_refusal(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import hermes_cli.config as cfgmod
+    import hermes_cli.profiles as profmod
+    from tools.process_registry import RestartSafeScopeUnavailable
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    monkeypatch.setattr(cfgmod, "load_config", lambda *a, **k: {})
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "300")
+    now = [30_000]
+    monkeypatch.setattr(kb.time, "time", lambda: now[0])
+
+    def advance() -> None:
+        now[0] += 10
+
+    def refuse_spawn(task, workspace, board=None):
+        raise RestartSafeScopeUnavailable("injected host refusal; no worker ran")
+
+    with kbc.connect() as conn:
+        repair_id, owner_id = _dependency_parked_pr_owner(conn, advance)
+        advance()
+        assert kb.complete_task(conn, repair_id, result="repair accepted")
+        assert kbd.check_respawn_guard(conn, owner_id) is None
+        advance()
+        kbd.dispatch_once(conn, spawn_fn=refuse_spawn)
+        assert kbd.check_respawn_guard(conn, owner_id) == "infrastructure_cooldown"
+        now[0] += 301
+        assert kbd.check_respawn_guard(conn, owner_id) is None
+        spawned = []
+
+        def spawn(task, workspace, board=None):
+            spawned.append(task.id)
+            return 4242
+
+        kbd.dispatch_once(conn, spawn_fn=spawn)
+        assert spawned == [owner_id]
+        owner = kb.get_task(conn, owner_id)
+        assert owner is not None
+        advance()
+        assert kb.block_task(
+            conn, owner_id, reason="actual owner ran", kind="transient",
+            expected_run_id=owner.current_run_id,
+        )
+        assert kb.unblock_task(conn, owner_id)
+        assert kbd.check_respawn_guard(conn, owner_id) == "active_pr"
+
+
+@pytest.mark.parametrize("link_before_completion", [False, True])
+def test_dependency_release_rejects_unlink_triggered_promotion(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+    link_before_completion: bool,
+) -> None:
+    now = [40_000]
+    monkeypatch.setattr(kb.time, "time", lambda: now[0])
+
+    def advance() -> None:
+        now[0] += 10
+
+    with kbc.connect() as conn:
+        unfinished, owner_id = _dependency_parked_pr_owner(conn, advance)
+        other = kb.create_task(conn, title="other", assignee="repairer")
+        advance()
+        if link_before_completion:
+            kb.link_tasks(conn, other, owner_id)
+            advance()
+        assert kb.complete_task(conn, other, result="other complete")
+        waiting = kb.get_task(conn, owner_id)
+        assert waiting is not None and waiting.status == "todo"
+        advance()
+        if not link_before_completion:
+            kb.link_tasks(conn, other, owner_id)
+            advance()
+        assert kb.unlink_tasks(conn, unfinished, owner_id)
+        promoted = kb.get_task(conn, owner_id)
+        assert promoted is not None and promoted.status == "ready"
+        assert kbd.check_respawn_guard(conn, owner_id) == "active_pr"
+
+
 def test_dispatch_json_exposes_suppression_reasons(
     kanban_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

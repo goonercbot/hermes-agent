@@ -1610,14 +1610,7 @@ def check_respawn_guard(
         ).fetchall()
         if any(_is_handoff_event(e["kind"], e["payload"]) for e in events):
             return None
-        if _has_fresh_dependency_release(
-            conn,
-            task_id,
-            pr_created_at=int(c["created_at"] or 0),
-            latest_owner_run_ended_at=(
-                int(latest_run["ended_at"]) if latest_run and latest_run["ended_at"] is not None else None
-            ),
-        ):
+        if _has_fresh_dependency_release(conn, task_id, pr_created_at=int(c["created_at"] or 0)):
             return None
         return "active_pr"
 
@@ -1629,17 +1622,23 @@ def _has_fresh_dependency_release(
     task_id: str,
     *,
     pr_created_at: int,
-    latest_owner_run_ended_at: Optional[int],
 ) -> bool:
-    """Whether a direct parent completed after this owner last worked the PR.
+    """Consume genuine dependency progress, not a host refusal or edge edit.
 
-    A parent becoming terminal is a legitimate reason to resume the existing
-    owner, but only when its completion caused this child to be auto-promoted.
-    All timestamp comparisons are strict: a same-second completion is not
-    trusted as newer than the PR or owner run.  The parent ``completed`` event
-    and child ``promoted`` event may share a second, so their global event ids
-    establish their required order in that one safe tie case.
+    Same-second PR/run ties fail closed. Global event IDs order the dependency
+    completion and promotion; existing link history and the absence of later
+    eligibility changes establish that the completion released this owner.
     """
+    latest_owner_run_ended_at = None
+    for run in conn.execute(
+        "SELECT outcome, ended_at, metadata FROM task_runs "
+        "WHERE task_id = ? AND ended_at IS NOT NULL ORDER BY ended_at DESC, id DESC",
+        (task_id,),
+    ):
+        if run["outcome"] == "spawn_failed" and _kb._json_dict(run["metadata"]).get("infrastructure") is True:
+            continue  # Nothing ran; preserve the release after the cooldown.
+        latest_owner_run_ended_at = int(run["ended_at"])
+        break
     if latest_owner_run_ended_at is None:
         return False
     return conn.execute(
@@ -1663,17 +1662,46 @@ def _has_fresh_dependency_release(
            AND parent.completed_at > ?
            AND parent.completed_at > ?
            AND EXISTS (
+               SELECT 1 FROM task_events linked
+                WHERE linked.task_id = l.child_id
+                  AND linked.id < parent_completed.id
+                  AND (
+                      (linked.kind = 'linked' AND json_extract(
+                          CASE WHEN json_valid(linked.payload) THEN linked.payload ELSE '{}' END,
+                          '$.parent') = l.parent_id)
+                      OR (linked.kind = 'created' AND json_type(
+                          CASE WHEN json_valid(linked.payload) THEN linked.payload ELSE '{}' END,
+                          '$.parents') = 'array' AND EXISTS (
+                          SELECT 1 FROM json_each(
+                              CASE WHEN json_valid(linked.payload) THEN linked.payload ELSE '{}' END,
+                              '$.parents') initial_parent
+                           WHERE initial_parent.value = l.parent_id
+                      ))
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM task_events unlinked
+                       WHERE unlinked.task_id = l.child_id AND unlinked.kind = 'unlinked'
+                         AND unlinked.id > linked.id AND unlinked.id < parent_completed.id
+                         AND json_extract(
+                             CASE WHEN json_valid(unlinked.payload) THEN unlinked.payload ELSE '{}' END,
+                             '$.parent') = l.parent_id
+                  )
+           )
+           AND EXISTS (
                SELECT 1
                  FROM task_events child_promoted
                 WHERE child_promoted.task_id = l.child_id
                   AND child_promoted.kind = 'promoted'
-                  AND (
-                      child_promoted.created_at > parent.completed_at
-                      OR (
-                          child_promoted.created_at = parent.completed_at
-                          AND child_promoted.id > parent_completed.id
-                      )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM task_events changed
+                       WHERE changed.id > parent_completed.id AND changed.id < child_promoted.id
+                         AND changed.kind NOT IN ('commented', 'heartbeat', 'respawn_guarded')
+                         AND (changed.task_id = l.child_id OR changed.task_id IN (
+                             SELECT parent_id FROM task_links WHERE child_id = l.child_id
+                         ))
                   )
+                  AND child_promoted.created_at >= parent.completed_at
+                  AND child_promoted.id > parent_completed.id
            )
          LIMIT 1
         """,

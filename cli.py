@@ -198,6 +198,7 @@ from hermes_cli.cli_single_query import (  # noqa: F401,E402
     _install_single_query_signal_handlers,
     _int_or,
     _interrupt_agent_for_signal,
+    _kanban_goal_driver_context,
     _route_single_query_images,
     _run_kanban_goal_loop_chat,
     _run_kanban_goal_loop_q,

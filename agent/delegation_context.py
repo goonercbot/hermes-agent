@@ -16,6 +16,10 @@ _DELEGATED_CHILD_CONTEXT: ContextVar[bool] = ContextVar("hermes_delegated_child_
 # Any in-process execution that is NOT the dispatcher-owned worker (cron jobs). Kept separate
 # so delegate_task-specific behaviour (subprocess env scrubbing, its error strings) is unchanged.
 _NON_DISPATCHER_OWNED_CONTEXT: ContextVar[bool] = ContextVar("hermes_non_dispatcher_owned_context", default=False)
+# Set only by the native single-query goal driver after it has verified the
+# dispatcher-owned run is still active.  A goal-mode environment marker alone
+# is not sufficient: descendants and stale workers may inherit it.
+_KANBAN_GOAL_DRIVER_CONTEXT: ContextVar[bool] = ContextVar("hermes_kanban_goal_driver_context", default=False)
 
 DELEGATED_CHILD_ENV_MARKER = "HERMES_DELEGATED_CHILD_CONTEXT"
 
@@ -71,6 +75,26 @@ def non_dispatcher_owned_context() -> Iterator[None]:
 def is_dispatcher_owned_worker_context() -> bool:
     """The single predicate every ``HERMES_KANBAN_*`` identity gate should use."""
     return not (is_delegated_child_process_context() or _NON_DISPATCHER_OWNED_CONTEXT.get())
+
+
+@contextmanager
+def kanban_goal_driver_context() -> Iterator[None]:
+    """Mark one turn sequence as owned by the verified native Kanban goal driver.
+
+    This is deliberately context-local: delegated children and stale worker
+    environments do not gain the turn-end exemption merely by inheriting the
+    goal-mode marker.
+    """
+    token = _KANBAN_GOAL_DRIVER_CONTEXT.set(True)
+    try:
+        yield
+    finally:
+        _KANBAN_GOAL_DRIVER_CONTEXT.reset(token)
+
+
+def is_kanban_goal_driver_context() -> bool:
+    """Whether the current execution is inside the native goal driver's live scope."""
+    return bool(_KANBAN_GOAL_DRIVER_CONTEXT.get()) and bool(owned_kanban_task())
 
 
 def owned_kanban_task() -> str:

@@ -88,6 +88,56 @@ _RESPAWN_GUARD_PR_URL_RE = re.compile(
 )
 
 
+def _task_repository_identity(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Best-effort GitHub ``owner/repo`` identity for a task's deliverable.
+
+    A declared completion contract is the strongest task-owned repository
+    signal.  Otherwise, a live workspace's ``origin`` is the narrowest shared
+    record that names the source repository.  Missing, stale, non-GitHub, or
+    malformed evidence deliberately returns ``None``: callers retain the old
+    fail-closed behavior for a recent PR they cannot relate to the task.
+    """
+    row = conn.execute(
+        "SELECT completion_contract, workspace_path FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+
+    # Reuse the completion-contract parser so this guard and PR acceptance
+    # agree on what a declared GitHub repository/PR means.
+    from hermes_cli.kanban_pr_acceptance import _PR, _REPO
+
+    contract = _kb._lossy_text(row["completion_contract"])
+    declared_pr = _PR.fullmatch(contract or "")
+    if declared_pr:
+        return declared_pr[1].casefold()
+    if _REPO.fullmatch(contract or ""):
+        return contract.casefold()
+
+    workspace_path = _kb._lossy_text(row["workspace_path"])
+    if not workspace_path:
+        return None
+    origin = _kb._git_out(
+        Path(workspace_path).expanduser(), "remote", "get-url", "origin", timeout=5,
+    )
+    if not origin:
+        return None
+
+    # Reuse the shared canonicalizer: HTTPS and common SSH remote spellings
+    # must identify one repository rather than create different guard paths.
+    from hermes_cli.banner import _canonical_github_remote
+
+    try:
+        canonical = _canonical_github_remote(origin)
+    except (TypeError, ValueError):
+        return None
+    if not canonical.startswith("github.com/"):
+        return None
+    repository = canonical.removeprefix("github.com/")
+    return repository.casefold() if _REPO.fullmatch(repository) else None
+
+
 @dataclass
 class DispatchResult:
     """Outcome of a single ``dispatch`` pass.
@@ -1587,19 +1637,48 @@ def check_respawn_guard(
             return "recent_success"
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
+    #    When task ownership identifies a repository, only a PR for that
+    #    repository is duplicate-work evidence.  Supporting infrastructure PRs
+    #    often appear in a task handoff, but must not block its actual source
+    #    repository.  Unknown ownership remains conservative: any recent PR
+    #    keeps the historic fail-closed guard.
     #    Exception: a handoff AFTER the newest PR comment (operator reassign,
     #    reviewer changes_requested, review reopen) names the profile that must
     #    now work on THAT PR — a closer or the implementer finishing it, not a
     #    duplicate implementation (#111910). A crash/reclaim is not a handoff,
     #    so the worker that opened the PR is still not re-spawned against it.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
+    task_repository = _task_repository_identity(conn, task_id)
+    from hermes_cli.kanban_pr_acceptance import _PR
+
     for c in conn.execute(
         "SELECT body, created_at FROM task_comments "
         "WHERE task_id = ? AND created_at >= ? ORDER BY created_at DESC",
         (task_id, pr_cutoff),
     ).fetchall():
         body = _kb._lossy_text(c["body"])
-        if not (body and _RESPAWN_GUARD_PR_URL_RE.search(body)):
+        if not body:
+            continue
+        # Keep the broader existing URL recognizer for comment text, then reuse
+        # the canonical PR parser to read its repository identity.  Checking
+        # every URL matters: a newer supporting PR (or the first URL in one
+        # comment) must not hide an older/current task-delivery PR.
+        matching_pr = False
+        for url in _RESPAWN_GUARD_PR_URL_RE.findall(body):
+            # The legacy guard has always accepted HTTP as well as HTTPS.  The
+            # shared acceptance parser is HTTPS-only, so promote only the
+            # scheme before parsing; its owner/repo/number validation remains
+            # the single identity grammar.
+            parse_url = url
+            if url[:7].casefold() == "http://":
+                parse_url = "https://" + url[7:]
+            parsed_pr = _PR.fullmatch(parse_url.casefold())
+            if parsed_pr is None:
+                continue
+            if task_repository is None or parsed_pr[1].casefold() == task_repository:
+                matching_pr = True
+                break
+        if not matching_pr:
             continue
         events = conn.execute(
             # Strictly after: a same-second tie stays guarded (fail closed).

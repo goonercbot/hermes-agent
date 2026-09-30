@@ -117,6 +117,8 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str, run_turn=None
     def _quiet_turn(prompt: str) -> str:
         result = cli.agent.run_conversation(user_message=prompt, conversation_history=cli.conversation_history)
         cli._last_turn_result = result
+        if isinstance(result, dict) and isinstance(result.get("messages"), list):
+            cli.conversation_history = result["messages"]
         _sync_cli_session_id_from_agent(cli)
         resp = result.get("final_response", "") if isinstance(result, dict) else str(result)
         if resp:
@@ -339,6 +341,10 @@ def _run_quiet_single_query(cli, effective_query, emitter=None):
     # active task/run for its established failure or interruption handling.
     if (os.environ.get("HERMES_KANBAN_GOAL_MODE") == "1"
             and _single_query_exit_code(result) == 0):
+        # run_conversation returns (and may compact) history; it does not
+        # mutate the input list. Carry that transcript into the next turn.
+        if isinstance(result, dict) and isinstance(result.get("messages"), list):
+            cli.conversation_history = result["messages"]
         try:
             continued_exit = _run_kanban_goal_loop_q(cli, response)
             if continued_exit is not None:

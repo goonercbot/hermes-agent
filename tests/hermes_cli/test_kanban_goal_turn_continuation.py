@@ -196,6 +196,49 @@ def test_nonquiet_goal_driver_carries_only_validated_scope_into_real_agent_threa
     assert task is not None and task.status == "blocked"
 
 
+@pytest.mark.parametrize("resumed", [False, True], ids=["fresh", "resumed"])
+def test_quiet_goal_turns_carry_returned_history_including_compaction(monkeypatch, resumed):
+    """A retained session ID alone is not contextual continuation."""
+    from copy import deepcopy
+    from hermes_cli import quiet_single_query
+
+    initial = [{"role": "user", "content": "retained constraints"}] if resumed else []
+    first = initial + [
+        {"role": "user", "content": "start the task"},
+        {"role": "assistant", "content": "step one", "tool_calls": [{
+            "id": "call_step", "type": "function",
+            "function": {"name": "terminal", "arguments": "{}"},
+        }]},
+        {"role": "tool", "tool_call_id": "call_step", "content": "step-one evidence"},
+        {"role": "assistant", "content": "concrete progress one"},
+    ]
+    compacted = [{"role": "user", "content": "compacted constraints and step-one evidence"},
+                 {"role": "assistant", "content": "concrete progress two"}]
+    final = compacted + [{"role": "assistant", "content": "concrete progress three"}]
+    returned = [first, compacted, final]
+    seen = []
+    probe = _StopGateProbe()
+
+    def _run(**kwargs):
+        seen.append(deepcopy(kwargs["conversation_history"]))
+        if len(seen) == 2:
+            probe.session_id = "compressed-goal-session"
+        return {"final_response": f"step {len(seen)}", "messages": deepcopy(returned[len(seen) - 1])}
+
+    monkeypatch.setattr(probe, "run_conversation", _run)
+    monkeypatch.setattr(quiet_single_query, "continue_quiet_notify_completions", lambda *a, **k: None)
+    monkeypatch.setattr(goals, "judge_goal", lambda *a, **k: (
+        "continue", "another concrete step", False, None, False,
+    ))
+    worker = SimpleNamespace(agent=probe, conversation_history=deepcopy(initial), session_id=probe.session_id)
+    with pytest.raises(SystemExit) as exc:
+        cli._run_quiet_single_query(worker, "start the task")
+    assert exc.value.code == 0
+    assert seen == [initial, first, compacted]
+    assert worker.conversation_history == final
+    assert worker.session_id == "compressed-goal-session"
+
+
 class _OneShotResultAgent:
     def __init__(self, result):
         self.result = result

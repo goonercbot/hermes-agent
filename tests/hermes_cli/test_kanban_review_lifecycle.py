@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -481,6 +482,168 @@ def test_active_pr_guard_skipped_for_review_lane_but_defers_ready_lane(
         assert kbd.check_respawn_guard(
             conn, review_id, lane="review"
         ) == "rate_limit_cooldown"
+
+
+def _github_workspace(tmp_path: Path, remote: str) -> Path:
+    """Small local repository whose origin identifies a task's source repo."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    subprocess.run(["git", "init", "--quiet", str(workspace)], check=True)
+    subprocess.run(
+        ["git", "-C", str(workspace), "remote", "add", "origin", remote], check=True,
+    )
+    return workspace
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "https://github.com/goonercbot/sports-ai.git",
+        "git@github.com:goonercbot/sports-ai.git",
+        "ssh://git@github.com/goonercbot/sports-ai.git",
+    ],
+)
+def test_active_pr_guard_matches_workspace_repository_across_origin_forms(
+    kanban_home: Path, tmp_path: Path, origin: str,
+) -> None:
+    """A task-owned source repo distinguishes its delivery PR from a support PR."""
+    workspace = _github_workspace(tmp_path, origin)
+    with kbc.connect() as conn:
+        supporting = kb.create_task(
+            conn, title="resume Sports AI", assignee="worker", workspace_kind="dir",
+            workspace_path=str(workspace), completion_contract="local-only",
+        )
+        kb.add_comment(
+            conn, supporting, author="operator",
+            body="Runtime repair: https://github.com/goonercbot/hermes-agent/pull/27",
+        )
+        assert kbd.check_respawn_guard(conn, supporting) is None
+
+        own_delivery = kb.create_task(
+            conn, title="deliver Sports AI", assignee="worker", workspace_kind="dir",
+            workspace_path=str(workspace), completion_contract="local-only",
+        )
+        kb.add_comment(
+            conn, own_delivery, author="worker",
+            body="Opened https://github.com/goonercbot/sports-ai/pull/19",
+        )
+        assert kbd.check_respawn_guard(conn, own_delivery) == "active_pr"
+
+
+def test_active_pr_guard_uses_declared_completion_contract_before_workspace(
+    kanban_home: Path,
+) -> None:
+    """A structured contract remains authoritative when no workspace is available."""
+    with kbc.connect() as conn:
+        unrelated = kb.create_task(
+            conn, title="contract-owned", assignee="worker",
+            completion_contract="goonercbot/sports-ai",
+        )
+        kb.add_comment(
+            conn, unrelated, author="operator",
+            body="Support PR https://github.com/goonercbot/hermes-agent/pull/27",
+        )
+        assert kbd.check_respawn_guard(conn, unrelated) is None
+
+        own = kb.create_task(
+            conn, title="contract delivery", assignee="worker",
+            completion_contract="goonercbot/sports-ai",
+        )
+        kb.add_comment(
+            conn, own, author="worker",
+            body="Delivery https://github.com/goonercbot/sports-ai/pull/20",
+        )
+        assert kbd.check_respawn_guard(conn, own) == "active_pr"
+
+
+def test_active_pr_guard_stays_conservative_without_repository_ownership(
+    kanban_home: Path,
+) -> None:
+    with kbc.connect() as conn:
+        task_id = kb.create_task(conn, title="unknown repository", assignee="worker")
+        kb.add_comment(
+            conn, task_id, author="operator",
+            body="Possibly related https://github.com/goonercbot/hermes-agent/pull/27",
+        )
+        assert kbd.check_respawn_guard(conn, task_id) == "active_pr"
+
+
+def test_active_pr_guard_checks_every_recent_pr_for_the_task_repository(
+    kanban_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An irrelevant newer URL cannot hide an older own PR; same-comment URLs work too."""
+    workspace = _github_workspace(tmp_path, "https://github.com/goonercbot/sports-ai.git")
+    now = [100_000]
+    monkeypatch.setattr(kb.time, "time", lambda: now[0])
+    with kbc.connect() as conn:
+        older_own = kb.create_task(
+            conn, title="own then support", assignee="worker", workspace_kind="dir",
+            workspace_path=str(workspace), completion_contract="local-only",
+        )
+        kb.add_comment(
+            conn, older_own, author="worker",
+            body="Delivery https://github.com/goonercbot/sports-ai/pull/21",
+        )
+        now[0] += 1
+        kb.add_comment(
+            conn, older_own, author="operator",
+            body="Support https://github.com/goonercbot/hermes-agent/pull/27",
+        )
+        assert kbd.check_respawn_guard(conn, older_own) == "active_pr"
+
+        same_comment = kb.create_task(
+            conn, title="two PRs", assignee="worker", workspace_kind="dir",
+            workspace_path=str(workspace), completion_contract="local-only",
+        )
+        kb.add_comment(
+            conn, same_comment, author="worker",
+            body=("Support https://github.com/goonercbot/hermes-agent/pull/27; "
+                  "delivery https://github.com/goonercbot/sports-ai/pull/22"),
+        )
+        assert kbd.check_respawn_guard(conn, same_comment) == "active_pr"
+
+
+def test_dispatch_spawns_after_unrelated_pr_but_holds_own_delivery_pr(
+    kanban_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exercise the real ready dispatcher while the process boundary stays mocked."""
+    import hermes_cli.profiles as profmod
+
+    workspace = _github_workspace(tmp_path, "https://github.com/goonercbot/sports-ai.git")
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    spawned: list[str] = []
+
+    def fake_spawn(task, workspace_path, board=None):
+        spawned.append(task.id)
+        return None
+
+    with kbc.connect() as conn:
+        supporting_pr = kb.create_task(
+            conn, title="resume after runtime repair", assignee="worker", workspace_kind="dir",
+            workspace_path=str(workspace), completion_contract="local-only",
+        )
+        kb.add_comment(
+            conn, supporting_pr, author="operator",
+            body="Support PR https://github.com/goonercbot/hermes-agent/pull/27",
+        )
+        own_pr = kb.create_task(
+            conn, title="already delivered", assignee="worker", workspace_kind="dir",
+            workspace_path=str(workspace), completion_contract="local-only",
+        )
+        kb.add_comment(
+            conn, own_pr, author="worker",
+            body="Delivery PR https://github.com/goonercbot/sports-ai/pull/23",
+        )
+
+        result = kbd.dispatch_once(conn, spawn_fn=fake_spawn, max_spawn=2)
+
+        assert supporting_pr in [task_id for task_id, _, _ in result.spawned]
+        assert spawned == [supporting_pr]
+        assert dict(result.respawn_guarded).get(own_pr) == "active_pr"
+        supporting_task = kb.get_task(conn, supporting_pr)
+        own_task = kb.get_task(conn, own_pr)
+        assert supporting_task is not None and supporting_task.status == "running"
+        assert own_task is not None and own_task.status == "ready"
 
 
 def _backdate_comments(conn, tid, seconds=60):

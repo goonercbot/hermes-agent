@@ -368,6 +368,150 @@ def test_goal_loop_stops_after_reviewer_requests_changes(
     assert result["turns_used"] == 1
 
 
+def _goal_mode_review_worker(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, body: str = "Implement the change; reviewer approval is required before completion.",
+) -> str:
+    """A disposable claimed goal-mode card for public review-handoff tests."""
+    home = tmp_path / ".hermes"
+    home.mkdir(parents=True)
+    (home / "profiles" / "reviewer").mkdir(parents=True)
+    (home / "profiles" / "reviewer" / "config.yaml").write_text("{}\n")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_PROFILE", "builder")
+    monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    with kbc.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="Goal-mode review readiness", body=body, assignee="builder", goal_mode=True,
+        )
+        claimed = kb.claim_task(conn, task_id, claimer="builder:fixture")
+        assert claimed is not None
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
+    return task_id
+
+
+def test_goal_mode_review_readiness_scopes_public_tool_and_cli(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Fixture proof, not a live reviewer proof: both public handoff paths ask
+    whether implementation is ready, while incomplete work and unreviewed
+    completion remain rejected by the ordinary full-goal judge."""
+    from tools import kanban_tools as tools
+    import agent.auxiliary_client as auxiliary_client
+    from hermes_cli import goals
+
+    def judge(goal, last_response, **_kwargs):
+        if "incomplete" in last_response.lower():
+            return "continue", "implementation evidence is incomplete", False, None, False
+        if "ready to hand off to a reviewer" in goal:
+            return "done", "implementation is ready for fixture review", False, None, False
+        return "continue", "reviewer approval evidence is absent", False, None, False
+
+    # Tool handler: the same-card review criterion must not deadlock the first handoff.
+    tool_task = _goal_mode_review_worker(monkeypatch, tmp_path / "tool")
+    monkeypatch.setattr(tools, "_goal_judge_available", lambda: True)
+    monkeypatch.setattr(tools, "judge_goal", judge)
+    requested = json.loads(tools._handle_request_review({
+        "summary": "Implemented the change with passing fixture checks.", "reviewer": "reviewer",
+    }))
+    assert requested.get("ok") is True, requested
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, tool_task).status == "review"
+        review = kb.claim_review_task(conn, tool_task, claimer="reviewer:fixture")
+        assert review is not None
+    monkeypatch.setenv("HERMES_PROFILE", "reviewer")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(review.current_run_id))
+    assert json.loads(tools._handle_request_changes({"reason": "Fixture: add a boundary assertion."}))["ok"]
+    with kbc.connect() as conn:
+        repair = kb.claim_task(conn, tool_task, claimer="builder:repair")
+        assert repair is not None
+    monkeypatch.setenv("HERMES_PROFILE", "builder")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(repair.current_run_id))
+    assert json.loads(tools._handle_request_review({
+        "summary": "Fixture repair implemented and tests pass.", "reviewer": "reviewer",
+    }))["ok"]
+    with kbc.connect() as conn:
+        rereview = kb.claim_review_task(conn, tool_task, claimer="reviewer:rereview")
+        assert rereview is not None
+    monkeypatch.setenv("HERMES_PROFILE", "reviewer")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(rereview.current_run_id))
+    # First prove completion cannot use the implementation-readiness waiver.
+    rejected_completion = json.loads(tools._handle_complete({"summary": "Implementation ready."}))
+    assert "rejected by judge" in rejected_completion.get("error", "")
+    monkeypatch.setattr(tools, "judge_goal", lambda **kw: ("done", "fixture review approved", False, None, False))
+    assert json.loads(tools._handle_complete({"summary": "Fixture reviewer accepted repaired candidate."}))["ok"]
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, tool_task).status == "done"
+    monkeypatch.setattr(tools, "judge_goal", judge)
+
+    # CLI handler: independently exercise the shell/slash implementation.
+    cli_task = _goal_mode_review_worker(monkeypatch, tmp_path / "cli")
+    monkeypatch.setattr(auxiliary_client, "get_text_auxiliary_client", lambda _purpose: (object(), "fixture-judge"))
+    monkeypatch.setattr(goals, "judge_goal", judge)
+    output = kc.run_slash(f"request-review {cli_task} --summary 'Implemented the change with passing fixture checks.'")
+    assert "Requested review" in output
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, cli_task).status == "review"
+
+    # The scoped question does not waive implementation evidence on either public path.
+    incomplete_tool = _goal_mode_review_worker(monkeypatch, tmp_path / "incomplete-tool")
+    rejected = json.loads(tools._handle_request_review({"summary": "Implementation incomplete."}))
+    assert "rejected by judge" in rejected.get("error", "")
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, incomplete_tool).status == "running"
+
+    incomplete_cli = _goal_mode_review_worker(monkeypatch, tmp_path / "incomplete-cli")
+    output = kc.run_slash(f"request-review {incomplete_cli} --summary 'Implementation incomplete.'")
+    assert "rejected by judge" in output
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, incomplete_cli).status == "running"
+
+    # Completion remains unscoped: review approval is still required there.
+    completion_task = _goal_mode_review_worker(monkeypatch, tmp_path / "completion")
+    output = kc.run_slash(f"complete {completion_task} --summary 'Implemented the change.'")
+    assert "rejected by judge" in output
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, completion_task).status == "running"
+
+
+def test_cli_review_readiness_note_survives_real_judge_truncation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """The CLI path reserves note space before the real 2000-character
+    ``judge_goal`` truncation. The fake transport labels this fixture proof."""
+    from unittest.mock import patch
+    import agent.auxiliary_client as auxiliary_client
+
+    body = "Acceptance criteria:\n" + "\n".join(
+        f"- Detailed implementation criterion {index}: verify a meaningful boundary."
+        for index in range(80)
+    )
+    assert len(body) > 2000
+    task_id = _goal_mode_review_worker(monkeypatch, tmp_path, body=body)
+    monkeypatch.setattr(auxiliary_client, "get_text_auxiliary_client", lambda _purpose: (object(), "fixture-judge"))
+    captured: dict = {}
+
+    class _Message:
+        content = '{"done": true, "reason": "fixture implementation evidence is sufficient"}'
+
+    class _Response:
+        choices = [type("Choice", (), {"message": _Message()})()]
+
+    def fake_call_llm(**kwargs):
+        captured.update(kwargs)
+        return _Response()
+
+    with patch("agent.auxiliary_client.call_llm", side_effect=fake_call_llm):
+        output = kc.run_slash(f"request-review {task_id} --summary 'Implemented all listed criteria.'")
+
+    assert "Requested review" in output
+    prompt = next(message["content"] for message in captured["messages"] if message["role"] == "user")
+    assert "do not withhold DONE merely because reviewer/approval evidence is absent" in prompt
+
+
 def test_cli_and_dashboard_receive_graph_aware_deadlock_diagnostic(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

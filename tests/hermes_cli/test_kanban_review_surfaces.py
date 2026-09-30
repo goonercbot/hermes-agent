@@ -548,6 +548,9 @@ def test_review_scope_preserves_previously_visible_implementation_criterion(
     assert criterion in user
     assert title_prefix + body in user
     assert "ready to hand off to a reviewer" in system
+    assert "independent-review execution itself" in system
+    assert "Never require the independent review to start or finish" in system
+    assert "Continue to reject missing implementation or failing required tests." in system
     with kbc.connect() as conn:
         task = kb.get_task(conn, task_id)
         assert task is not None and task.status == "running"

@@ -934,6 +934,11 @@ def judge_goal(
                 "call for a reviewer to approve or close out the work, treat that as a "
                 "later step outside this check: do not withhold DONE merely because "
                 "reviewer/approval evidence is absent."
+                "\n\nFor this handoff, independent-review execution itself, "
+                "a review verdict, and final delivery are later phases, not implementation "
+                "requirements. Never require the independent review to start or finish before "
+                "allowing this handoff. Continue to reject missing implementation or failing "
+                "required tests."
             )
         raw = _call_goal_judge_llm(call_llm, system_prompt, prompt, timeout)
     except AuxiliaryClientUnavailable as exc:

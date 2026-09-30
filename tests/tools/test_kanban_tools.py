@@ -417,11 +417,10 @@ def test_request_review_goal_mode_asks_judge_about_implementation_not_review(
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_db_connect as kbc
 
-    # A judge that withholds DONE for missing reviewer evidence UNLESS the
-    # goal text itself says that's not required for this check — i.e. it
-    # reacts to the reframing, not to which tool called it.
-    def mock_judge_goal(goal, last_response, *, timeout=30.0, subgoals=None):
-        if "do not withhold DONE merely because" in goal:
+    # A judge that withholds DONE unless the caller explicitly selects
+    # implementation readiness. Real prompt rendering is tested below.
+    def mock_judge_goal(goal, last_response, *, timeout=30.0, subgoals=None, review_handoff=False):
+        if review_handoff:
             return "done", "implementation evidence present", False, None, False
         return "continue", "no reviewer approval evidence yet", False, None, False
 
@@ -482,7 +481,7 @@ def test_request_review_goal_mode_note_survives_long_body(monkeypatch, tmp_path)
     def _fake_call_llm(**kwargs):
         captured.update(kwargs)
         prompt = next(
-            (m["content"] for m in kwargs.get("messages", []) if m["role"] == "user"), ""
+            (m["content"] for m in kwargs.get("messages", []) if m["role"] == "system"), ""
         )
         note_present = "do not withhold DONE merely because" in prompt
         _FakeMsg.content = json.dumps({

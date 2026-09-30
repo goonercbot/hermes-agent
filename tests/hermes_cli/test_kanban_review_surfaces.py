@@ -406,7 +406,7 @@ def test_goal_mode_review_readiness_scopes_public_tool_and_cli(
     def judge(goal, last_response, **_kwargs):
         if "incomplete" in last_response.lower():
             return "continue", "implementation evidence is incomplete", False, None, False
-        if "ready to hand off to a reviewer" in goal:
+        if _kwargs.get("review_handoff"):
             return "done", "implementation is ready for fixture review", False, None, False
         return "continue", "reviewer approval evidence is absent", False, None, False
 
@@ -480,8 +480,8 @@ def test_goal_mode_review_readiness_scopes_public_tool_and_cli(
 def test_cli_review_readiness_note_survives_real_judge_truncation(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
-    """The CLI path reserves note space before the real 2000-character
-    ``judge_goal`` truncation. The fake transport labels this fixture proof."""
+    """The CLI scope stays outside the real 2000-character task truncation.
+    The fake transport labels this fixture proof."""
     from unittest.mock import patch
     import agent.auxiliary_client as auxiliary_client
 
@@ -508,8 +508,49 @@ def test_cli_review_readiness_note_survives_real_judge_truncation(
         output = kc.run_slash(f"request-review {task_id} --summary 'Implemented all listed criteria.'")
 
     assert "Requested review" in output
-    prompt = next(message["content"] for message in captured["messages"] if message["role"] == "user")
+    prompt = next(message["content"] for message in captured["messages"] if message["role"] == "system")
     assert "do not withhold DONE merely because reviewer/approval evidence is absent" in prompt
+
+
+@pytest.mark.parametrize("surface", ["tool", "cli"])
+def test_review_scope_preserves_previously_visible_implementation_criterion(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, surface: str,
+) -> None:
+    """Real prompt construction, fake transport: scope must not consume task budget."""
+    from types import SimpleNamespace
+    import agent.auxiliary_client as auxiliary_client
+    from tools import kanban_tools as tools
+
+    criterion = "MANDATORY: enforce tenant isolation before review."
+    title_prefix = "Goal-mode review readiness\n\n"
+    body = "Implement the documented behavior.\n".ljust(1701 - len(title_prefix), ".") + criterion
+    assert (title_prefix + body).index(criterion) == 1701
+    task_id = _goal_mode_review_worker(monkeypatch, tmp_path, body=body)
+    monkeypatch.setattr(tools, "_goal_judge_available", lambda: True)
+    monkeypatch.setattr(auxiliary_client, "get_text_auxiliary_client", lambda _purpose: (object(), "fixture-judge"))
+    captured = {}
+
+    def transport(**kwargs):
+        captured.update(kwargs)
+        user = next(m["content"] for m in kwargs["messages"] if m["role"] == "user")
+        verdict = {"done": criterion not in user, "reason": "tenant isolation is not implemented"}
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(verdict)))])
+
+    monkeypatch.setattr(auxiliary_client, "call_llm", transport)
+    if surface == "tool":
+        result = json.loads(tools._handle_request_review({"summary": "Basic implementation done; tenant isolation not implemented."}))
+        assert "rejected by judge" in result.get("error", "")
+    else:
+        result = kc.run_slash(f"request-review {task_id} --summary 'Basic implementation done; tenant isolation not implemented.'")
+        assert "rejected by judge" in result
+    user = next(m["content"] for m in captured["messages"] if m["role"] == "user")
+    system = next(m["content"] for m in captured["messages"] if m["role"] == "system")
+    assert criterion in user
+    assert title_prefix + body in user
+    assert "ready to hand off to a reviewer" in system
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.status == "running"
 
 
 def test_cli_and_dashboard_receive_graph_aware_deadlock_diagnostic(

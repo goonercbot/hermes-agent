@@ -824,17 +824,6 @@ def _worker_run_id_for(task_id: str) -> Optional[int]:
         return None
 
 
-# Kept in sync with tools/kanban_tools.py's copy of this note (#98160).
-_REVIEW_READINESS_NOTE = (
-    "\n\nJudging note: this checks whether the implementation work described "
-    "above is finished and ready to hand off to a reviewer — it does not "
-    "check whether the card as a whole is done. If the card's own criteria "
-    "call for a reviewer to approve or close out the work, treat that as a "
-    "later step outside this check: do not withhold DONE merely because "
-    "reviewer/approval evidence is absent."
-)
-
-
 def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str, *, is_review: bool = False):
     """Goal judge for every terminal worker handoff (including review).
 
@@ -865,16 +854,6 @@ def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str, *, is_r
 
     from hermes_cli.goals import judge_goal
 
-    goal = f"{task.title}\n\n{task.body or ''}".strip()
-    if is_review:
-        # judge_goal truncates its goal argument to 2000 chars before sending it to the
-        # judge; reserve room here so a long title/body can't push the note itself past
-        # that limit and silently drop it (#98160).
-        budget = 2000 - len(_REVIEW_READINESS_NOTE)
-        if len(goal) > budget:
-            goal = goal[:budget]
-        goal = f"{goal}{_REVIEW_READINESS_NOTE}"
-
     verdict, reason, transport_failed = "done", "", False
     try:
         # Headless handoff checks run outside any agent turn: bind the per-task relay-affinity
@@ -882,9 +861,11 @@ def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str, *, is_r
         from agent.portal_tags import get_affinity_scope, reset_affinity_scope, set_affinity_scope
         affinity_token = None if get_affinity_scope() else set_affinity_scope(f"kanban:{task.id}")
         try:
+            judge_kwargs: dict[str, Any] = {"review_handoff": True} if is_review else {}
             verdict, reason, _, _, transport_failed = judge_goal(
-                goal=goal,
-                last_response=evidence.strip())
+                goal=f"{task.title}\n\n{task.body or ''}".strip(),
+                last_response=evidence.strip(),
+                **judge_kwargs)
         finally:
             if affinity_token is not None:
                 reset_affinity_scope(affinity_token)

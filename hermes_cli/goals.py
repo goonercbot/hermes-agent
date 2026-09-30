@@ -877,12 +877,15 @@ def judge_goal(
     background_processes: Optional[List[Dict[str, Any]]] = None,
     contract: Optional[GoalContract] = None,
     active_delegations: int = 0,
+    review_handoff: bool = False,
 ) -> Tuple[str, str, bool, Optional[Dict[str, Any]], bool]:
     """Ask the auxiliary model whether the goal is satisfied.
 
     Returns ``(verdict, reason, parse_failed, wait_directive, transport_failed)``; verdict is done /
     blocked / continue / wait / skipped. ``parse_failed`` means unusable output; transport errors
     set ``transport_failed`` instead and fail-open to ``continue``.
+    ``review_handoff`` scopes readiness in the system instruction, preserving
+    the ordinary task/evidence budgets and completion behavior.
     """
     if not goal.strip():
         return "skipped", "empty goal", False, None, False
@@ -920,7 +923,19 @@ def judge_goal(
         prompt = JUDGE_USER_PROMPT_TEMPLATE.format(**common)
 
     try:
-        raw = _call_goal_judge_llm(call_llm, JUDGE_SYSTEM_PROMPT, prompt, timeout)
+        # Scope review separately: never spend the existing task-text budget
+        # on the readiness instruction or hide previously visible criteria.
+        system_prompt = JUDGE_SYSTEM_PROMPT
+        if review_handoff:
+            system_prompt += (
+                "\n\nJudging note: this checks whether the implementation work described "
+                "in the task is finished and ready to hand off to a reviewer — it does not "
+                "check whether the card as a whole is done. If the card's own criteria "
+                "call for a reviewer to approve or close out the work, treat that as a "
+                "later step outside this check: do not withhold DONE merely because "
+                "reviewer/approval evidence is absent."
+            )
+        raw = _call_goal_judge_llm(call_llm, system_prompt, prompt, timeout)
     except AuxiliaryClientUnavailable as exc:
         # No client at all (e.g. a dead Nous refresh token): name the cause so the user is sent to
         # re-authenticate, not to context-length / model debugging (#42177). Still fails open.

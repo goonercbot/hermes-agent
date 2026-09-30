@@ -128,10 +128,14 @@ def _task_repository_identity(conn: sqlite3.Connection, task_id: str) -> Optiona
     # must identify one repository rather than create different guard paths.
     from hermes_cli.banner import _canonical_github_remote
 
-    canonical = _canonical_github_remote(origin)
-    if not canonical.startswith("github.com/") or canonical.count("/") != 2:
+    try:
+        canonical = _canonical_github_remote(origin)
+    except (TypeError, ValueError):
         return None
-    return canonical.removeprefix("github.com/")
+    if not canonical.startswith("github.com/"):
+        return None
+    repository = canonical.removeprefix("github.com/")
+    return repository.casefold() if _REPO.fullmatch(repository) else None
 
 
 @dataclass
@@ -1661,7 +1665,14 @@ def check_respawn_guard(
         # comment) must not hide an older/current task-delivery PR.
         matching_pr = False
         for url in _RESPAWN_GUARD_PR_URL_RE.findall(body):
-            parsed_pr = _PR.fullmatch(url.lower())
+            # The legacy guard has always accepted HTTP as well as HTTPS.  The
+            # shared acceptance parser is HTTPS-only, so promote only the
+            # scheme before parsing; its owner/repo/number validation remains
+            # the single identity grammar.
+            parse_url = url
+            if url[:7].casefold() == "http://":
+                parse_url = "https://" + url[7:]
+            parsed_pr = _PR.fullmatch(parse_url.casefold())
             if parsed_pr is None:
                 continue
             if task_repository is None or parsed_pr[1].casefold() == task_repository:

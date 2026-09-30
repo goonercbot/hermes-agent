@@ -487,7 +487,7 @@ def test_active_pr_guard_skipped_for_review_lane_but_defers_ready_lane(
 def _github_workspace(tmp_path: Path, remote: str) -> Path:
     """Small local repository whose origin identifies a task's source repo."""
     workspace = tmp_path / "workspace"
-    workspace.mkdir()
+    workspace.mkdir(parents=True)
     subprocess.run(["git", "init", "--quiet", str(workspace)], check=True)
     subprocess.run(
         ["git", "-C", str(workspace), "remote", "add", "origin", remote], check=True,
@@ -566,6 +566,93 @@ def test_active_pr_guard_stays_conservative_without_repository_ownership(
             body="Possibly related https://github.com/goonercbot/hermes-agent/pull/27",
         )
         assert kbd.check_respawn_guard(conn, task_id) == "active_pr"
+
+
+def test_active_pr_guard_preserves_http_pr_recognition_for_known_and_unknown_tasks(
+    kanban_home: Path, tmp_path: Path,
+) -> None:
+    """The new identity correlation cannot narrow the legacy HTTP URL grammar."""
+    workspace = _github_workspace(tmp_path, "https://github.com/goonercbot/sports-ai.git")
+    with kbc.connect() as conn:
+        known = kb.create_task(
+            conn, title="known HTTP delivery", assignee="worker", workspace_kind="dir",
+            workspace_path=str(workspace), completion_contract="local-only",
+        )
+        kb.add_comment(
+            conn, known, author="worker",
+            body="Delivery http://github.com/goonercbot/sports-ai/pull/24",
+        )
+        assert kbd.check_respawn_guard(conn, known) == "active_pr"
+
+        unknown = kb.create_task(conn, title="unknown HTTP delivery", assignee="worker")
+        kb.add_comment(
+            conn, unknown, author="worker",
+            body="Delivery http://github.com/example/repo/pull/7",
+        )
+        assert kbd.check_respawn_guard(conn, unknown) == "active_pr"
+
+
+def test_active_pr_guard_contract_precedence_and_casefold_identity(
+    kanban_home: Path, tmp_path: Path,
+) -> None:
+    """A declared contract wins over a conflicting workspace origin, case-insensitively."""
+    workspace = _github_workspace(tmp_path, "https://github.com/goonercbot/hermes-agent.git")
+    with kbc.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="contract before workspace", assignee="worker", workspace_kind="dir",
+            workspace_path=str(workspace), completion_contract="GoonerCBot/Sports-AI",
+        )
+        kb.add_comment(
+            conn, task_id, author="worker",
+            body="Delivery HTTPS://GITHUB.COM/GOONERCBOT/SPORTS-AI/pull/25",
+        )
+        assert kbd.check_respawn_guard(conn, task_id) == "active_pr"
+
+        support_task = kb.create_task(
+            conn, title="contract ignores workspace support", assignee="worker", workspace_kind="dir",
+            workspace_path=str(workspace), completion_contract="GoonerCBot/Sports-AI",
+        )
+        kb.add_comment(
+            conn, support_task, author="worker",
+            body="Support https://github.com/goonercbot/hermes-agent/pull/27",
+        )
+        assert kbd.check_respawn_guard(conn, support_task) is None
+
+
+def test_active_pr_guard_fails_closed_for_invalid_or_unparseable_workspace_origin(
+    kanban_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Malformed normalizer results and failures remain unknown ownership, never trusted."""
+    invalid_workspace = _github_workspace(tmp_path / "invalid", "https://github.com//repo.git")
+    parser_workspace = _github_workspace(tmp_path / "parser", "https://github.com/goonercbot/sports-ai.git")
+    with kbc.connect() as conn:
+        invalid = kb.create_task(
+            conn, title="invalid origin", assignee="worker", workspace_kind="dir",
+            workspace_path=str(invalid_workspace), completion_contract="local-only",
+        )
+        kb.add_comment(
+            conn, invalid, author="worker",
+            body="Support https://github.com/goonercbot/hermes-agent/pull/27",
+        )
+        assert kbd._task_repository_identity(conn, invalid) is None
+        assert kbd.check_respawn_guard(conn, invalid) == "active_pr"
+
+        import hermes_cli.banner as banner
+
+        monkeypatch.setattr(
+            banner, "_canonical_github_remote",
+            lambda _origin: (_ for _ in ()).throw(ValueError("malformed authority")),
+        )
+        unparsable = kb.create_task(
+            conn, title="unparseable origin", assignee="worker", workspace_kind="dir",
+            workspace_path=str(parser_workspace), completion_contract="local-only",
+        )
+        kb.add_comment(
+            conn, unparsable, author="worker",
+            body="Support https://github.com/goonercbot/hermes-agent/pull/27",
+        )
+        assert kbd._task_repository_identity(conn, unparsable) is None
+        assert kbd.check_respawn_guard(conn, unparsable) == "active_pr"
 
 
 def test_active_pr_guard_checks_every_recent_pr_for_the_task_repository(

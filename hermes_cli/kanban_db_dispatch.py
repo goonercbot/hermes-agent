@@ -1504,8 +1504,9 @@ def check_respawn_guard(
     ready lane only ``"recent_success"`` (completed run within the window, unless
     a re-queue event arrived after it — a deliberate re-run) and ``"active_pr"``
     (PR URL in a recent comment; re-spawning risks a duplicate PR — unless a
-    handoff event followed the comment: the named profile must work on that
-    PR). The review lane skips the last two: they are the *inputs* to a review
+    handoff event followed the comment, or a direct dependency completed and
+    re-promoted the card after the owner's last run: the named profile must
+    work on that PR). The review lane skips the last two: they are the *inputs* to a review
     handoff. Stale / dead claim locks are NOT a guard reason — the reclaim
     passes own those.
     """
@@ -1609,9 +1610,75 @@ def check_respawn_guard(
         ).fetchall()
         if any(_is_handoff_event(e["kind"], e["payload"]) for e in events):
             return None
+        if _has_fresh_dependency_release(
+            conn,
+            task_id,
+            pr_created_at=int(c["created_at"] or 0),
+            latest_owner_run_ended_at=(
+                int(latest_run["ended_at"]) if latest_run and latest_run["ended_at"] is not None else None
+            ),
+        ):
+            return None
         return "active_pr"
 
     return None
+
+
+def _has_fresh_dependency_release(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    pr_created_at: int,
+    latest_owner_run_ended_at: Optional[int],
+) -> bool:
+    """Whether a direct parent completed after this owner last worked the PR.
+
+    A parent becoming terminal is a legitimate reason to resume the existing
+    owner, but only when its completion caused this child to be auto-promoted.
+    All timestamp comparisons are strict: a same-second completion is not
+    trusted as newer than the PR or owner run.  The parent ``completed`` event
+    and child ``promoted`` event may share a second, so their global event ids
+    establish their required order in that one safe tie case.
+    """
+    if latest_owner_run_ended_at is None:
+        return False
+    return conn.execute(
+        """
+        SELECT 1
+          FROM task_links l
+          JOIN tasks parent ON parent.id = l.parent_id
+          JOIN task_events parent_completed
+            ON parent_completed.task_id = parent.id
+           AND parent_completed.kind = 'completed'
+           AND parent_completed.created_at = parent.completed_at
+           AND parent_completed.id = (
+               SELECT MAX(latest_parent_completed.id)
+                 FROM task_events latest_parent_completed
+                WHERE latest_parent_completed.task_id = parent.id
+                  AND latest_parent_completed.kind = 'completed'
+                  AND latest_parent_completed.created_at = parent.completed_at
+           )
+         WHERE l.child_id = ?
+           AND parent.status = 'done'
+           AND parent.completed_at > ?
+           AND parent.completed_at > ?
+           AND EXISTS (
+               SELECT 1
+                 FROM task_events child_promoted
+                WHERE child_promoted.task_id = l.child_id
+                  AND child_promoted.kind = 'promoted'
+                  AND (
+                      child_promoted.created_at > parent.completed_at
+                      OR (
+                          child_promoted.created_at = parent.completed_at
+                          AND child_promoted.id > parent_completed.id
+                      )
+                  )
+           )
+         LIMIT 1
+        """,
+        (task_id, pr_created_at, latest_owner_run_ended_at),
+    ).fetchone() is not None
 
 
 def _is_handoff_event(kind: str, payload: Optional[str]) -> bool:

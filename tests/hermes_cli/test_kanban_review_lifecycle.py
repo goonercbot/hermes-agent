@@ -605,6 +605,204 @@ def test_active_pr_guard_lifts_for_implementer_after_changes_requested(
         assert kbd.check_respawn_guard(conn, done_id) == "recent_success"
 
 
+def _dependency_parked_pr_owner(conn, advance):
+    """Create an owner that published a PR then parked on a direct repair task."""
+    repair_id = kb.create_task(conn, title="repair", assignee="repairer")
+    advance()
+    owner_id = kb.create_task(conn, title="owner", assignee="owner")
+    advance()
+    owner_claim = kb.claim_task(conn, owner_id)
+    assert owner_claim is not None
+    advance()
+    kb.add_comment(
+        conn,
+        owner_id,
+        author="owner",
+        body="Opened https://github.com/example/repo/pull/99 for review.",
+    )
+    advance()
+    assert kb.link_tasks(
+        conn,
+        parent_id=repair_id,
+        child_id=owner_id,
+        expected_child_run_id=owner_claim.current_run_id,
+    ) is False
+    advance()
+    assert kb.block_task(
+        conn,
+        owner_id,
+        reason="wait for the repair",
+        kind="dependency",
+        expected_run_id=owner_claim.current_run_id,
+    )
+    owner = kb.get_task(conn, owner_id)
+    assert owner is not None and owner.status == "todo"
+    return repair_id, owner_id
+
+
+def test_active_pr_guard_lifts_once_for_fresh_dependency_release(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A completed direct repair resumes its original PR owner exactly once.
+
+    This exercises the ordinary task lifecycle and real dispatcher claim path;
+    only the subprocess boundary is mocked.  Before the repair finishes the PR
+    stays guarded, and a later ready replay after the released owner run is
+    guarded again.
+    """
+    import hermes_cli.config as cfgmod
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    monkeypatch.setattr(cfgmod, "load_config", lambda *a, **k: {})
+    now = [10_000]
+    monkeypatch.setattr(kb.time, "time", lambda: now[0])
+
+    def advance() -> None:
+        now[0] += 10
+
+    spawned = []
+
+    def fake_spawn(task, workspace, board=None):
+        spawned.append((task.id, workspace, board))
+        return 4242
+
+    with kbc.connect() as conn:
+        repair_id, owner_id = _dependency_parked_pr_owner(conn, advance)
+        assert kbd.check_respawn_guard(conn, owner_id) == "active_pr"
+
+        advance()
+        repair_claim = kb.claim_task(conn, repair_id)
+        assert repair_claim is not None
+        advance()
+        assert kb.complete_task(
+            conn,
+            repair_id,
+            result="repair independently completed",
+            expected_run_id=repair_claim.current_run_id,
+        )
+        # complete_task's ordinary recompute auto-promotes the waiting owner.
+        owner = kb.get_task(conn, owner_id)
+        assert owner is not None and owner.status == "ready"
+        assert kbd.check_respawn_guard(conn, owner_id) is None
+
+        result = kbd.dispatch_once(conn, dry_run=False, spawn_fn=fake_spawn)
+        assert owner_id in [task_id for task_id, _, _ in result.spawned]
+        assert [task_id for task_id, _, _ in spawned] == [owner_id]
+        owner = kb.get_task(conn, owner_id)
+        assert owner is not None
+        owner_run_id = owner.current_run_id
+        assert owner_run_id is not None
+
+        # The released owner run then returns to ready without another parent
+        # completion.  It must not consume the old dependency release forever.
+        advance()
+        assert kb.block_task(
+            conn,
+            owner_id,
+            reason="needs another pass",
+            kind="transient",
+            expected_run_id=owner_run_id,
+        )
+        advance()
+        assert kb.unblock_task(conn, owner_id)
+        owner = kb.get_task(conn, owner_id)
+        assert owner is not None and owner.status == "ready"
+        assert kbd.check_respawn_guard(conn, owner_id) == "active_pr"
+
+
+def test_active_pr_dependency_release_requires_fresh_related_progress(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Incomplete, stale, newer-PR, unrelated, and timestamp-tied paths hold."""
+    now = [20_000]
+    monkeypatch.setattr(kb.time, "time", lambda: now[0])
+
+    def advance() -> None:
+        now[0] += 10
+
+    with kbc.connect() as conn:
+        # A direct repair that has not completed is not a release.
+        repair_id, owner_id = _dependency_parked_pr_owner(conn, advance)
+        assert kbd.check_respawn_guard(conn, owner_id) == "active_pr"
+
+        # Completing it promotes the owner, but a later owner run makes that
+        # completion stale for a retry.
+        advance()
+        repair_claim = kb.claim_task(conn, repair_id)
+        assert repair_claim is not None
+        advance()
+        assert kb.complete_task(
+            conn, repair_id, result="done", expected_run_id=repair_claim.current_run_id,
+        )
+        advance()
+        stale_claim = kb.claim_task(conn, owner_id)
+        assert stale_claim is not None
+        advance()
+        assert kb.block_task(
+            conn, owner_id, reason="retry", kind="transient",
+            expected_run_id=stale_claim.current_run_id,
+        )
+        advance()
+        assert kb.unblock_task(conn, owner_id)
+        assert kbd.check_respawn_guard(conn, owner_id) == "active_pr"
+
+        # A new PR comment after an otherwise valid dependency release wins.
+        repair_id, owner_id = _dependency_parked_pr_owner(conn, advance)
+        advance()
+        repair_claim = kb.claim_task(conn, repair_id)
+        assert repair_claim is not None
+        advance()
+        assert kb.complete_task(
+            conn, repair_id, result="done", expected_run_id=repair_claim.current_run_id,
+        )
+        advance()
+        kb.add_comment(
+            conn,
+            owner_id,
+            author="owner",
+            body="Follow-up https://github.com/example/repo/pull/100 is now open.",
+        )
+        assert kbd.check_respawn_guard(conn, owner_id) == "active_pr"
+
+        # A completed task not linked to the owner cannot release its PR.
+        unrelated_id = kb.create_task(conn, title="unrelated", assignee="repairer")
+        advance()
+        unlinked_owner = kb.create_task(conn, title="unlinked owner", assignee="owner")
+        unlinked_claim = kb.claim_task(conn, unlinked_owner)
+        assert unlinked_claim is not None
+        kb.add_comment(
+            conn,
+            unlinked_owner,
+            author="owner",
+            body="Opened https://github.com/example/repo/pull/101 for review.",
+        )
+        advance()
+        assert kb.block_task(
+            conn, unlinked_owner, reason="pause", kind="transient",
+            expected_run_id=unlinked_claim.current_run_id,
+        )
+        advance()
+        assert kb.unblock_task(conn, unlinked_owner)
+        unrelated_claim = kb.claim_task(conn, unrelated_id)
+        assert unrelated_claim is not None
+        advance()
+        assert kb.complete_task(
+            conn, unrelated_id, result="done", expected_run_id=unrelated_claim.current_run_id,
+        )
+        assert kbd.check_respawn_guard(conn, unlinked_owner) == "active_pr"
+
+        # Equal-second repair completion and owner-run end deliberately fail
+        # closed even though complete_task emits the subsequent promotion.
+        repair_id, tied_owner = _dependency_parked_pr_owner(conn, advance)
+        repair_claim = kb.claim_task(conn, repair_id)
+        assert repair_claim is not None
+        assert kb.complete_task(
+            conn, repair_id, result="done", expected_run_id=repair_claim.current_run_id,
+        )
+        assert kbd.check_respawn_guard(conn, tied_owner) == "active_pr"
+
+
 def test_dispatch_json_exposes_suppression_reasons(
     kanban_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

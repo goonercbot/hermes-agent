@@ -11,7 +11,7 @@ from __future__ import annotations
 import os
 from typing import Any, Iterable, Optional
 
-from agent.delegation_context import owned_kanban_task
+from agent.delegation_context import is_kanban_goal_driver_context, owned_kanban_task
 
 
 # Every tool that ends this worker's responsibility for the card, not just the two that
@@ -35,7 +35,11 @@ def kanban_stop_nudge_enabled() -> bool:
     inherit the env var but own no board task and carry no kanban toolset."""
     if (os.environ.get("HERMES_KANBAN_STOP_NUDGE") or "").strip().lower() in {"0", "false", "no", "off"}:
         return False
-    return bool(owned_kanban_task())
+    # The native goal driver owns unfinished worker turns until its judge
+    # decides whether another turn or a terminal board transition is needed.
+    # It enters this scope only after validating the live dispatcher run; a
+    # mere HERMES_KANBAN_GOAL_MODE marker remains insufficient.
+    return bool(owned_kanban_task()) and not is_kanban_goal_driver_context()
 
 
 def _tool_call_name(tc: Any) -> str:

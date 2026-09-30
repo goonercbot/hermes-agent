@@ -1631,12 +1631,13 @@ class GoalManager:
 KANBAN_GOAL_CONTINUATION_TEMPLATE = (
     "[Continuing toward this kanban task — judge says it is not done yet]\n"
     "Reason: {reason}\n\n"
-    "Take the next concrete step toward completing the task. When the work "
-    "is genuinely finished, call kanban_complete with a summary. If it is a "
-    "code change that needs same-card review before counting as done, call "
-    "kanban_request_review with a summary instead. If you are blocked and "
-    "need human input, call kanban_block with a reason. Do not stop without "
-    "calling one of them."
+    "Take the next concrete step toward completing the task. If the work is "
+    "still unfinished after this turn, report concrete progress; the goal "
+    "driver will judge it and continue you. When the work is genuinely finished, "
+    "call kanban_complete with a summary. If it is a code change that needs "
+    "same-card review before counting as done, call kanban_request_review with "
+    "a summary instead. If you are blocked and need human input, call "
+    "kanban_block with a reason."
 )
 
 # Judge says done but the worker never made a terminal board call

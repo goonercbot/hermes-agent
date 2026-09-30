@@ -13,7 +13,7 @@ import os
 import sys
 import time
 from agent.interrupt_compat import request_hard_interrupt
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +30,40 @@ def _int_or(value, default: int) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+@contextmanager
+def _kanban_goal_driver_context():
+    """Enter the stop-guard exemption only for this live native goal driver.
+
+    The dispatcher environment is process-scoped and can outlive a claim or be
+    inherited by a child.  Verify the task, run and mode against the board
+    before the first worker turn as well as before continuation turns.
+    """
+    from agent.delegation_context import kanban_goal_driver_context, owned_kanban_task
+
+    task_id = owned_kanban_task()
+    raw_run_id = (os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip()
+    run_id = _int_or(raw_run_id, -1) if raw_run_id else -1
+    if os.environ.get("HERMES_KANBAN_GOAL_MODE") != "1" or not task_id or run_id < 1:
+        yield False
+        return
+
+    try:
+        from hermes_cli import kanban_db as _kb
+        from hermes_cli import kanban_db_connect as _kbc
+
+        with _kbc.connect_closing() as conn:
+            task = _kb.get_task(conn, task_id)
+            status = _kb.goal_run_status(conn, task_id, run_id)
+    except Exception:
+        yield False
+        return
+    if task is None or not task.goal_mode or status != "running":
+        yield False
+        return
+    with kanban_goal_driver_context():
+        yield True
 
 
 def _interrupt_agent_for_signal(agent, signum) -> None:
@@ -95,12 +129,15 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str, run_turn=None
         with _kbc.connect_closing() as c:
             _kb.block_task(c, task_id, reason=reason, expected_run_id=worker_run_id)
 
-    _run_loop(
-        task_id=task_id, goal_text=goal_text, run_turn=run_turn or _quiet_turn,
-        task_status_fn=_task_status, block_fn=_block,
-        max_turns=task.goal_max_turns or _DEF_TURNS, first_response=first_response or "",
-        log=log or (lambda m: logger.info("%s", m)),
-    )
+    # This scope covers every continued turn.  The initial turn enters the
+    # same validated scope at its single-query caller below.
+    with _kanban_goal_driver_context():
+        _run_loop(
+            task_id=task_id, goal_text=goal_text, run_turn=run_turn or _quiet_turn,
+            task_status_fn=_task_status, block_fn=_block,
+            max_turns=task.goal_max_turns or _DEF_TURNS, first_response=first_response or "",
+            log=log or (lambda m: logger.info("%s", m)),
+        )
 
 
 def _run_kanban_goal_loop_chat(cli: "HermesCLI", first_response: str) -> None:
@@ -201,9 +238,14 @@ def _run_quiet_single_query(cli, effective_query, emitter=None):
     author_kwargs = {"turn_author": author} if author is not None and _accepts_keyword(cli.agent.run_conversation, "turn_author") else {}
     with bind_quiet_session_key(getattr(cli, "session_id", "") or "default"):
         try:
-            result = cli.agent.run_conversation(
-                user_message=effective_query, conversation_history=cli.conversation_history, **author_kwargs,
-            )
+            # The first worker turn must be inside the same verified driver
+            # scope as continuations; otherwise its plain unfinished response
+            # is intercepted by the ordinary terminal-worker stop guard before
+            # the goal judge can run.
+            with _kanban_goal_driver_context():
+                result = cli.agent.run_conversation(
+                    user_message=effective_query, conversation_history=cli.conversation_history, **author_kwargs,
+                )
         except KeyboardInterrupt:
             _emit_interrupted_session_end(cli, reason="keyboard_interrupt")
             if emitter is not None:
@@ -499,7 +541,10 @@ def _run_single_query_mode(cli, query, image, quiet, oneshot, stream_json: bool 
         if _query_label:
             cli.console.print(f"[bold blue]Query:[/] {_query_label}")
         cli._show_security_advisories()
-        response = cli.chat(query, images=single_query_images or None)
+        # Non-quiet workers use the same native goal-driver scope for their
+        # first turn; their follow-up turns enter it in _run_kanban_goal_loop_q.
+        with _kanban_goal_driver_context():
+            response = cli.chat(query, images=single_query_images or None)
         # Kanban goal_mode on the `-q` path: same judge loop as `-Q`, but each follow-up turn
         # runs through cli.chat so the worker log keeps its live tool feed (the dispatcher
         # used to force -Q here, which left goal_mode cards with a blank Worker log).

@@ -1641,8 +1641,33 @@ def _has_fresh_dependency_release(
         break
     if latest_owner_run_ended_at is None:
         return False
+    # Parent deletion removes its events and links without recording an unlink
+    # on surviving children. Reconcile their retained link history in the same
+    # SQLite read snapshot; missing history must not manufacture a release.
     return conn.execute(
         """
+        WITH link_events AS (
+            SELECT id, kind, json_extract(
+                CASE WHEN json_valid(payload) THEN payload ELSE '{}' END,
+                '$.parent') AS parent_id
+              FROM task_events
+             WHERE task_id = ? AND kind IN ('linked', 'unlinked')
+            UNION ALL
+            SELECT creation.id, 'linked', initial_parent.value
+              FROM task_events creation, json_each(
+                  CASE WHEN json_valid(creation.payload) THEN creation.payload ELSE '{}' END,
+                  '$.parents') initial_parent
+             WHERE creation.task_id = ? AND creation.kind = 'created'
+               AND json_type(
+                   CASE WHEN json_valid(creation.payload) THEN creation.payload ELSE '{}' END,
+                   '$.parents') = 'array'
+        ), active_history AS (
+            SELECT edge.parent_id, edge.id FROM link_events edge
+             WHERE edge.kind = 'linked' AND NOT EXISTS (
+                 SELECT 1 FROM link_events later
+                  WHERE later.parent_id = edge.parent_id AND later.id > edge.id
+             )
+        )
         SELECT 1
           FROM task_links l
           JOIN tasks parent ON parent.id = l.parent_id
@@ -1662,30 +1687,23 @@ def _has_fresh_dependency_release(
            AND parent.completed_at > ?
            AND parent.completed_at > ?
            AND EXISTS (
-               SELECT 1 FROM task_events linked
-                WHERE linked.task_id = l.child_id
-                  AND linked.id < parent_completed.id
-                  AND (
-                      (linked.kind = 'linked' AND json_extract(
-                          CASE WHEN json_valid(linked.payload) THEN linked.payload ELSE '{}' END,
-                          '$.parent') = l.parent_id)
-                      OR (linked.kind = 'created' AND json_type(
-                          CASE WHEN json_valid(linked.payload) THEN linked.payload ELSE '{}' END,
-                          '$.parents') = 'array' AND EXISTS (
-                          SELECT 1 FROM json_each(
-                              CASE WHEN json_valid(linked.payload) THEN linked.payload ELSE '{}' END,
-                              '$.parents') initial_parent
-                           WHERE initial_parent.value = l.parent_id
-                      ))
-                  )
-                  AND NOT EXISTS (
-                      SELECT 1 FROM task_events unlinked
-                       WHERE unlinked.task_id = l.child_id AND unlinked.kind = 'unlinked'
-                         AND unlinked.id > linked.id AND unlinked.id < parent_completed.id
-                         AND json_extract(
-                             CASE WHEN json_valid(unlinked.payload) THEN unlinked.payload ELSE '{}' END,
-                             '$.parent') = l.parent_id
-                  )
+               SELECT 1 FROM task_events creation
+                WHERE creation.task_id = l.child_id AND creation.kind = 'created'
+                  AND json_type(
+                      CASE WHEN json_valid(creation.payload) THEN creation.payload ELSE '{}' END,
+                      '$.parents') = 'array'
+           )
+           AND NOT EXISTS (
+               SELECT parent_id FROM active_history
+               EXCEPT SELECT parent_id FROM task_links WHERE child_id = l.child_id
+           )
+           AND NOT EXISTS (
+               SELECT parent_id FROM task_links WHERE child_id = l.child_id
+               EXCEPT SELECT parent_id FROM active_history
+           )
+           AND EXISTS (
+               SELECT 1 FROM active_history linked
+                WHERE linked.parent_id = l.parent_id AND linked.id < parent_completed.id
            )
            AND EXISTS (
                SELECT 1
@@ -1705,7 +1723,7 @@ def _has_fresh_dependency_release(
            )
          LIMIT 1
         """,
-        (task_id, pr_created_at, latest_owner_run_ended_at),
+        (task_id, task_id, task_id, pr_created_at, latest_owner_run_ended_at),
     ).fetchone() is not None
 
 

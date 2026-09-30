@@ -882,6 +882,36 @@ def test_dependency_release_rejects_unlink_triggered_promotion(
         assert kbd.check_respawn_guard(conn, owner_id) == "active_pr"
 
 
+@pytest.mark.parametrize("archive_first", [False, True])
+def test_dependency_release_rejects_deleted_prerequisite_history(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch, archive_first: bool,
+) -> None:
+    now = [50_000]
+    monkeypatch.setattr(kb.time, "time", lambda: now[0])
+
+    def advance() -> None:
+        now[0] += 10
+
+    with kbc.connect() as conn:
+        unfinished, owner_id = _dependency_parked_pr_owner(conn, advance)
+        other = kb.create_task(conn, title="other", assignee="repairer")
+        kb.link_tasks(conn, other, owner_id)
+        advance()
+        assert kb.complete_task(conn, other, result="other complete")
+        assert kbd.check_respawn_guard(conn, owner_id) == "active_pr"
+        advance()
+        if archive_first:
+            assert kb.archive_task(conn, unfinished)
+            assert kbd.check_respawn_guard(conn, owner_id) == "active_pr"
+            advance()
+            assert kb.delete_archived_task(conn, unfinished)
+        else:
+            assert kb.delete_task(conn, unfinished)
+        owner = kb.get_task(conn, owner_id)
+        assert owner is not None and owner.status == "ready"
+        assert kbd.check_respawn_guard(conn, owner_id) == "active_pr"
+
+
 def test_dispatch_json_exposes_suppression_reasons(
     kanban_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

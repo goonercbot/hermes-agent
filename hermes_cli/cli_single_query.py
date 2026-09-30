@@ -38,7 +38,7 @@ def _kanban_goal_driver_context():
 
     The dispatcher environment is process-scoped and can outlive a claim or be
     inherited by a child.  Verify the task, run and mode against the board
-    before the first worker turn as well as before continuation turns.
+    before the first worker turn and before entering the continuation sequence.
     """
     from agent.delegation_context import kanban_goal_driver_context, owned_kanban_task
 
@@ -236,6 +236,7 @@ def _run_quiet_single_query(cli, effective_query, emitter=None):
     # A dispatcher's re-run of a failed bot delivery resumes the DM row its first attempt persisted.
     adopt_unanswered_turn(cli, effective_query)
     author_kwargs = {"turn_author": author} if author is not None and _accepts_keyword(cli.agent.run_conversation, "turn_author") else {}
+    result = None
     with bind_quiet_session_key(getattr(cli, "session_id", "") or "default"):
         try:
             # The first worker turn must be inside the same verified driver
@@ -314,9 +315,12 @@ def _run_quiet_single_query(cli, effective_query, emitter=None):
     elif response:
         print(response)
 
-    # Kanban goal_mode: keep working in THIS session until a judge agrees the card is
-    # done, the worker terminates it, or the turn budget runs out (sticky block).
-    if os.environ.get("HERMES_KANBAN_GOAL_MODE") == "1":
+    # An inner agent execution cap, failure, partial result, or interrupt is
+    # already the authoritative one-shot outcome. Do not spend a goal turn
+    # after it: the dispatcher must receive that real exit code and retain the
+    # active task/run for its established failure or interruption handling.
+    if (os.environ.get("HERMES_KANBAN_GOAL_MODE") == "1"
+            and _single_query_exit_code(result) == 0):
         try:
             _run_kanban_goal_loop_q(cli, response)
         except Exception as _goal_exc:
@@ -545,10 +549,13 @@ def _run_single_query_mode(cli, query, image, quiet, oneshot, stream_json: bool 
         # first turn; their follow-up turns enter it in _run_kanban_goal_loop_q.
         with _kanban_goal_driver_context():
             response = cli.chat(query, images=single_query_images or None)
+        # An agent cap / failure / partial result / interrupt owns this process's
+        # outcome. Never launch an extra judge-driven model turn after it.
+        turn_exit_code = _single_query_exit_code(cli._last_turn_result)
         # Kanban goal_mode on the `-q` path: same judge loop as `-Q`, but each follow-up turn
         # runs through cli.chat so the worker log keeps its live tool feed (the dispatcher
         # used to force -Q here, which left goal_mode cards with a blank Worker log).
-        if os.environ.get("HERMES_KANBAN_GOAL_MODE") == "1":
+        if os.environ.get("HERMES_KANBAN_GOAL_MODE") == "1" and turn_exit_code == 0:
             try:
                 _run_kanban_goal_loop_chat(cli, response or "")
             except Exception as _goal_exc:
@@ -556,6 +563,6 @@ def _run_single_query_mode(cli, query, image, quiet, oneshot, stream_json: bool 
         cli._print_exit_summary(clear_screen=False)
         # Same exit contract as `-Q`: scripts and the Kanban dispatcher read the outcome from
         # the exit code. This path used to fall through to an implicit 0 for every outcome.
-        exit_single_query(_single_query_exit_code(cli._last_turn_result))
+        exit_single_query(turn_exit_code)
     finally:
         _finalize_single_query(cli)

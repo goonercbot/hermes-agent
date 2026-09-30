@@ -110,8 +110,17 @@ class CLIChatTurnMixin:
                 # Per-prompt elapsed timer — frozen when the agent thread finishes.
                 self._prompt_start_time = time.time()
                 self._prompt_duration = 0.0
+                # Threads do not inherit ContextVars on Python 3.11. Carry only the
+                # already-validated native goal-driver ownership into this actual
+                # agent thread; copying the ambient Context would also copy unrelated
+                # delegated/non-dispatcher state into a new execution context.
+                from agent.delegation_context import is_kanban_goal_driver_context
+                goal_driver_owned = is_kanban_goal_driver_context()
                 # Daemon: closing the terminal tab (SIGHUP) must not be kept alive by it.
-                agent_thread = threading.Thread(target=self._chat_run_agent, args=(turn, message), daemon=True)
+                agent_thread = threading.Thread(
+                    target=self._chat_run_agent_with_goal_driver_context,
+                    args=(turn, message, goal_driver_owned), daemon=True,
+                )
                 agent_thread.start()
                 interrupt_msg = self._chat_monitor_agent_thread(turn, agent_thread)
                 self._chat_settle_turn(turn)
@@ -302,6 +311,22 @@ class CLIChatTurnMixin:
         if voice_input and isinstance(message, str):
             turn.voice_prefix = ("[Voice input — respond concisely and conversationally, "
                                  "2-3 sentences max. No code blocks or markdown.] ")
+
+    def _chat_run_agent_with_goal_driver_context(self, turn, message, goal_driver_owned: bool):
+        """Run the agent-thread body with the caller's validated native goal scope only.
+
+        ``threading.Thread`` starts from an empty ContextVar context on supported
+        Python versions.  The Boolean is captured at the native chat boundary,
+        where the single-query driver has already checked the task/run; do not
+        use ``copy_context`` here because a delegated or cron child must never
+        inherit a dispatcher-owner exemption.
+        """
+        if not goal_driver_owned:
+            return self._chat_run_agent(turn, message)
+        from agent.delegation_context import kanban_goal_driver_context
+
+        with kanban_goal_driver_context():
+            return self._chat_run_agent(turn, message)
 
     def _chat_run_agent(self, turn, message):
         """Agent-thread body: bind per-thread callbacks/approval key, prepend one-shot notes, run the turn."""

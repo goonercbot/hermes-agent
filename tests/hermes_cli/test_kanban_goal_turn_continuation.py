@@ -7,6 +7,7 @@ model responses.  They prove control flow, not provider autonomy.
 from __future__ import annotations
 
 import os
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -54,6 +55,8 @@ class _StopGateProbe:
         self.responses = iter(("concrete step one", "concrete step two", "concrete step three"))
         self.stop_gate_continues: list[bool] = []
         self.prompts: list[str] = []
+        self.thread_ids: list[int] = []
+        self._pending_cli_user_message = {"display_metadata": None}
 
     def _turn(self) -> str:
         response = next(self.responses)
@@ -72,6 +75,7 @@ class _StopGateProbe:
 
     def run_conversation(self, **kwargs):
         self.prompts.append(kwargs["user_message"])
+        self.thread_ids.append(threading.get_ident())
         return {"final_response": self._turn(), "messages": []}
 
     def chat(self, prompt, **_kwargs):
@@ -134,8 +138,148 @@ def test_native_goal_driver_reaches_repeated_continuations_without_terminalizing
     assert task is not None and task.status == "blocked", "the unchanged goal budget fails closed"
 
 
+def test_nonquiet_goal_driver_carries_only_validated_scope_into_real_agent_threads(
+    monkeypatch, _isolated_kanban_goal_worker,
+):
+    """``-q`` first and continued turns cross the actual CLI Thread boundary.
+
+    Python does not inherit ContextVars into ``threading.Thread``. This test uses
+    the native chat entry point (rather than replacing ``cli.chat`` with a
+    synchronous probe) so a stop-gate result proves the scope reached each
+    worker thread.
+    """
+    probe = _StopGateProbe()
+    shell = cli.HermesCLI(compact=True, max_turns=1)
+    shell.agent = probe
+
+    monkeypatch.setattr(goals, "judge_goal", lambda *a, **k: (
+        "continue", "another concrete step is required", False, None, False,
+    ))
+    monkeypatch.setattr(cli, "_should_seed_interactive", lambda *a, **k: False)
+    monkeypatch.setattr(cli, "_collect_query_images", lambda query, image: (query, []))
+    monkeypatch.setattr(cli, "_collect_kanban_task_images", lambda images: [])
+    monkeypatch.setattr(cli, "_finalize_single_query", lambda worker: None)
+    monkeypatch.setattr(shell, "_claim_active_session", lambda *a, **k: True)
+    monkeypatch.setattr(shell, "_show_security_advisories", lambda: None)
+    monkeypatch.setattr(shell, "_print_exit_summary", lambda **k: None)
+    monkeypatch.setattr(shell, "_ensure_runtime_credentials", lambda: True)
+    monkeypatch.setattr(shell, "_resolve_turn_agent_config", lambda message: {
+        "signature": shell._active_agent_route_signature, "model": None, "runtime": None,
+    })
+    monkeypatch.setattr(shell, "_init_agent", lambda **kwargs: True)
+    monkeypatch.setattr(shell, "_sync_fallback_chain_with_config", lambda agent: None)
+    monkeypatch.setattr(shell, "_chat_route_images", lambda message, images: message)
+    monkeypatch.setattr(shell, "_chat_expand_context_references", lambda message: (message, None))
+    monkeypatch.setattr(shell, "_chat_stage_user_message", lambda agent, message: None)
+    monkeypatch.setattr(shell, "_reset_stream_state", lambda: None)
+    monkeypatch.setattr(shell, "_chat_setup_turn_audio", lambda turn, message, voice_input: None)
+    monkeypatch.setattr(shell, "_chat_monitor_agent_thread", lambda turn, thread: (thread.join(5), None)[1])
+    monkeypatch.setattr(shell, "_chat_settle_turn", lambda turn: setattr(shell, "_last_turn_result", turn.result))
+    monkeypatch.setattr(shell, "_chat_render_turn", lambda turn, thread, interrupt: turn.result["final_response"])
+    monkeypatch.setattr(shell, "_chat_release_turn_audio", lambda turn: None)
+    monkeypatch.setattr(shell, "_flush_credit_notices", lambda: None)
+
+    with pytest.raises(SystemExit) as exc:
+        cli._run_single_query_mode(shell, "start the task", None, False, True)
+
+    assert exc.value.code == 0
+    assert probe.stop_gate_continues == [False, False, False]
+    assert len(probe.thread_ids) == 3
+    assert all(thread_id != threading.get_ident() for thread_id in probe.thread_ids)
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, _isolated_kanban_goal_worker)
+    assert task is not None and task.status == "blocked"
+
+
+class _OneShotResultAgent:
+    def __init__(self, result):
+        self.result = result
+        self.calls = 0
+        self.session_id = "one-shot-goal-worker"
+
+    def run_conversation(self, **_kwargs):
+        self.calls += 1
+        return dict(self.result)
+
+
+@pytest.mark.parametrize("quiet", [True, False], ids=["quiet", "nonquiet"])
+@pytest.mark.parametrize(
+    ("turn_result", "expected_exit"),
+    [
+        ({"final_response": "budget hit", "completed": False, "api_calls": 500}, 1),
+        ({"final_response": "failed", "failed": True, "failure_reason": "task_error"}, 1),
+        ({"final_response": "partial", "partial": True, "completed": False}, 1),
+        ({"final_response": "cancelled", "interrupted": True, "completed": False}, 130),
+    ],
+    ids=["inner-cap", "failed", "partial", "interrupted"],
+)
+def test_goal_mode_preserves_unsuccessful_inner_turn_exit_without_another_model_turn(
+    monkeypatch, _isolated_kanban_goal_worker, quiet, turn_result, expected_exit,
+):
+    """The real one-shot entries retain cap/failure/partial/interrupt outcomes.
+
+    A goal loop owns only a successful completed turn. In particular, it must
+    not turn an inner execution cap into an extra model call or a sticky block.
+    """
+    loop_calls = []
+    agent = _OneShotResultAgent(turn_result)
+    chat_calls = []
+    monkeypatch.setattr(cli, "_should_seed_interactive", lambda *a, **k: False)
+    monkeypatch.setattr(cli, "_collect_query_images", lambda query, image: (query, []))
+    monkeypatch.setattr(cli, "_collect_kanban_task_images", lambda images: [])
+    monkeypatch.setattr(cli, "_finalize_single_query", lambda worker: None)
+    monkeypatch.setattr(cli, "_run_kanban_goal_loop_q", lambda *a, **k: loop_calls.append("quiet"))
+    monkeypatch.setattr(cli, "_run_kanban_goal_loop_chat", lambda *a, **k: loop_calls.append("nonquiet"))
+
+    if quiet:
+        from hermes_cli import quiet_single_query
+
+        monkeypatch.setattr(quiet_single_query, "continue_quiet_notify_completions", lambda *a, **k: None)
+        worker = SimpleNamespace(
+            _single_query_mode=False,
+            _claim_active_session=lambda *a, **k: True,
+            _ensure_runtime_credentials=lambda: True,
+            _resolve_turn_agent_config=lambda query: {"signature": None, "model": None, "runtime": None},
+            _active_agent_route_signature=None,
+            _init_agent=lambda **kwargs: True,
+            tool_progress_mode="all",
+            agent=agent,
+            conversation_history=[],
+            session_id=agent.session_id,
+            model="scripted",
+        )
+    else:
+
+        def _chat(*_args, **_kwargs):
+            chat_calls.append("initial")
+            return str(turn_result.get("final_response") or "")
+
+        worker = SimpleNamespace(
+            _single_query_mode=False,
+            _claim_active_session=lambda *a, **k: True,
+            console=SimpleNamespace(print=lambda *a, **k: None),
+            _show_security_advisories=lambda: None,
+            chat=_chat,
+            _print_exit_summary=lambda **k: None,
+            _last_turn_result=turn_result,
+        )
+
+    with pytest.raises(SystemExit) as exc:
+        cli._run_single_query_mode(worker, "start the task", None, quiet, True)
+
+    assert exc.value.code == expected_exit
+    assert loop_calls == []
+    if quiet:
+        assert agent.calls == 1
+    else:
+        assert chat_calls == ["initial"]
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, _isolated_kanban_goal_worker)
+    assert task is not None and task.status == "running"
+
+
 def test_goal_driver_scope_requires_live_owned_run_and_restores_the_guard(
-    _isolated_kanban_goal_worker,
+    monkeypatch, _isolated_kanban_goal_worker,
 ):
     """Goal-mode env alone, a descendant, and a terminated claim cannot bypass the guard."""
     from agent.delegation_context import delegated_child_context
@@ -145,6 +289,25 @@ def test_goal_driver_scope_requires_live_owned_run_and_restores_the_guard(
         assert kanban_stop_nudge_enabled() is False
     assert kanban_stop_nudge_enabled() is True
     assert not is_kanban_goal_driver_context()
+
+    # A normal Kanban worker remains nudged when goal mode is disabled, and
+    # stale/mismatched dispatcher markers cannot manufacture the exemption.
+    monkeypatch.delenv("HERMES_KANBAN_GOAL_MODE")
+    with cli._kanban_goal_driver_context() as active:
+        assert active is False
+        assert kanban_stop_nudge_enabled() is True
+    monkeypatch.setenv("HERMES_KANBAN_GOAL_MODE", "1")
+    live_run_id = os.environ["HERMES_KANBAN_RUN_ID"]
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "999999")
+    with cli._kanban_goal_driver_context() as active:
+        assert active is False
+        assert kanban_stop_nudge_enabled() is True
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", live_run_id)
+    monkeypatch.delenv("HERMES_KANBAN_TASK")
+    with cli._kanban_goal_driver_context() as active:
+        assert active is False
+        assert kanban_stop_nudge_enabled() is False
+    monkeypatch.setenv("HERMES_KANBAN_TASK", _isolated_kanban_goal_worker)
 
     with pytest.raises(RuntimeError):
         with cli._kanban_goal_driver_context() as active:
@@ -177,10 +340,12 @@ def test_goal_driver_scope_requires_live_owned_run_and_restores_the_guard(
         ("review", "review_requested_by_worker"),
         ("changes_requested", "changes_requested_by_reviewer"),
         ("done", "completed_by_worker"),
+        # A dependency block is parked as todo rather than reopened as a goal turn.
+        ("todo", "stopped"),
     ],
 )
-def test_goal_loop_preserves_terminal_handoffs_without_reopening(status, outcome):
-    """Blocks (including dependency/input waits) and review ownership end before judging."""
+def test_goal_loop_preserves_handoffs_and_dependency_parks_without_reopening(status, outcome):
+    """Blocks (including dependency/input waits), review ownership and done end before judging."""
     result = goals.run_kanban_goal_loop(
         task_id="t_terminal",
         goal_text="do not reopen terminal handoffs",

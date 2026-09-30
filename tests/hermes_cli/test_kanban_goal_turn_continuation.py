@@ -117,12 +117,17 @@ def test_native_goal_driver_reaches_repeated_continuations_without_terminalizing
         monkeypatch.setattr(cli, "_collect_query_images", lambda query, image: (query, []))
         monkeypatch.setattr(cli, "_collect_kanban_task_images", lambda images: [])
         monkeypatch.setattr(cli, "_finalize_single_query", lambda worker: None)
+        def _chat(prompt, **kwargs):
+            response = probe.chat(prompt, **kwargs)
+            worker._last_turn_result = {"final_response": response}
+            return response
+
         worker = SimpleNamespace(
             _single_query_mode=False,
             _claim_active_session=lambda *args, **kwargs: True,
             console=SimpleNamespace(print=lambda *args, **kwargs: None),
             _show_security_advisories=lambda: None,
-            chat=probe.chat,
+            chat=_chat,
             _print_exit_summary=lambda **kwargs: None,
             _last_turn_result={"final_response": "concrete step one"},
         )
@@ -199,6 +204,8 @@ class _OneShotResultAgent:
 
     def run_conversation(self, **_kwargs):
         self.calls += 1
+        if isinstance(self.result, Exception):
+            raise self.result
         return dict(self.result)
 
 
@@ -210,11 +217,15 @@ class _OneShotResultAgent:
         ({"final_response": "failed", "failed": True, "failure_reason": "task_error"}, 1),
         ({"final_response": "partial", "partial": True, "completed": False}, 1),
         ({"final_response": "cancelled", "interrupted": True, "completed": False}, 130),
+        ({"final_response": "rate limited", "failed": True, "failure_reason": "rate_limit"}, kb.KANBAN_RATE_LIMIT_EXIT_CODE),
+        ({"final_response": "auth rejected", "failed": True, "failure_reason": "auth"}, kb.KANBAN_TERMINAL_PROVIDER_EXIT_CODE),
+        (RuntimeError("turn raised"), 1),
     ],
-    ids=["inner-cap", "failed", "partial", "interrupted"],
+    ids=["inner-cap", "failed", "partial", "interrupted", "rate-limit", "auth", "exception"],
 )
+@pytest.mark.parametrize("failure_turn", [1, 2], ids=["initial", "continued"])
 def test_goal_mode_preserves_unsuccessful_inner_turn_exit_without_another_model_turn(
-    monkeypatch, _isolated_kanban_goal_worker, quiet, turn_result, expected_exit,
+    monkeypatch, _isolated_kanban_goal_worker, quiet, turn_result, expected_exit, failure_turn,
 ):
     """The real one-shot entries retain cap/failure/partial/interrupt outcomes.
 
@@ -222,14 +233,30 @@ def test_goal_mode_preserves_unsuccessful_inner_turn_exit_without_another_model_
     not turn an inner execution cap into an extra model call or a sticky block.
     """
     loop_calls = []
+    if failure_turn == 1 and isinstance(turn_result, Exception):
+        pytest.skip("This regression exercises continuation exceptions; initial CLI exceptions are separate.")
     agent = _OneShotResultAgent(turn_result)
     chat_calls = []
+    if failure_turn == 2:
+        original_run = agent.run_conversation
+
+        def _run(**kwargs):
+            if agent.calls == 0:
+                agent.calls += 1
+                return {"final_response": "concrete progress", "completed": True}
+            return original_run(**kwargs)
+
+        monkeypatch.setattr(agent, "run_conversation", _run)
+        monkeypatch.setattr(goals, "judge_goal", lambda *a, **k: (
+            "continue", "another step is required", False, None, False,
+        ))
     monkeypatch.setattr(cli, "_should_seed_interactive", lambda *a, **k: False)
     monkeypatch.setattr(cli, "_collect_query_images", lambda query, image: (query, []))
     monkeypatch.setattr(cli, "_collect_kanban_task_images", lambda images: [])
     monkeypatch.setattr(cli, "_finalize_single_query", lambda worker: None)
-    monkeypatch.setattr(cli, "_run_kanban_goal_loop_q", lambda *a, **k: loop_calls.append("quiet"))
-    monkeypatch.setattr(cli, "_run_kanban_goal_loop_chat", lambda *a, **k: loop_calls.append("nonquiet"))
+    if failure_turn == 1:
+        monkeypatch.setattr(cli, "_run_kanban_goal_loop_q", lambda *a, **k: loop_calls.append("quiet"))
+        monkeypatch.setattr(cli, "_run_kanban_goal_loop_chat", lambda *a, **k: loop_calls.append("nonquiet"))
 
     if quiet:
         from hermes_cli import quiet_single_query
@@ -251,8 +278,9 @@ def test_goal_mode_preserves_unsuccessful_inner_turn_exit_without_another_model_
     else:
 
         def _chat(*_args, **_kwargs):
-            chat_calls.append("initial")
-            return str(turn_result.get("final_response") or "")
+            chat_calls.append("turn")
+            worker._last_turn_result = agent.run_conversation()
+            return str(worker._last_turn_result.get("final_response") or "")
 
         worker = SimpleNamespace(
             _single_query_mode=False,
@@ -269,10 +297,9 @@ def test_goal_mode_preserves_unsuccessful_inner_turn_exit_without_another_model_
 
     assert exc.value.code == expected_exit
     assert loop_calls == []
-    if quiet:
-        assert agent.calls == 1
-    else:
-        assert chat_calls == ["initial"]
+    assert agent.calls == failure_turn
+    if not quiet:
+        assert len(chat_calls) == failure_turn
     with kbc.connect() as conn:
         task = kb.get_task(conn, _isolated_kanban_goal_worker)
     assert task is not None and task.status == "running"

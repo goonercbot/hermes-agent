@@ -171,6 +171,53 @@ JUDGE_SYSTEM_PROMPT = (
     "accepted (true=done, false=continue)."
 )
 
+# Review readiness is a different decision, not an exception to full completion.
+# Keep the original task/criteria as evidence; change only the evaluation target.
+REVIEW_HANDOFF_SYSTEM_PROMPT = (
+    "You are a strict implementation-readiness judge for a review request that "
+    "has NOT executed yet. Decide whether the implementation is finished and "
+    "ready to hand off to a reviewer, NOT whether the whole task is completed.\n\n"
+    "Read the original task and supplied criteria to identify the implementation "
+    "stage and its explicit pre-review prerequisites. Judge the handoff report, "
+    "not an independent audit of the work. An explicit implementation-complete "
+    "report supported by an existing candidate and reported checks is readiness "
+    "evidence, not final acceptance. Do not infer that a historical step was "
+    "skipped solely because this short handoff does not repeat its transcript. "
+    "Reject reported unfinished implementation, unmet pre-review prerequisites, "
+    "constraint violations, or contradictions with the task. Requested repairs "
+    "from an earlier review are implementation work and must also be complete. "
+    "Continue to reject missing implementation or failing required tests. "
+    "Work explicitly assigned to later owner acceptance, installation or delivery "
+    "is not an implementation prerequisite.\n\n"
+    "The current review request, independent-review execution itself and its "
+    "verdict are what this handoff enables, not prerequisites to it. Never require "
+    "the independent review to start or finish before allowing its own handoff; "
+    "do not withhold DONE merely because reviewer/approval evidence is absent. "
+    "Publication or delivery required ONLY AFTER review/approval is a later phase. "
+    "If the task explicitly requires publication or another action BEFORE review, "
+    "require evidence of that prerequisite. Do not waive implementation criteria "
+    "or treat deferred phases as satisfied for final completion.\n\n"
+    "DONE means the implementation and pre-review prerequisites are evidenced "
+    "and ready for review. CONTINUE means implementation evidence is missing, "
+    "tests fail, or concrete implementation work remains; use this when unsure. "
+    "BLOCKED means an implementation prerequisite needs external input; name only "
+    "the blocker evidenced in the response. WAIT means required implementation "
+    "work is genuinely waiting on a supplied running background process or "
+    "delegation; include its wait_on_session, wait_on_pid or wait_for_seconds.\n\n"
+    "Reply ONLY with one JSON object: {\"verdict\": "
+    "\"done|continue|blocked|wait\", \"reason\": \"one sentence\"}, "
+    "plus the applicable wait field only for wait."
+)
+
+REVIEW_HANDOFF_USER_PROMPT_TEMPLATE = (
+    "Evaluation target: implementation-ready handoff (not final completion).\n\n"
+    "Original task (binding requirements; distinguish implementation from later phases):\n"
+    "{goal}\n\n{criteria_block}"
+    "Agent's latest implementation evidence:\n{response}\n\n"
+    "{background_block}Current time: {current_time}\n\n"
+    "Is this implementation ready to enter the requested review?"
+)
+
 # Judge prompt line for live delegated subagents (WAIT-for-seconds vs CONTINUE).
 JUDGE_DELEGATIONS_BLOCK_TEMPLATE = (
     "Active delegations: the agent has {count} delegated subagent batch(es) still running; "
@@ -911,6 +958,8 @@ def judge_goal(
         + (JUDGE_DELEGATIONS_BLOCK_TEMPLATE.format(count=active_delegations) if active_delegations > 0 else ""),
         current_time=safe_strftime(datetime.now(tz=timezone.utc).astimezone(), "%Y-%m-%d %H:%M:%S %Z"),
     )
+    contract_block = ""
+    subgoals_block = ""
     if contract is not None and not contract.is_empty():
         contract_block = contract.render_block()
         if clean_subgoals:
@@ -922,24 +971,24 @@ def judge_goal(
     else:
         prompt = JUDGE_USER_PROMPT_TEMPLATE.format(**common)
 
-    try:
-        # Scope review separately: never spend the existing task-text budget
-        # on the readiness instruction or hide previously visible criteria.
-        system_prompt = JUDGE_SYSTEM_PROMPT
-        if review_handoff:
-            system_prompt += (
-                "\n\nJudging note: this checks whether the implementation work described "
-                "in the task is finished and ready to hand off to a reviewer — it does not "
-                "check whether the card as a whole is done. If the card's own criteria "
-                "call for a reviewer to approve or close out the work, treat that as a "
-                "later step outside this check: do not withhold DONE merely because "
-                "reviewer/approval evidence is absent."
-                "\n\nFor this handoff, independent-review execution itself, "
-                "a review verdict, and final delivery are later phases, not implementation "
-                "requirements. Never require the independent review to start or finish before "
-                "allowing this handoff. Continue to reject missing implementation or failing "
-                "required tests."
+    if review_handoff:
+        criteria_block = ""
+        if contract is not None and not contract.is_empty():
+            criteria_block = (
+                "Original contract and criteria (binding; assess their implementation stage):\n"
+                + _truncate(contract_block, 2500) + "\n\n"
             )
+        elif clean_subgoals:
+            criteria_block = (
+                "Additional criteria (binding; assess their implementation stage):\n"
+                + _truncate(subgoals_block, 2000) + "\n\n"
+            )
+        prompt = REVIEW_HANDOFF_USER_PROMPT_TEMPLATE.format(
+            criteria_block=criteria_block, **common)
+
+    try:
+        # Choose one coherent decision target. Full completion remains unchanged.
+        system_prompt = REVIEW_HANDOFF_SYSTEM_PROMPT if review_handoff else JUDGE_SYSTEM_PROMPT
         raw = _call_goal_judge_llm(call_llm, system_prompt, prompt, timeout)
     except AuxiliaryClientUnavailable as exc:
         # No client at all (e.g. a dead Nous refresh token): name the cause so the user is sent to

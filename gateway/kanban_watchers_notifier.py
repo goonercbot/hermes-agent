@@ -10,6 +10,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import re
+import shlex
+import unicodedata
 from functools import partial
 from pathlib import Path
 import weakref
@@ -361,29 +363,55 @@ def _payload(ev: Any, key: str) -> Any:
     return ev.payload.get(key) if ev.payload and ev.payload.get(key) else None
 
 
-def _display_summary(value: Any, task_id: str, limit: int = 280) -> str:
-    """Keep a short complete summary, or clip at a sentence/word with a detail pointer."""
+def _display_summary(value: Any, task_id: str, board_slug: str, limit: int = 280) -> str:
+    """Keep readable paragraphs and balanced markup, or add a safe detail pointer."""
     text = str(value or "").strip()
     if not text:
         return ""
     if len(text) <= limit:
         return text
     prefix = text[:limit]
-    # Prefer a complete sentence, then a word boundary for a single long sentence.
+    # A complete sentence is useful even when it occupies less than half the budget.
     boundary = max((m.end() for m in re.finditer(r"[.!?](?:[\"'”’)]*)?(?:\s+|$)", prefix)), default=0)
-    if boundary < limit // 2:
-        boundary = prefix.rfind(" ")
+    if not boundary:
+        boundary = max(prefix.rfind("\n"), prefix.rfind(" "))
     if boundary <= 0:
         boundary = limit
-    return f"{text[:boundary].rstrip()}…\nMore: hermes kanban show {task_id}"
+    # Do not end on a combining mark, variation selector, emoji modifier, or
+    # either side of a ZWJ sequence. These are the common multi-codepoint
+    # grapheme cases in summaries, handled without an optional dependency.
+    while boundary > 0 and boundary < len(text):
+        next_char = text[boundary]
+        prev_char = text[boundary - 1]
+        code = ord(next_char)
+        if (unicodedata.combining(next_char) or code in range(0xFE00, 0xFE10)
+                or code in range(0x1F3FB, 0x1F400) or next_char == "\u200d"
+                or prev_char == "\u200d"):
+            boundary -= 1
+            continue
+        break
+    excerpt = text[:boundary].rstrip()
+    # Close an open fenced block before placing the detail link outside it.
+    fences = re.findall(r"(?m)^\s*(```+|~~~+)", excerpt)
+    if fences and len(fences) % 2:
+        excerpt += "\n" + fences[-1]
+    # Close an unmatched inline code span when the cut falls inside one.
+    if excerpt.count("`") % 2:
+        excerpt += "`"
+    for marker in ("**", "__", "~~"):
+        if excerpt.count(marker) % 2:
+            excerpt += marker
+    lookup = f"hermes kanban --board {shlex.quote(board_slug)} show {shlex.quote(task_id)}"
+    return f"{excerpt}…\nMore: {lookup}"
 
 
 def _notice(status: str, n: Any, detail: Any = None) -> str:
     """Human-facing lifecycle notice: title first, with concise detail and task lookup."""
     lines = [f"{n.title} — {status}"]
     if detail:
-        lines.append(_display_summary(detail, n.task_id))
-    lines.append(f"Task {n.task_id} · hermes kanban show {n.task_id}")
+        lines.append(_display_summary(detail, n.task_id, n.board_slug))
+    lookup = f"hermes kanban --board {shlex.quote(n.board_slug)} show {shlex.quote(n.task_id)}"
+    lines.append(f"Task {n.task_id} · {lookup}")
     return "\n\n".join(lines)
 
 
@@ -392,9 +420,9 @@ def _fmt_completed(ev, n) -> tuple:
     wake_handoff = None
     payload_summary = _payload(ev, "summary")
     if payload_summary:
-        wake_handoff = _display_summary(payload_summary, n.task_id, 200)
+        wake_handoff = _display_summary(payload_summary, n.task_id, n.board_slug, 200)
     elif n.task and n.task.result:
-        wake_handoff = _display_summary(n.task.result, n.task_id, 160)
+        wake_handoff = _display_summary(n.task.result, n.task_id, n.board_slug, 160)
     summary = payload_summary or (n.task.result if n.task and n.task.result else None)
     msg = _notice("Completed", n, summary)
     return msg, wake_handoff, None
@@ -407,7 +435,7 @@ def _fmt_review_requested(ev, n) -> tuple:
     summary = _payload(ev, "summary")
     if summary:
         summary = str(summary)
-        wake_handoff = _display_summary(summary, n.task_id, 200)
+        wake_handoff = _display_summary(summary, n.task_id, n.board_slug, 200)
     return _notice("Ready for independent review", n, summary), wake_handoff, None
 
 

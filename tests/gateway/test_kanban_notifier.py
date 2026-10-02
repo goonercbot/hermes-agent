@@ -166,7 +166,7 @@ def test_active_named_profile_subscription_is_delivered(tmp_path, monkeypatch):
     assert len(adapter.sent) == 1
     message = adapter.sent[0]["text"]
     assert tid in message
-    assert "blocked" in message
+    assert "Blocked" in message
 
 
 def test_non_dispatch_gateway_claims_only_its_profile_subscriptions(
@@ -639,6 +639,10 @@ class _StubEvent:
 
 class _StubNotif:
     head = "H123"
+    title = "Readable task title"
+    task_id = "H123"
+    board_slug = "default"
+    task = None
 
 
 def _fmt_block_loop(payload):
@@ -657,7 +661,7 @@ def test_block_loop_technical_kind_uses_neutral_orchestration_wording():
     assert "for orchestration attention" in msg
     assert "human decision" not in msg
     # Circuit-breaker visibility is preserved.
-    assert "TRIAGE" in msg
+    assert "in triage" in msg.lower()
     assert "waiting on upstream" in msg
 
 
@@ -674,6 +678,108 @@ def test_block_loop_owner_input_keeps_decision_wording():
     assert "needs a human decision" in msg
     assert "for orchestration attention" not in msg
     assert "Which API key should this use?" in msg
+
+
+def test_native_notices_lead_with_title_and_keep_block_kind_distinction():
+    from gateway.kanban_watchers_notifier import _EVENT_FORMATTERS
+
+    review, _, _ = _EVENT_FORMATTERS["review_requested"](
+        _StubEvent({"summary": "Implementation is ready."}), _StubNotif()
+    )
+    assert review.startswith("Readable task title — Ready for independent review")
+    assert "Implementation is ready." in review
+    assert "Task H123 · hermes kanban --board default show H123" in review
+    assert "[default]" not in review and "@worker" not in review
+
+    needs_input, _, _ = _EVENT_FORMATTERS["blocked"](
+        _StubEvent({"kind": "needs_input", "reason": "Which option?"}), _StubNotif()
+    )
+    technical, _, _ = _EVENT_FORMATTERS["blocked"](
+        _StubEvent({"kind": "capability", "reason": "Unavailable service"}), _StubNotif()
+    )
+    assert "Blocked — needs your input" in needs_input
+    assert "Which option?" in needs_input
+    assert "Blocked — needs your input" not in technical
+    assert "Unavailable service" in technical
+
+
+def test_native_summary_preserves_multiline_and_clips_at_sentence_or_word():
+    from gateway.kanban_watchers_notifier import _display_summary
+
+    multiline = "Done: ready.\n\nRemaining: review."
+    assert _display_summary(multiline, "H123", "default") == multiline
+
+    long_sentences = "First sentence is complete. " + "Second sentence " + ("long detail " * 30)
+    clipped = _display_summary(long_sentences, "H123", "default", limit=80)
+    assert clipped == "First sentence is complete.…\nMore: hermes kanban --board default show H123"
+    assert "long deta…" not in clipped
+
+    long_single = "😀" + ("word " * 50)
+    clipped_single = _display_summary(long_single, "H123", "default", limit=40)
+    assert clipped_single.endswith("More: hermes kanban --board default show H123")
+    assert "😀" in clipped_single
+    assert _display_summary("  ", "H123", "default") == ""
+
+    fenced = "```python\n" + ("print('long value')\n" * 20) + "```"
+    clipped_fence = _display_summary(fenced, "H123", "default", limit=55)
+    assert "```python" in clipped_fence and "\n```…\nMore:" in clipped_fence
+    assert clipped_fence.endswith("hermes kanban --board default show H123")
+
+    newline_only = "line-one-without-spaces\nline-two-without-spaces\n" + ("tail" * 30)
+    clipped_newline = _display_summary(newline_only, "H123", "default", limit=50)
+    assert clipped_newline.startswith("line-one-without-spaces\nline-two-without-spaces…")
+    assert clipped_newline.endswith("hermes kanban --board default show H123")
+
+    family = "👩\u200d👩\u200d👧\u200d👦"
+    clipped_family = _display_summary("x" * 38 + family + "more words " * 10,
+                                      "H123", "default", limit=43)
+    excerpt = clipped_family.split("…\nMore:", 1)[0]
+    assert not excerpt.endswith("\u200d")
+    assert family not in excerpt or excerpt.endswith(family)
+
+    board = _display_summary("A long single sentence " * 8, "H123", "quality review", limit=35)
+    assert "hermes kanban --board 'quality review' show H123" in board
+
+    # The notification must point at its own board even when that differs
+    # from the recipient's current-board selection.
+    from types import SimpleNamespace
+    from gateway.kanban_watchers_notifier import _notice
+    notice = _notice("Completed", SimpleNamespace(
+        title="Non-default task", task_id="Q7", board_slug="quality review",
+    ))
+    assert "hermes kanban --board 'quality review' show Q7" in notice
+
+
+def test_long_markdown_summary_is_plain_text_in_actual_adapter_delivery(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "long-markdown.db"))
+    kb.init_db()
+    summary = "```python\n" + ("print('bounded detail')\n" * 30) + "```"
+    task_id = _create_completed_subscription(summary=summary)
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert len(adapter.sent) == 1
+    body = adapter.sent[0]["text"]
+    assert body.startswith("notify once — Completed")
+    assert "print('bounded detail')" in body
+    assert "```" not in body
+    assert "More: hermes kanban --board default show " + task_id in body
+    assert f"Task {task_id} · hermes kanban --board default show {task_id}" in body
+
+
+def test_completion_and_changes_notices_use_title_and_keep_event_status():
+    from gateway.kanban_watchers_notifier import _EVENT_FORMATTERS
+
+    completed, _, _ = _EVENT_FORMATTERS["completed"](
+        _StubEvent({"summary": "Finished successfully."}), _StubNotif()
+    )
+    changed, _, _ = _EVENT_FORMATTERS["changes_requested"](
+        _StubEvent({"reason": "Please fix the test."}), _StubNotif()
+    )
+    assert completed.startswith("Readable task title — Completed")
+    assert changed.startswith("Readable task title — Changes requested")
+    assert "not approved" in changed
+    assert "Please fix the test." in changed
 
 
 # ---------------------------------------------------------------------------
@@ -741,6 +847,77 @@ def test_review_requested_wakes_the_origin_session(tmp_path, monkeypatch):
         "the worker's handoff must ride the wake turn like it does for "
         "`completed`, otherwise the woken reviewer has to re-read the board"
     )
+
+
+def test_review_summary_survives_request_review_event_and_transport(tmp_path, monkeypatch):
+    """Exercise serialization, persistence, notification formatting, and adapter body."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "review-summary-e2e.db"))
+    kb.init_db()
+    summary = "Done: implemented.\n\nRemaining: independent review."
+    tid = _review_handoff_task(summary=summary, delivery_mode="notify")
+
+    conn = kbc.connect()
+    try:
+        event = next(e for e in kb.list_events(conn, task_id=tid) if e.kind == "review_requested")
+        assert event.payload["summary"] == summary
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    assert len(adapter.sent) == 1
+    delivered = adapter.sent[0]["text"]
+    assert "Done: implemented." in delivered
+    assert "Remaining: independent review." in delivered
+    assert delivered.index("Done:") < delivered.index("Remaining:")
+
+
+def test_review_fenced_long_summary_is_plain_text_end_to_end(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "review-fence-e2e.db"))
+    kb.init_db()
+    summary = "```text\nReady.\n" + ("unbroken" * 100) + "\n```"
+    tid = _review_handoff_task(summary=summary, delivery_mode="notify")
+
+    conn = kbc.connect()
+    try:
+        event = next(e for e in kb.list_events(conn, task_id=tid) if e.kind == "review_requested")
+        assert event.payload is not None
+        assert event.payload["summary"].startswith("Ready.")
+        assert "```" not in event.payload["summary"]
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    delivered = adapter.sent[0]["text"]
+    assert "Ready." in delivered
+    assert "```" not in delivered
+    assert f"Task {tid} · hermes kanban --board default show {tid}" in delivered
+
+
+def test_completion_fenced_summary_is_plain_text_end_to_end(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "completion-fence-e2e.db"))
+    kb.init_db()
+    summary = "```text\nReady.\n" + ("unbroken" * 100) + "\n```"
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="completion summary", assignee="worker")
+        kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        assert kb.complete_task(conn, tid, summary=summary)
+        event = next(e for e in kb.list_events(conn, task_id=tid) if e.kind == "completed")
+        assert event.payload is not None
+        assert event.payload["summary"].startswith("Ready.")
+        assert "```" not in event.payload["summary"]
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    delivered = adapter.sent[0]["text"]
+    assert "Ready." in delivered
+    assert "```" not in delivered
+    assert f"Task {tid} · hermes kanban --board default show {tid}" in delivered
+    assert "More: hermes kanban --board default show" not in delivered
 
 
 def test_block_loop_detected_wakes_the_origin_session(tmp_path, monkeypatch):

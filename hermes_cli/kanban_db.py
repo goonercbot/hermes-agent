@@ -2944,8 +2944,8 @@ def _completed_event_payload(
 
 
 def _completion_event_summary(value: Optional[str], limit: int = 400) -> Optional[str]:
-    """Bound the event copy without collapsing paragraphs or cutting mid-sentence."""
-    text = str(value or "").strip()
+    """Persist a bounded plain-text event excerpt without collapsing paragraphs."""
+    text = _summary_as_plain_text(value)
     if not text:
         return None
     if len(text) <= limit:
@@ -2957,6 +2957,29 @@ def _completion_event_summary(value: Optional[str], limit: int = 400) -> Optiona
     if boundary <= 0:
         boundary = limit
     return prefix[:boundary].rstrip() + "…"
+
+
+def _summary_as_plain_text(value: Optional[str]) -> str:
+    """Remove Markdown delimiters before summaries enter human-facing event payloads.
+
+    Notifications are delivered by adapters with different formatting rules;
+    keep summary prose readable and safe across them rather than carrying open
+    code/emphasis delimiters into a clipped event.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    # Preserve fenced-block contents while removing the language/open/close
+    # markers. Delimiter removal before clipping prevents a short excerpt from
+    # becoming an unterminated transport-format block.
+    text = re.sub(r"(?m)^\s*(```+|~~~+)[^\n]*$", "", text)
+    # Preserve both the linked label and destination in plain text.
+    text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1 (\2)", text)
+    text = re.sub(r"(`+)(.*?)\1", r"\2", text, flags=re.DOTALL)
+    text = re.sub(r"(?<!\\)(\*\*|__|~~|\*)(.+?)\1", r"\2", text, flags=re.DOTALL)
+    text = re.sub(r"(?<!\w)_(\S(?:.*?\S)?)_(?!\w)", r"\1", text, flags=re.DOTALL)
+    text = re.sub(r"\\([\\`*_{}\[\]()#+.!>|~-])", r"\1", text)
+    return re.sub(r"\n[ \t]*\n(?:[ \t]*\n)+", "\n\n", text).strip()
 
 
 def _flag_phantom_prose_refs(
@@ -3473,7 +3496,7 @@ def request_review(
                 profile=implementer,
             )
             payload: dict = {
-                "summary": _first_line(summary, 400) or None,
+                "summary": _completion_event_summary(summary),
                 "implementer": implementer,
                 "reviewer": reviewer,
             }

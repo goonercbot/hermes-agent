@@ -750,7 +750,7 @@ def test_native_summary_preserves_multiline_and_clips_at_sentence_or_word():
     assert "hermes kanban --board 'quality review' show Q7" in notice
 
 
-def test_long_markdown_summary_is_balanced_in_actual_adapter_delivery(tmp_path, monkeypatch):
+def test_long_markdown_summary_is_plain_text_in_actual_adapter_delivery(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "long-markdown.db"))
     kb.init_db()
     summary = "```python\n" + ("print('bounded detail')\n" * 30) + "```"
@@ -761,9 +761,10 @@ def test_long_markdown_summary_is_balanced_in_actual_adapter_delivery(tmp_path, 
     assert len(adapter.sent) == 1
     body = adapter.sent[0]["text"]
     assert body.startswith("notify once — Completed")
-    assert "\n```…\nMore: hermes kanban --board default show " + task_id in body
-    assert body.count("```") == 2
-    assert body.index("\nMore:") > body.index("\n```")
+    assert "print('bounded detail')" in body
+    assert "```" not in body
+    assert "More: hermes kanban --board default show " + task_id in body
+    assert f"Task {task_id} · hermes kanban --board default show {task_id}" in body
 
 
 def test_completion_and_changes_notices_use_title_and_keep_event_status():
@@ -846,6 +847,77 @@ def test_review_requested_wakes_the_origin_session(tmp_path, monkeypatch):
         "the worker's handoff must ride the wake turn like it does for "
         "`completed`, otherwise the woken reviewer has to re-read the board"
     )
+
+
+def test_review_summary_survives_request_review_event_and_transport(tmp_path, monkeypatch):
+    """Exercise serialization, persistence, notification formatting, and adapter body."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "review-summary-e2e.db"))
+    kb.init_db()
+    summary = "Done: implemented.\n\nRemaining: independent review."
+    tid = _review_handoff_task(summary=summary, delivery_mode="notify")
+
+    conn = kbc.connect()
+    try:
+        event = next(e for e in kb.list_events(conn, task_id=tid) if e.kind == "review_requested")
+        assert event.payload["summary"] == summary
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    assert len(adapter.sent) == 1
+    delivered = adapter.sent[0]["text"]
+    assert "Done: implemented." in delivered
+    assert "Remaining: independent review." in delivered
+    assert delivered.index("Done:") < delivered.index("Remaining:")
+
+
+def test_review_fenced_long_summary_is_plain_text_end_to_end(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "review-fence-e2e.db"))
+    kb.init_db()
+    summary = "```text\nReady.\n" + ("unbroken" * 100) + "\n```"
+    tid = _review_handoff_task(summary=summary, delivery_mode="notify")
+
+    conn = kbc.connect()
+    try:
+        event = next(e for e in kb.list_events(conn, task_id=tid) if e.kind == "review_requested")
+        assert event.payload is not None
+        assert event.payload["summary"].startswith("Ready.")
+        assert "```" not in event.payload["summary"]
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    delivered = adapter.sent[0]["text"]
+    assert "Ready." in delivered
+    assert "```" not in delivered
+    assert f"Task {tid} · hermes kanban --board default show {tid}" in delivered
+
+
+def test_completion_fenced_summary_is_plain_text_end_to_end(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "completion-fence-e2e.db"))
+    kb.init_db()
+    summary = "```text\nReady.\n" + ("unbroken" * 100) + "\n```"
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="completion summary", assignee="worker")
+        kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        assert kb.complete_task(conn, tid, summary=summary)
+        event = next(e for e in kb.list_events(conn, task_id=tid) if e.kind == "completed")
+        assert event.payload is not None
+        assert event.payload["summary"].startswith("Ready.")
+        assert "```" not in event.payload["summary"]
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    delivered = adapter.sent[0]["text"]
+    assert "Ready." in delivered
+    assert "```" not in delivered
+    assert f"Task {tid} · hermes kanban --board default show {tid}" in delivered
+    assert "More: hermes kanban --board default show" not in delivered
 
 
 def test_block_loop_detected_wakes_the_origin_session(tmp_path, monkeypatch):

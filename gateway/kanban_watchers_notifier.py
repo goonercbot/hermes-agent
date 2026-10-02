@@ -361,18 +361,30 @@ def _payload(ev: Any, key: str) -> Any:
     return ev.payload.get(key) if ev.payload and ev.payload.get(key) else None
 
 
-def _clip(ev: Any, key: str, fmt: str, limit: int) -> str:
-    """``fmt`` applied to the truncated payload value, or ``""`` when absent."""
-    value = _payload(ev, key)
-    return fmt.format(str(value)[:limit]) if value else ""
+def _display_summary(value: Any, task_id: str, limit: int = 280) -> str:
+    """Keep a short complete summary, or clip at a sentence/word with a detail pointer."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if len(text) <= limit:
+        return text
+    prefix = text[:limit]
+    # Prefer a complete sentence, then a word boundary for a single long sentence.
+    boundary = max((m.end() for m in re.finditer(r"[.!?](?:[\"'”’)]*)?(?:\s+|$)", prefix)), default=0)
+    if boundary < limit // 2:
+        boundary = prefix.rfind(" ")
+    if boundary <= 0:
+        boundary = limit
+    return f"{text[:boundary].rstrip()}…\nMore: hermes kanban show {task_id}"
 
 
-_NL = "\n{}"
-
-
-def _first_line(text: str, limit: int) -> str:
-    lines = text.strip().splitlines()
-    return lines[0][:limit] if lines else text[:limit]
+def _notice(status: str, n: Any, detail: Any = None) -> str:
+    """Human-facing lifecycle notice: title first, with concise detail and task lookup."""
+    lines = [f"{n.title} — {status}"]
+    if detail:
+        lines.append(_display_summary(detail, n.task_id))
+    lines.append(f"Task {n.task_id} · hermes kanban show {n.task_id}")
+    return "\n\n".join(lines)
 
 
 def _fmt_completed(ev, n) -> tuple:
@@ -380,24 +392,23 @@ def _fmt_completed(ev, n) -> tuple:
     wake_handoff = None
     payload_summary = _payload(ev, "summary")
     if payload_summary:
-        wake_handoff = _first_line(str(payload_summary), 200)
+        wake_handoff = _display_summary(payload_summary, n.task_id, 200)
     elif n.task and n.task.result:
-        wake_handoff = _first_line(n.task.result, 160)
-    handoff = f"\n{wake_handoff}" if wake_handoff is not None else ""
-    return f"✔ {n.head} done — {n.title}{handoff}", wake_handoff, None
+        wake_handoff = _display_summary(n.task.result, n.task_id, 160)
+    summary = payload_summary or (n.task.result if n.task and n.task.result else None)
+    msg = _notice("Completed", n, summary)
+    return msg, wake_handoff, None
 
 
 def _fmt_review_requested(ev, n) -> tuple:
     # Implementation done; task moved to the review lane. Carry the handoff
     # into the wake turn like ``completed`` so the reviewer needn't re-read the board.
-    handoff = ""
     wake_handoff = None
     summary = _payload(ev, "summary")
     if summary:
         summary = str(summary)
-        handoff = f"\n{summary[:200]}"
-        wake_handoff = _first_line(summary, 200)
-    return f"👀 {n.head} ready for review — {n.title}{handoff}", wake_handoff, None
+        wake_handoff = _display_summary(summary, n.task_id, 200)
+    return _notice("Ready for independent review", n, summary), wake_handoff, None
 
 
 def _fmt_changes_requested(ev, n) -> tuple:
@@ -409,7 +420,7 @@ def _fmt_changes_requested(ev, n) -> tuple:
     provenance = f" — reviewer @{reviewer}" if reviewer else ""
     if implementer:
         provenance += f" → implementer @{implementer}"
-    msg = f"🛑 {n.board_tag}Kanban {n.task_id} review requested changes/BLOCK: {reason_text}{provenance}"
+    msg = _notice("Changes requested — implementation is not approved", n, reason_text + provenance)
     return msg, None, reason_text
 
 
@@ -425,11 +436,12 @@ def _fmt_block_loop_detected(ev, n) -> tuple:
     """
     kind = _payload(ev, "kind")
     decision = kind == "needs_input"
-    msg = (
-        f"🛑 {n.head} routed to TRIAGE — "
-        f"{'needs a human decision' if decision else 'for orchestration attention'}"
-        f"{_clip(ev, 'recurrences', ' (blocked {}x for the same cause)', 200)}{_clip(ev, 'reason', ': {}', 160)}"
-    )
+    detail = _payload(ev, "reason")
+    status = "In triage — needs a human decision" if decision else "In triage — for orchestration attention"
+    recurrence = _payload(ev, "recurrences")
+    if recurrence:
+        status += f" after {recurrence} repeated blocks"
+    msg = _notice(status, n, detail)
     return msg, None, None
 
 
@@ -438,19 +450,15 @@ def _fmt_gave_up(ev, n) -> tuple:
     # (spawn failure, crash, or timeout alike): it is now Blocked and waiting for a human.
     failures = _payload(ev, "failures")
     count = f"it failed {int(failures)} times in a row" if failures else "it kept failing"
-    last = _clip(ev, "error", " (last: {})", 160)
-    return (
-        f"⛔ {n.head} is now blocked: {count}{last}. Fix the cause, then `hermes kanban unblock "
-        f"{n.task_id}` (or `hermes kanban reassign {n.task_id}`). Logs: `hermes kanban log {n.task_id}`.",
-        None, None,
-    )
+    last = _payload(ev, "error")
+    return _notice(f"Blocked after repeated failures ({count})", n, last), None, None
 
 
 def _fmt_timed_out(ev, n) -> tuple:
     limit = int(_payload(ev, "limit_seconds") or 0)
     minutes = max(1, round(limit / 60)) if limit else 0
     span = f"its {minutes}-minute limit" if minutes else "its time limit"
-    return f"⏱ {n.head} ran past {span} and was stopped; it will be retried automatically.", None, None
+    return _notice(f"Stopped after {span}; retry is automatic", n), None, None
 
 
 # archived / unblocked are claimed (so the cursor advances past them) but
@@ -458,13 +466,16 @@ def _fmt_timed_out(ev, n) -> tuple:
 # never wake the creator.
 _EVENT_FORMATTERS: dict[str, Callable[[Any, "_KanbanNotification"], tuple]] = {
     "completed": _fmt_completed,
-    "blocked": lambda ev, n: (f"⏸ {n.head} blocked{_clip(ev, 'reason', ': {}', 160)}", None, None),
+    "blocked": lambda ev, n: (_notice(
+        "Blocked — needs your input" if _payload(ev, "kind") == "needs_input" else "Blocked",
+        n, _payload(ev, "reason"),
+    ), None, None),
     "gave_up": _fmt_gave_up,
     "crashed": lambda ev, n: (
-        f"✖ {n.head} — its worker stopped unexpectedly; it will be retried automatically.", None, None,
+        _notice("Worker stopped unexpectedly; retry is automatic", n), None, None,
     ),
     "timed_out": _fmt_timed_out,
-    "status": lambda ev, n: (f"🔄 {n.head} → {_payload(ev, 'status') or ''}", None, None),
+    "status": lambda ev, n: (_notice(f"Status changed to {_payload(ev, 'status') or 'updated'}", n), None, None),
     "review_requested": _fmt_review_requested,
     "changes_requested": _fmt_changes_requested,
     "block_loop_detected": _fmt_block_loop_detected,
@@ -493,11 +504,7 @@ class _KanbanNotification:
         self.platform_str = (sub["platform"] or "").lower()
         self.task_id = sub["task_id"]
         self.sub_profile = sub.get("notifier_profile") or ""
-        self.title = (task.title if task else sub["task_id"])[:120]
-        self.board_tag = f"[{self.board_slug}] " if self.board_slug else ""
-        # Attribute the ping to the worker that did the work.
-        tag = f"@{task.assignee} " if task and task.assignee else ""
-        self.head = f"{self.board_tag}{tag}Kanban {self.task_id}"
+        self.title = re.sub(r"\s+", " ", task.title if task else sub["task_id"]).strip()[:120]
         # The wake self-post path needs the key even when every event was skipped.
         self.sub_key = (sub["task_id"], sub["platform"], sub["chat_id"], sub.get("thread_id") or "")
         mode = sub.get("delivery_mode") or "notify"

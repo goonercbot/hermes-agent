@@ -166,7 +166,7 @@ def test_active_named_profile_subscription_is_delivered(tmp_path, monkeypatch):
     assert len(adapter.sent) == 1
     message = adapter.sent[0]["text"]
     assert tid in message
-    assert "blocked" in message
+    assert "Blocked" in message
 
 
 def test_non_dispatch_gateway_claims_only_its_profile_subscriptions(
@@ -639,6 +639,9 @@ class _StubEvent:
 
 class _StubNotif:
     head = "H123"
+    title = "Readable task title"
+    task_id = "H123"
+    task = None
 
 
 def _fmt_block_loop(payload):
@@ -657,7 +660,7 @@ def test_block_loop_technical_kind_uses_neutral_orchestration_wording():
     assert "for orchestration attention" in msg
     assert "human decision" not in msg
     # Circuit-breaker visibility is preserved.
-    assert "TRIAGE" in msg
+    assert "in triage" in msg.lower()
     assert "waiting on upstream" in msg
 
 
@@ -674,6 +677,63 @@ def test_block_loop_owner_input_keeps_decision_wording():
     assert "needs a human decision" in msg
     assert "for orchestration attention" not in msg
     assert "Which API key should this use?" in msg
+
+
+def test_native_notices_lead_with_title_and_keep_block_kind_distinction():
+    from gateway.kanban_watchers_notifier import _EVENT_FORMATTERS
+
+    review, _, _ = _EVENT_FORMATTERS["review_requested"](
+        _StubEvent({"summary": "Implementation is ready."}), _StubNotif()
+    )
+    assert review.startswith("Readable task title — Ready for independent review")
+    assert "Implementation is ready." in review
+    assert "Task H123 · hermes kanban show H123" in review
+    assert "[default]" not in review and "@worker" not in review
+
+    needs_input, _, _ = _EVENT_FORMATTERS["blocked"](
+        _StubEvent({"kind": "needs_input", "reason": "Which option?"}), _StubNotif()
+    )
+    technical, _, _ = _EVENT_FORMATTERS["blocked"](
+        _StubEvent({"kind": "capability", "reason": "Unavailable service"}), _StubNotif()
+    )
+    assert "Blocked — needs your input" in needs_input
+    assert "Which option?" in needs_input
+    assert "Blocked — needs your input" not in technical
+    assert "Unavailable service" in technical
+
+
+def test_native_summary_preserves_multiline_and_clips_at_sentence_or_word():
+    from gateway.kanban_watchers_notifier import _display_summary
+
+    multiline = "Done: ready.\n\nRemaining: review."
+    assert _display_summary(multiline, "H123") == multiline
+
+    long_sentences = "First sentence is complete. " + "Second sentence " + ("long detail " * 30)
+    clipped = _display_summary(long_sentences, "H123", limit=80)
+    assert clipped.startswith("First sentence is complete.")
+    assert clipped.endswith("More: hermes kanban show H123")
+    assert "long deta…" not in clipped
+
+    long_single = "😀" + ("word " * 50)
+    clipped_single = _display_summary(long_single, "H123", limit=40)
+    assert clipped_single.endswith("More: hermes kanban show H123")
+    assert "😀" in clipped_single
+    assert _display_summary("  ", "H123") == ""
+
+
+def test_completion_and_changes_notices_use_title_and_keep_event_status():
+    from gateway.kanban_watchers_notifier import _EVENT_FORMATTERS
+
+    completed, _, _ = _EVENT_FORMATTERS["completed"](
+        _StubEvent({"summary": "Finished successfully."}), _StubNotif()
+    )
+    changed, _, _ = _EVENT_FORMATTERS["changes_requested"](
+        _StubEvent({"reason": "Please fix the test."}), _StubNotif()
+    )
+    assert completed.startswith("Readable task title — Completed")
+    assert changed.startswith("Readable task title — Changes requested")
+    assert "not approved" in changed
+    assert "Please fix the test." in changed
 
 
 # ---------------------------------------------------------------------------

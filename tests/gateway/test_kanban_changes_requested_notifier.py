@@ -106,7 +106,9 @@ def test_changes_requested_notify_wake_is_actionable_and_exactly_routed(tmp_path
 
     assert len(adapter.sent) == 1
     text = adapter.sent[0]["text"]
-    assert text.startswith(f"🛑 [default] Kanban {task_id} review requested changes/BLOCK: Tests need updates")
+    assert text.startswith("existing implementation card — Changes requested")
+    assert "Tests need updates" in text
+    assert f"Task {task_id} · hermes kanban --board default show {task_id}" in text
     assert "reviewer @claude-qa → implementer @codex-cua" in text
     assert adapter.sent[0]["metadata"]["thread_id"] == "topic-7"
     assert len(adapter.handled) == 1

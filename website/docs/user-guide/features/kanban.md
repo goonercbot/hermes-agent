@@ -1325,6 +1325,31 @@ Duplicate delivery across gateways is prevented by the atomic per-event claim
 in the board DB. No relays, credential sharing, or extra dispatchers are
 needed — each profile gateway simply delivers through its own adapters.
 
+## Task conversation continuity
+
+Enable `kanban.resume_sessions: true` in each receiving worker/reviewer profile
+to continue its conversation across attempts. The default is `false`; existing
+profiles keep their fresh-attempt behavior until explicitly enabled.
+
+The native CLI child records its session in the existing run metadata before its
+first turn. On a later claim it resumes only the same board, task, profile home,
+implementation/review role, workspace, branch and workflow step. Reviewer and
+implementer histories remain separate, including when one profile serves both
+roles. Native compression continuations are followed. Missing, archived, empty,
+over-limit or scope-mismatched history falls back to a fresh conversation using
+the task brief and recovery checkpoint; legacy runs without a binding also start
+fresh. No conversation is guessed from the profile's latest session.
+
+The new claim remains authoritative. Resumption does not restore an old working
+directory, model selection or YOLO approval bypass; current profile settings and
+dispatcher ownership apply. The resumed worker is prompted to read the current
+task and review findings before continuing. Existing session locks still prevent
+two processes from running the same conversation concurrently.
+
+This is separate from profile-owned persistent memory. Enable built-in memory
+through the existing `memory.memory_enabled` setting and `memory` toolset when
+cross-task knowledge is wanted; never share a profile home between roles.
+
 ## Runs — one row per attempt
 
 A task is a logical unit of work; a **run** is one attempt to execute it. When the dispatcher claims a ready task it creates a row in `task_runs` and points `tasks.current_run_id` at it. When that attempt ends — completed, blocked, crashed, timed out, spawn-failed, reclaimed — the run row closes with an `outcome` and the task's pointer clears. A task that's been attempted three times has three `task_runs` rows.

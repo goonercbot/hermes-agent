@@ -304,9 +304,12 @@ class CLIInitMixin:
         self._prompt_duration: float = 0.0
         self._last_turn_finished_at: Optional[float] = None
         self._init_session_store()
+        from hermes_cli.kanban_session import resolve_worker_resume, record_worker_session
+        resume = resolve_worker_resume(self._session_db, resume)
         self._pending_title: Optional[str] = None
         self._resumed = bool(resume)
         self.session_id = resume or new_session_id(self.session_start)
+        record_worker_session(self.session_id)
         getattr(self, "_write_terminal_breadcrumb", lambda: None)()
 
         self._history_file = _hermes_home / ".hermes_history"

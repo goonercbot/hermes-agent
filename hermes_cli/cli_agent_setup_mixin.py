@@ -543,6 +543,11 @@ class CLIAgentSetupMixin:
 
     def _restore_session_state(self, session_meta, *, quiet: bool = False) -> None:
         """Restore cwd / yolo / model from the resumed session's metadata."""
+        from hermes_cli.kanban_session import worker_continuity_enabled
+        if worker_continuity_enabled():
+            # Resume knowledge, never previous-run authority or launch settings.
+            # The current dispatcher claim/profile/workspace remain authoritative.
+            return
         self._restore_session_cwd(session_meta, quiet=quiet)
         self._restore_session_yolo(session_meta, quiet=quiet)
         self._restore_session_model(session_meta, quiet=quiet)

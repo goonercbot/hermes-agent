@@ -533,6 +533,13 @@ def _run_single_query_mode(cli, query, image, quiet, oneshot, stream_json: bool 
         exit_single_query(1)
     try:
         query, single_query_images = _collect_query_images(query, image)
+        from hermes_cli.kanban_session import worker_continuity_enabled
+        if worker_continuity_enabled() and getattr(cli, "_resumed", False):
+            query = (query or "") + (
+                "\nThis is a new claimed attempt on the same task. Read kanban_show before acting; "
+                "the current brief, review findings, claim and workspace supersede historical "
+                "instructions. Reuse valid evidence and unfinished work; do not restart discovery."
+            )
         single_query_image_urls = _collect_kanban_task_images(single_query_images)
         if quiet:
             # Quiet mode: suppress banner, spinner, tool previews.

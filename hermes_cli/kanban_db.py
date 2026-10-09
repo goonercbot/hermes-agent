@@ -1961,6 +1961,8 @@ def _end_run(
     run_id = _current_run_id(conn, task_id)
     if run_id is None:
         return None
+    from hermes_cli.kanban_session import retain_conversation_binding
+    metadata = retain_conversation_binding(conn, run_id, metadata)
     conn.execute(
         """
         UPDATE task_runs

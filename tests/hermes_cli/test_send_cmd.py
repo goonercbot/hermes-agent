@@ -58,6 +58,24 @@ def fake_tool(monkeypatch):
     return fake
 
 
+def test_send_positional_text_stays_plain_and_json_is_only_the_receipt(
+    fake_tool, monkeypatch, capsys
+):
+    """The authorized worker route passes plain text; --json formats only the result."""
+    monkeypatch.setattr(send_cmd, "_load_hermes_env", lambda: None)
+    message = "Readable task — implementation in progress\n\nDone: test passed."
+    with pytest.raises(SystemExit) as exc:
+        send_cmd.cmd_send(_parse(["--to", "telegram:6906136596", "--json", message]))
+
+    assert exc.value.code == 0
+    assert fake_tool.calls == [{
+        "action": "send", "target": "telegram:6906136596", "message": message,
+    }]
+    receipt = json.loads(capsys.readouterr().out)
+    assert receipt == {"success": True, "message_id": "m123"}
+    assert "{\"text\":" not in fake_tool.calls[0]["message"]
+
+
 # ---------------------------------------------------------------------------
 # Happy path
 # ---------------------------------------------------------------------------

@@ -1609,6 +1609,8 @@ class SendResult:
     # SEND_ERROR_KINDS member (failures only) via :func:`classify_send_error`, so consumers
     # branch without substring-matching ``error``.
     error_kind: Optional[str] = None
+    # Explicit proof the complete requested body reached the transport.
+    full_payload_delivered: Optional[bool] = None
 
 
 # Longest server ``retry_after`` ``_send_with_retry`` will sleep inline. Longer penalties return the
@@ -1806,7 +1808,10 @@ def _lazy_attr(obj: Any, name: str, factory: Callable[[], Any]) -> Any:
 _strip_media_directives = _strip_media_tag_directives
 
 
-class BasePlatformAdapter(ABC):
+from gateway.platforms.post_delivery import FinalDeliveryReceiptMixin
+
+
+class BasePlatformAdapter(FinalDeliveryReceiptMixin, ABC):
     """Base class for platform adapters: connect/auth, receive, send, handle media."""
 
     # ``format_message`` renders ``` fences as real code blocks (tool-progress then sends a bare
@@ -3675,11 +3680,14 @@ class BasePlatformAdapter(ABC):
             self, chat_id: str, content: str, *, reply_to: Optional[str], metadata: Any) -> SendResult:
         """Last-resort send after a non-transient failure; platforms whose markup is not the
         likely culprit override it (Photon drops rich links instead of adding the banner)."""
-        return await self.send(
+        result = await self.send(
             chat_id=chat_id, content=self.warning_text(
                 t("gateway.notify.plain_fallback_prefix", content=content[:3500]), content[:3500],
                 chat_id=chat_id, metadata=metadata),
             reply_to=reply_to, metadata=metadata)
+        if len(content) > 3500:
+            result.full_payload_delivered = False
+        return result
 
     @staticmethod
     def _merge_caption(existing_text: Optional[str], new_text: str) -> str:
@@ -4313,7 +4321,7 @@ class BasePlatformAdapter(ABC):
 
     async def _send_final_text(
         self, event: MessageEvent, session_key: str, text_content: str, metadata: dict[str, Any],
-        is_ephemeral_response: bool, ephemeral_ttl: int, record_delivery: Callable) -> None:
+        is_ephemeral_response: bool, ephemeral_ttl: int, record_delivery: Callable) -> bool:
         """Normal-lane final: the ledger bracket plus the message-id owner's ephemeral delete."""
         result, delivery_adapter = await self.send_final_ledgered(
             event, session_key, text_content, metadata,
@@ -4321,6 +4329,8 @@ class BasePlatformAdapter(ABC):
         record_delivery(result)
         if ephemeral_ttl and ephemeral_ttl > 0 and result.success and result.message_id:
             delivery_adapter._schedule_ephemeral_delete(event.source.chat_id, result.message_id, ephemeral_ttl)
+        from gateway.platforms.post_delivery import complete_body
+        return complete_body(result)
 
     async def _notify_turn_error(self, event: MessageEvent, e: BaseException) -> Optional[dict]:
         """Tell the user a turn failed rather than leaving radio silence (last resort:
@@ -4434,6 +4444,8 @@ class BasePlatformAdapter(ABC):
         await run_post_delivery_callback(self.pop_post_delivery_callback(
             session_key, generation=getattr(interrupt_event, "_hermes_run_generation", None)),
             _POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS)
+        getattr(self, "_confirmed_final_deliveries", {}).pop(
+            (session_key, getattr(interrupt_event, "_hermes_run_generation", None)), None)
 
     def _finish_session_task(self, session_key: str, interrupt_event: asyncio.Event) -> None:
         """End-of-task guard/ownership reconciliation. A late ``_pending_messages`` arrival must not
@@ -4528,9 +4540,11 @@ class BasePlatformAdapter(ABC):
                         or _tts_paths or _tts_caption_delivered:
                     self.pause_typing_for_chat(event.source.chat_id)
                 if text_content and not _tts_caption_delivered:
-                    await self._send_final_text(
+                    complete = await self._send_final_text(
                         event, session_key, text_content, _final_thread_metadata,
                         is_ephemeral_response, _ephemeral_ttl, _record_delivery)
+                    self._confirm_final_delivery(session_key,
+                        getattr(interrupt_event, "_hermes_run_generation", None), complete)
                 await self._deliver_attachments(
                     event, extracted, _final_thread_metadata,
                     anything_sent=delivery_attempted or _tts_caption_delivered,
@@ -4644,7 +4658,14 @@ class BasePlatformAdapter(ABC):
             if pending_event is None:  # consumed elsewhere during the back-off
                 self._cleanup_finished_session_task(session_key, guard)
                 return
-        await self._process_message_background(pending_event, session_key)
+        task = asyncio.current_task()
+        if self._session_tasks.get(session_key) is task:
+            setattr(task, "_hermes_fifo_handoff", (self, session_key, pending_event))
+        try:
+            await self._process_message_background(pending_event, session_key)
+        finally:
+            if hasattr(task, "_hermes_fifo_handoff"):
+                delattr(task, "_hermes_fifo_handoff")
 
     def _clear_session_guard(self, session_key: str) -> None:
         """Clear (not delete) the session's interrupt Event so the guard stays live for inbound."""

@@ -187,7 +187,7 @@ class TestCancelledBestEffortDeliveryFinalizes:
         adapter.REQUIRES_EDIT_FINALIZE = True
         adapter.send.side_effect = [
             SimpleNamespace(success=True, message_id="initial_preview"),
-            SimpleNamespace(success=True, message_id="fresh_final"),
+            SimpleNamespace(success=True, message_id="fresh_final", full_payload_delivered=True),
         ]
         consumer = GatewayStreamConsumer(
             adapter=adapter,

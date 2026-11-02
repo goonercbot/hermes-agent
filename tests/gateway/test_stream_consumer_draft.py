@@ -330,7 +330,7 @@ def _make_fresh_final_adapter():
 
     adapter.send = AsyncMock(side_effect=[
         SendResult(success=True, message_id="preview1"),
-        SendResult(success=True, message_id="final1"),
+        SendResult(success=True, message_id="final1", full_payload_delivered=True),
     ])
     adapter.edit_message = AsyncMock(return_value=SendResult(success=True))
     adapter.delete_message = AsyncMock(return_value=True)
@@ -484,7 +484,7 @@ class TestRichAwareOverflow:
         long_text = "x" * 5000  # > 4096 legacy limit, < 32768 rich limit
         adapter = _make_rich_capable_adapter(send_results=[
             SendResult(success=True, message_id="preview1"),
-            SendResult(success=True, message_id="final1"),
+            SendResult(success=True, message_id="final1", full_payload_delivered=True),
         ])
         cfg = StreamConsumerConfig(
             transport="auto", chat_type="dm",

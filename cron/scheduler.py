@@ -1100,7 +1100,7 @@ def sweep_stale_inflight(due_jobs: Optional[list] = None) -> list:
 
 
 def mark_running_jobs_interrupted(
-    reason: str, *, only_owners: Optional[set] = None,
+    reason: str, *, only_owners: Optional[set] = None, include_homes: bool = False,
 ) -> list:
     """Best-effort: mark every in-flight cron job interrupted; returns the job IDs marked.
 
@@ -1137,6 +1137,7 @@ def mark_running_jobs_interrupted(
     marked = []
     for _token, key, fire_owner, profile_home in active_fires:
         job_id = key[1]
+        notice = {"job_id": job_id, "profile_home": str(profile_home)} if include_homes else job_id
         if not fire_owner:
             logger.warning(
                 "Job '%s' interrupted before its durable fire owner was registered; "
@@ -1145,13 +1146,13 @@ def mark_running_jobs_interrupted(
             # Still report it: shutdown uses the returned IDs for the interrupted-cron notice. The
             # in-memory flag WAS recorded above; only the persisted last_status write is skipped.
             # See #82232.
-            marked.append(job_id)
+            marked.append(notice)
             continue
         try:
             with use_cron_store(profile_home):
                 if mark_job_run(
                     job_id, False, reason, expected_fire_owner=fire_owner):
-                    marked.append(job_id)
+                    marked.append(notice)
         except Exception as e:
             logger.warning("Failed to mark job %s interrupted: %s", job_id, e)
     return marked

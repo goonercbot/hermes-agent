@@ -285,6 +285,9 @@ async def test_cleanup_chains_with_existing_callback(monkeypatch, tmp_path):
     assert result["final_response"] == "done"
     cb = adapter.pop_post_delivery_callback(session_key)
     assert callable(cb)
+    # This test fires the callback manually rather than delivering a final body.
+    # Supply the complete receipt that the real adapter records after delivery.
+    adapter._confirm_final_delivery(session_key, None, True)
     await _fire_post_delivery_cb(cb)
     for _ in range(20):
         await asyncio.sleep(0.01)

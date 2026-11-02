@@ -221,6 +221,8 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         # #29346: a tool/segment boundary means what we delivered was an interim preamble, not the final
         # answer — clear the flags so a premature setter can't fool the gateway. Safe: got_done returns
         # before any reset, and run.py reads these only after the consumer task exits.
+        self._confirmed_complete_body = False
+        self._body_receipts_complete = True
         self._final_response_sent = False
         self._final_content_delivered = False  # content landed even if the cosmetic edit failed
         self._delivered_final_text: Optional[str] = None

@@ -288,9 +288,14 @@ class StreamTransportMixin:
             return False
         if not getattr(result, "success", False):
             return False
+        from gateway.platforms.post_delivery import complete_body
+        complete = complete_body(result)
+        if is_turn_final:
+            self._confirmed_complete_body = complete
         new_message_id = getattr(result, "message_id", None)
         # Best-effort preview cleanup; never delete the message just sent.
-        await self._delete_previews(stale_ids, skip=new_message_id, label="Fresh-final")
+        if complete:
+            await self._delete_previews(stale_ids, skip=new_message_id, label="Fresh-final")
         self._preview_message_ids = set()
         self._adopt_message_id(new_message_id)
         self._already_sent = True
@@ -460,6 +465,11 @@ class StreamTransportMixin:
         result = await self.adapter.send(
             chat_id=self.chat_id, content=text, reply_to=self._initial_reply_to_id,
             metadata=self._metadata_for_send(final=finalize, expect_edits=not finalize))
+        from gateway.platforms.post_delivery import complete_body
+        self._body_receipts_complete = getattr(self, '_body_receipts_complete', True) and complete_body(result)
+        if finalize:
+            self._confirmed_complete_body = complete_body(result) and (
+                not self._turn_split_delivery or self._body_receipts_complete)
         if not result.success:
             self._edit_supported = False
             return False
@@ -505,6 +515,11 @@ class StreamTransportMixin:
             # changed on screen, so the visible prefix and flood state stay as they were and the
             # next tick retries with the newer text.
             return True
+        from gateway.platforms.post_delivery import complete_body
+        if finalize:
+            self._confirmed_complete_body = complete_body(result) and (
+                not self._turn_split_delivery or getattr(self, '_body_receipts_complete', False))
+        self._body_receipts_complete = getattr(self, '_body_receipts_complete', True) and complete_body(result)
         self._already_sent = True
         self._track_preview_ids_from_result(result)
         # Oversized edit split across continuations: message_id is now the LAST

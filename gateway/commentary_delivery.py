@@ -1,0 +1,79 @@
+"""Turn-owned commentary receipts; deletion requires complete final-body proof."""
+from contextlib import suppress
+
+
+def message_ids(result):
+    raw = getattr(result, 'raw_response', None)
+    ids = raw.get('message_ids', []) if isinstance(raw, dict) else []
+    return list(dict.fromkeys(str(mid) for mid in [getattr(result, 'message_id', None), *ids,
+        *(getattr(result, 'continuation_message_ids', None) or ())] if mid is not None))
+
+
+def track_progress(ctx, result):
+    if ctx._cleanup_progress and getattr(result, 'success', False):
+        for mid in message_ids(result):
+            if mid not in ctx._cleanup_msg_ids:
+                ctx._cleanup_msg_ids.append(mid)
+
+
+def remember_commentary(ctx, future, text):
+    if future is None or not ctx._cleanup_progress:
+        return
+    ctx._commentary_delivery_futures.append(future)
+    def remember(done):
+        with suppress(Exception):
+            result = done.result()
+            track_progress(ctx, result)
+            if getattr(result, 'success', False):
+                ctx._commentary_messages.extend((mid, text) for mid in message_ids(result))
+    future.add_done_callback(remember)
+
+
+def schedule_cleanup(response, adapter, ctx):
+    import asyncio
+    if not (ctx._cleanup_progress and adapter is not None and ctx.session_key
+            and (ctx._cleanup_msg_ids or ctx._commentary_delivery_futures)
+            and isinstance(response, dict) and not response.get('failed')
+            and not response.get('partial') and not response.get('interrupted')
+            and response.get('completed') is not False
+            and hasattr(adapter, 'register_post_delivery_callback')):
+        return
+    final_text = str(response.get('final_response') or '').strip()
+    if response.get('_complete_final_body') and final_text:
+        adapter._confirm_final_delivery(ctx.session_key, ctx.run_generation, True)
+    async def cleanup():
+        if not adapter._has_confirmed_final_delivery(ctx.session_key, ctx.run_generation):
+            return
+        for future in ctx._commentary_delivery_futures:
+            with suppress(Exception):
+                await asyncio.wrap_future(future)
+        keep = {mid for mid, text in ctx._commentary_messages if final_text and str(text).strip() == final_text}
+        for mid in dict.fromkeys(ctx._cleanup_msg_ids):
+            current = ctx._run_still_current
+            if callable(current) and not current():
+                return
+            if mid not in keep:
+                with suppress(Exception):
+                    await adapter.delete_message(ctx.source.chat_id, mid)
+    adapter.register_post_delivery_callback(ctx.session_key, cleanup, generation=ctx.run_generation)
+
+
+async def edit_streamed_final(consumer, source, response, content, *, _sk, ok, fail_result, fail_exc):
+    import logging
+    from gateway.platforms.post_delivery import complete_body
+    logger = logging.getLogger(__name__)
+    try:
+        result = await consumer.adapter.edit_message(chat_id=source.chat_id, message_id=consumer.message_id,
+                                                      content=content, finalize=True)
+    except Exception as error:
+        logger.warning(fail_exc, _sk, error)
+        return False
+    raw = getattr(result, 'raw_response', None)
+    if (not getattr(result, 'success', False) or getattr(result, 'full_payload_delivered', None) is False
+            or isinstance(raw, dict) and (raw.get('partial_overflow') or raw.get('skipped'))):
+        logger.warning(fail_result, _sk, getattr(result, 'error', None))
+        return False
+    response['already_sent'] = True
+    response['_complete_final_body'] = complete_body(result)
+    logger.info(*ok)
+    return True

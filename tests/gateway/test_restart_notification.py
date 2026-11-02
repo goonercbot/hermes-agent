@@ -314,8 +314,8 @@ async def test_send_restart_notification_logs_warning_on_sendresult_failure(
         delivered_target = await runner._send_restart_notification()
 
     assert delivered_target is None
-    # Still cleans up.
-    assert not notify_path.exists()
+    # Failed delivery retains the marker so reconnect/startup can retry.
+    assert notify_path.exists()
 
 
 

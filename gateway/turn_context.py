@@ -42,6 +42,8 @@ class TurnContext:
     _LONG_TOOL_THRESHOLD_S: float = 30.0
     _cleanup_progress: bool = False
     _cleanup_msg_ids: list[str] = field(default_factory=list)
+    _commentary_messages: list[tuple[str, str]] = field(default_factory=list)
+    _commentary_delivery_futures: list[Any] = field(default_factory=list)
     _progress_metadata: Optional[dict] = None
     _progress_reply_to: Optional[Any] = None
     message: Optional[str] = None  # the only rebindable field

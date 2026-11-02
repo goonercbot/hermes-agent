@@ -192,6 +192,7 @@ def resolve_and_repair_transcript_batch(
     decode_content_fn: Callable[[Any], Any],
     serialize_message_fn: Callable[[dict[str, Any], float], Mapping[str, Any]],
     decode_row_fn: Callable[[Mapping[str, Any]], dict[str, Any]],
+    fork_protected_row_fn: Callable[[Mapping[str, Any]], Mapping[str, Any]],
 ) -> list[dict[str, Any]]:
     """Resolve row-addressed rewrites without appending duplicates or replacing concurrent winners.
 
@@ -214,7 +215,16 @@ def resolve_and_repair_transcript_batch(
         expected = msg.get(DB_ROW_SNAPSHOT) if isinstance(msg, dict) else None
         target_row = None
         if isinstance(existing_row_id, int):
-            target_row = _active_message_row(conn, session_id, existing_row_id, role)
+            addressed = conn.execute("SELECT * FROM messages WHERE id = ? AND session_id = ? AND role = ?",
+                                     (existing_row_id, session_id, role)).fetchone()
+            if addressed is not None and not addressed["active"] and isinstance(expected, str):
+                uid = message_uid_or_none(msg)
+                if uid and uid == addressed[MESSAGE_UID]:
+                    # Only a live successor may be rewritten. With no successor,
+                    # retain the native unresolved-row insertion behavior.
+                    target_row = _active_logical_message_row(conn, session_id, role, uid)
+            else:
+                target_row = _active_message_row(conn, session_id, existing_row_id, role)
         elif isinstance(expected, str):
             # Logical identity + the CAS version prove this dict came from durable replay. A new message
             # has neither proof, even when role/content/timestamp happen to equal an older message exactly.
@@ -256,6 +266,9 @@ def resolve_and_repair_transcript_batch(
                     # "unknown", not NULL.
                     serialized = {**serialized, "token_count": target_row["token_count"]}
                 if any(target_row[column] != serialized[column] for column in _OWNED_COLUMNS):
+                    target_row = fork_protected_row_fn(target_row)
+                    target_id = int(target_row["id"])
+                    msg["_row_id"] = target_id
                     _rewrite_row(conn, session_id, target_row, serialized)
                     wrote = True
                 missing = {c: target_row[c] for c in _LIVE_MISSING_METADATA if msg.get(c) is None}
@@ -266,6 +279,10 @@ def resolve_and_repair_transcript_batch(
         elif role == "assistant" and is_content_blank(decode_content_fn(target_row["content"])):
             # Legacy dict (no digest) over a blank assistant row: the interrupted-stream repair. Fill the row
             # from live content with a content-only CAS and never adopt the blank row onto the live dict.
+            if encode_content_fn(msg.get("content")) != target_row["content"]:
+                target_row = fork_protected_row_fn(target_row)
+                target_id = int(target_row["id"])
+                msg["_row_id"] = target_id
             wrote = conn.execute(
                 "UPDATE messages SET content = ? WHERE id = ? AND session_id = ? AND content IS ?",
                 (encode_content_fn(msg.get("content")), target_id, session_id, target_row["content"]),

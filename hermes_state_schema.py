@@ -1022,6 +1022,8 @@ class SessionSchemaMixin:
             self._init_fts(cursor)
             self._stamp_settled_fts_layout(cursor)
         self._conn.commit()
+        from hermes_state_usage_history import initialize
+        initialize(self._conn)
 
     def _stamp_settled_fts_layout(self, cursor: sqlite3.Cursor) -> None:
         """Write ``fts_storage_version`` once the stored layout is exactly current and nothing is in flight.

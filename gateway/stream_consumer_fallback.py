@@ -126,10 +126,13 @@ class StreamFallbackMixin:
         # Thread only a FULL resend (it replaces the preview); a tail continuation
         # keeps its existing unthreaded delivery on every platform.
         anchor = self._initial_reply_to_id if continuation == final_text else None
+        from gateway.platforms.post_delivery import complete_body
+        complete = continuation == final_text or getattr(self, '_body_receipts_complete', False)
         for chunk in chunks:
             result = await self._send_with_flood_retry(
                 content=chunk, reply_to=None if sent_any_chunk else anchor,
                 retry_log="Flood control on fallback send, retrying in %.1fs")
+            complete = complete and complete_body(result)
             if not result or not result.success:
                 # Partial continuation landed: do NOT set _final_response_sent (the
                 # gateway must still deliver the full answer); _already_sent only
@@ -149,11 +152,12 @@ class StreamFallbackMixin:
         # re-sent.  If only the missing tail went out, the partial IS the head of
         # the answer ("sent only the second half" symptom).
         if (stale_message_id and stale_message_id != last_message_id
-                and not self._fallback_preserve_partial_messages and continuation == final_text):
+                and not self._fallback_preserve_partial_messages and continuation == final_text and complete):
             await self._delete_previews([stale_message_id], label="Fallback partial",
                                         skip_sentinel=False)
 
         self._message_id = last_message_id
+        self._confirmed_complete_body = complete
         self._already_sent = True
         # Recorder substitutes the unsplit ledger on a split turn.
         self._mark_final_delivered(record=final_text)

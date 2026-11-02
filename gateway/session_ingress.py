@@ -224,9 +224,15 @@ async def fire_post_delivery(authority, admission_id):
         return
     from gateway.platforms.base import _POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS, _split_post_delivery_entry
     from gateway.platforms.base_post_delivery import run_post_delivery_callback
-    callback = _split_post_delivery_entry(taken[2])[1]
-    with await _execution_scope(authority, None):  # off-turn: the owning profile's scope
-        await run_post_delivery_callback(callback, _POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS)
+    generation, callback = _split_post_delivery_entry(taken[2])
+    try:
+        with await _execution_scope(authority, None):  # off-turn: the owning profile's scope
+            await run_post_delivery_callback(callback, _POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS)
+    finally:
+        receipt = _registry(authority, 'delivery_receipt_owners').pop(admission_id, None)
+        if receipt is not None:
+            adapter, route = receipt
+            getattr(adapter, '_confirmed_final_deliveries', {}).pop((route, generation), None)
 
 
 async def _release_turn_marker(authority, event):
@@ -464,7 +470,16 @@ async def deliver_settled(authority, admission_id):
     delivered = False
     try:
         with await _execution_scope(authority, home):
-            delivered = await deliver_response(adapter, event, session_key, response)
+            taken = _registry(authority, 'post_delivery').get(admission_id)
+            if taken is not None:
+                from gateway.platforms.base import _split_post_delivery_entry
+                generation = _split_post_delivery_entry(taken[2])[0]
+                def confirm(complete):
+                    adapter._confirm_final_delivery(session_key, generation, complete)
+                    _registry(authority, 'delivery_receipt_owners')[admission_id] = (adapter, session_key)
+            else:
+                confirm = None
+            delivered = await deliver_response(adapter, event, session_key, response, on_final=confirm)
     except Exception:
         logger.exception('Delivery of settled admission %s failed', admission_id)
     finally:
@@ -476,7 +491,7 @@ async def deliver_settled(authority, admission_id):
             authority, admission_id, ProcessingOutcome.SUCCESS if delivered else ProcessingOutcome.FAILURE)
 
 
-async def deliver_response(adapter, event, session_key, response):
+async def deliver_response(adapter, event, session_key, response, *, on_final=None):
     """Send a turn's reply; whether it was delivered (``_process_message_background``'s verdict:
     nothing to send, or at least one send that succeeded)."""
     from gateway.platforms.base import _thread_metadata_for_event, _mark_notify_metadata
@@ -487,8 +502,10 @@ async def deliver_response(adapter, event, session_key, response):
     metadata = _mark_notify_metadata(_thread_metadata_for_event(event))
     results = []
     if extracted.text_content:
-        await adapter._send_final_text(event, session_key, extracted.text_content,
-                                       metadata, ttl > 0, ttl, results.append)
+        complete = await adapter._send_final_text(event, session_key, extracted.text_content,
+                                                  metadata, ttl > 0, ttl, results.append)
+        if on_final is not None:
+            on_final(complete)
     await adapter._deliver_attachments(event, extracted, metadata, anything_sent=bool(results),
                                        record_delivery=results.append)
     return any(getattr(result, 'success', False) for result in results if result is not None)

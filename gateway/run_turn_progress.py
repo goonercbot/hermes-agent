@@ -131,9 +131,8 @@ class GatewayTurnProgressMixin:
 
     def _track_progress_result(self, result) -> None:
         """Remember a delivered progress/status message id for end-of-turn cleanup."""
-        ctx = self._ctx
-        if ctx._cleanup_progress and getattr(result, "success", False) and getattr(result, "message_id", None):
-            ctx._cleanup_msg_ids.append(str(result.message_id))
+        from gateway.commentary_delivery import track_progress
+        track_progress(self._ctx, result)
 
     def _track_future_cleanup_id(self, fut) -> None:
         try:
@@ -933,7 +932,9 @@ class GatewayTurnProgressMixin:
 
     def _send_status_text(self, text: str, metadata, log_message: str) -> None:
         ctx = self._ctx
-        self._schedule(ctx._status_adapter.send(ctx._status_chat_id, text, metadata=metadata), log_message)
+        from gateway.commentary_delivery import remember_commentary
+        future = self._schedule(ctx._status_adapter.send(ctx._status_chat_id, text, metadata=metadata), log_message)
+        remember_commentary(ctx, future, text)
 
     def _attach_session_title_callback(self, agent, ctx) -> None:
         """Wire the platform thread-rename lane onto the agent as `_on_session_title`.

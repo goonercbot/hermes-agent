@@ -415,14 +415,23 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         notify_path = _hermes_home / ".restart_notify.json"
         if not notify_path.exists():
             return None
+        remove_marker = False
         try:
             data = json.loads(notify_path.read_text(encoding="utf-8-sig"))
             platform_str = data.get("platform")
             chat_id = data.get("chat_id")
             thread_id = data.get("thread_id")
             if not platform_str or not chat_id:
+                remove_marker = True
                 return None
             platform = Platform(platform_str)
+            from gateway.lifecycle_privacy import lifecycle_target_allowed
+            profile = self._marker_profile(data)
+            profile_config = (getattr(self, "_profile_configs", None) or {}).get(profile) or self.config
+            platform_cfg = profile_config.platforms.get(platform)
+            if not lifecycle_target_allowed(platform_cfg, platform, chat_id, thread_id, chat_type=data.get("chat_type")):
+                remove_marker = True
+                return None
             # Relay-aware transport over the REQUESTER'S profile adapter map; ``self.adapters`` is the
             # default profile's, so a secondary's "restarted" notice would leave through the wrong bot.
             transport = resolve_delivery_transport(
@@ -430,8 +439,8 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             if transport is None:
                 logger.debug("Restart notification skipped: no live transport for %s", platform_str)
                 return None
-            platform_cfg = self.config.platforms.get(platform)
             if platform_cfg is not None and not platform_cfg.gateway_restart_notification:
+                remove_marker = True
                 logger.info(
                     "Restart notification suppressed: %s has gateway_restart_notification=false", platform_str
                 )
@@ -454,12 +463,14 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                 )
                 return None
             logger.info("Sent restart notification to %s:%s", platform_str, chat_id)
+            remove_marker = True
             return str(platform_str), str(chat_id), str(thread_id) if thread_id else None
         except Exception as e:
             logger.warning("Restart notification failed: %s", e)
             return None
         finally:
-            notify_path.unlink(missing_ok=True)
+            if remove_marker:
+                notify_path.unlink(missing_ok=True)
 
     def _home_channel_transports(self):
         """Yield ``(platform, platform_cfg, home, transport)`` for every home channel with a live transport."""
@@ -552,11 +563,13 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                 delivered = {tuple(target) for target in data.get("delivered_targets", [])}
                 # Owed targets come from config, not live transports: a removed home or an opt-out
                 # (gateway_restart_notification=false) must not keep the marker alive forever.
+                from gateway.lifecycle_privacy import lifecycle_target_allowed
                 owed = {
                     _served_notice_target_key(
                         profile, platform.value, cfg.home_channel.chat_id, cfg.home_channel.thread_id)
                     for profile, platform, cfg in self._served_home_channel_configs()
                     if cfg.home_channel and cfg.home_channel.chat_id and cfg.gateway_restart_notification
+                    and lifecycle_target_allowed(cfg, platform, cfg.home_channel.chat_id, cfg.home_channel.thread_id)
                 }
                 delivered |= await self._send_home_channel_startup_notifications(skip_targets=delivered)
                 if owed <= delivered:
@@ -589,6 +602,9 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             if _served_notice_target_key(profile, platform.value, home.chat_id, home.thread_id) in skipped
         }
         for profile, platform, platform_cfg, home, transport in targets:
+            from gateway.lifecycle_privacy import lifecycle_target_allowed
+            if not lifecycle_target_allowed(platform_cfg, platform, home.chat_id, home.thread_id):
+                continue
             if not platform_cfg.gateway_restart_notification:
                 logger.info(
                     "Home-channel startup notification suppressed: %s has gateway_restart_notification=false",

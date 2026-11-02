@@ -19,10 +19,12 @@ def test_usage_receipt_includes_route_rows_and_rolls_back_on_receipt_failure(tmp
         assert db.get_session('s')['input_tokens'] == 13
         with db._read_ctx() as conn:
             assert conn.execute('SELECT input_tokens FROM session_model_usage').fetchone()[0] == 13
+            assert conn.execute('SELECT COUNT(*) FROM usage_events').fetchone()[0] == 1
         db._execute_write(lambda c: c.execute("CREATE TRIGGER deny_receipt BEFORE INSERT ON worker_receipts BEGIN SELECT RAISE(ABORT, 'deny receipt'); END"))
         with pytest.raises(sqlite3.IntegrityError, match='deny receipt'):
             rt.mutate_worker_execution(db, **(args | {'sequence': 2}))
         assert db.get_session('s')['input_tokens'] == 13
+        assert db._conn.execute('SELECT COUNT(*) FROM usage_events').fetchone()[0] == 1
         db._execute_write(lambda c: c.execute('DROP TRIGGER deny_receipt'))
         aux = dict(**scope, sequence=2, operation='usage.auxiliary',
                    payload={'task': 'compression', 'model': 'aux', 'input_tokens': 3})
@@ -31,6 +33,7 @@ def test_usage_receipt_includes_route_rows_and_rolls_back_on_receipt_failure(tmp
         assert db.get_session('s')['input_tokens'] == 13
         with db._read_ctx() as conn:
             assert conn.execute("SELECT input_tokens FROM session_model_usage WHERE task='compression'").fetchone()[0] == 3
+            assert conn.execute('SELECT COUNT(*) FROM usage_events').fetchone()[0] == 2
         with pytest.raises(rt.RuntimeStoreError, match='invalid_params'):
             rt.mutate_worker_execution(db, **(args | {'sequence': 3, 'payload': {'input_tokens': -1}}))
     finally:
@@ -52,5 +55,28 @@ def test_worker_voice_turn_usage_counts_but_never_rewrites_the_session_route(tmp
         row = db.get_session('s')
         assert (row['input_tokens'], row['model']) == (10, 'main-model')
         assert db.auxiliary_usage_by_task('s')['voice_chat']['input_tokens'] == 10
+    finally:
+        db.close()
+
+
+def test_worker_source_timestamp_survives_receipt(tmp_path):
+    from agent.runtime_session_store import RuntimeSessionStore
+    db = SessionDB(tmp_path / 'state.db')
+    try:
+        db.create_session('s', source='cli')
+        epoch = rt.begin_runtime_epoch(db, instance_id='owner')
+        scope = dict(epoch=epoch, execution_id='w', session_id='s', generation=0)
+        rt.register_worker_execution(db, **scope, kind='compute', adoption_secret='private')
+        store = RuntimeSessionStore(lambda method, **p: rt.mutate_worker_execution(db, **p), scope, tmp_path / 'outbox')
+        store.queue_token_counts('s', input_tokens=2, api_call_count=1, model='m')
+        event = dict(db._conn.execute('select * from usage_events').fetchone())
+        assert event['timing_kind'] == 'point' and event['occurred_at'] is not None
+        assert event['input_tokens'] == 2
+        store.record_auxiliary_usage('s', 'vision', model='aux', input_tokens=2)
+        store.queue_token_counts('s', input_tokens=2, api_call_count=1, model='m')
+        rows = [dict(r) for r in db._conn.execute('select * from usage_events order by rowid')]
+        assert len(rows) == 3 and len({r['event_id'] for r in rows}) == 3
+        assert rows[1]['task'] == 'vision' and rows[1]['timing_kind'] == 'point'
+        assert rows[2]['input_tokens'] == 2
     finally:
         db.close()

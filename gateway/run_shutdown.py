@@ -917,56 +917,8 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         cron work because cron runs on the scheduler's own thread pool rather than ``self._running_agents``
         (#60432).
         """
-        if not job_ids:
-            return 0
-        try:
-            from cron.jobs import get_job
-            from cron.scheduler import _resolve_delivery_targets
-        except Exception as e:
-            logger.debug("Cron interrupt notification unavailable: %s", e)
-            return 0
-        action = t("gateway.shutdown.action_restarting" if self._restart_requested else "gateway.shutdown.action_shutting_down")
-        notified: set = set()
-        for job_id in job_ids:
-            try:
-                job = get_job(job_id)
-                if not job:
-                    continue
-                # deliver=local / unresolvable-origin jobs resolve to zero targets and stay silent (no home-
-                # channel fallback). Interrupted notices are failure-category status: honor failure_deliver.
-                # See #43014.
-                targets = _resolve_delivery_targets(job, for_failure=True)
-            except Exception as e:
-                logger.debug("Cron interrupt targets unresolved for %s: %s", job_id, e)
-                continue
-            job_name = job.get("name") or job_id
-            msg = t("gateway.shutdown.cron_interrupted", job=job_name, action=action)
-            for target in targets or ():
-                try:
-                    platform = Platform(str(target.get("platform", "")).lower())
-                except Exception:
-                    continue
-                adapter = self.adapters.get(platform)
-                if adapter is None or not self._restart_notification_allowed(platform):
-                    continue
-                chat_id = str(target.get("chat_id"))
-                thread_id = target.get("thread_id")
-                dedup_key = (job_id, *_notice_target_key(platform.value, chat_id, thread_id))
-                if dedup_key in notified:
-                    continue
-                with _log_suppressed(logging.DEBUG, "Cron interrupt notice to %s:%s raised: %s", platform.value, chat_id):
-                    metadata = self._thread_metadata_for_target(platform, chat_id, thread_id, adapter=adapter)
-                    async def send_notice():
-                        if await self._send_notice_logged(
-                            adapter, chat_id, msg, platform.value, "Cron interrupt notice to %s:%s failed: %s",
-                            "Cron interrupt notice to %s:%s raised: %s", metadata=metadata,
-                        ):
-                            notified.add(dedup_key)
-                    from gateway.warning_notifications import present_notification
-                    await present_notification(send_notice, platform=platform)
-        if notified:
-            logger.info("Shutdown: delivered %d interrupted-cron-job notice(s)", len(notified))
-        return len(notified)
+        from gateway.lifecycle_privacy import notify_interrupted_cron_jobs
+        return await notify_interrupted_cron_jobs(self, job_ids)
 
     async def _shutdown_notification_target(self, session_key: str):
         """``(source, platform_str, chat_id, thread_id, profile)``: persisted origin > cached source >
@@ -1044,6 +996,12 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
                 continue
             try:
                 platform = Platform(platform_str)
+                from gateway.lifecycle_privacy import lifecycle_target_allowed
+                profile_config = (getattr(self, "_profile_configs", None) or {}).get(profile) or self.config
+                platform_config = profile_config.platforms.get(platform)
+                if not lifecycle_target_allowed(platform_config, platform, chat_id, thread_id,
+                                                 chat_type=getattr(source, "chat_type", None)):
+                    continue
                 # The session's OWN profile's bot (transport ref → profile map), never a bare
                 # self.adapters hit: under multiplex that is the default bot, so a secondary session's
                 # "Gateway shutting down" would land in the user's chat with the wrong bot.
@@ -1052,7 +1010,7 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
                     adapter = self._authorization_adapter(platform, profile)
                 if not adapter:
                     continue
-                if not self._notice_allowed(platform, "active session"):
+                if not self._notice_allowed(platform, "active session", platform_config):
                     continue
                 reply_to_message_id = getattr(source, "message_id", None)
                 if reply_to_message_id is None and restart_key == dedup_key:
@@ -1101,6 +1059,9 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         for profile, platform, platform_cfg in list(self._served_home_channel_configs()):
             home = platform_cfg.home_channel
             if not home or not home.chat_id:
+                continue
+            from gateway.lifecycle_privacy import lifecycle_target_allowed
+            if not lifecycle_target_allowed(platform_cfg, platform, home.chat_id, home.thread_id):
                 continue
             adapter = (self.adapters if profile is None else profile_adapters.get(profile) or {}).get(platform)
             if adapter is None:
@@ -1770,12 +1731,15 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
             # flight. See #60432.
             from cron.scheduler import mark_running_jobs_interrupted
             _interrupted = mark_running_jobs_interrupted(
-                f"Gateway shutdown ({phase}) killed the job's tool subprocess before the run finished."
+                f"Gateway shutdown ({phase}) killed the job's tool subprocess before the run finished.",
+                include_homes=True,
             )
             if _interrupted:
                 logger.warning(
                     "Shutdown (%s): marked %d in-flight cron job(s) interrupted: %s",
-                    phase, len(_interrupted), ", ".join(_interrupted),
+                    phase, len(_interrupted), ", ".join(
+                        str(notice.get("job_id")) if isinstance(notice, dict) else str(notice)
+                        for notice in _interrupted),
                 )
             return _interrupted
 

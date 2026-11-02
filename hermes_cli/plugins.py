@@ -240,7 +240,10 @@ class PluginContext(PluginCapabilityCtxMixin):
 
     def _abandon_load(self) -> None:
         """Mark this load as timed out; every later ``register_*``/``subscribe``/``on_unload`` is ignored."""
-        self._load_abandoned = True
+        # Serialize timeout with callback publication, not with discovery's lock:
+        # the deadline worker runs while the discovery thread holds that lock.
+        with self._manager._telegram_callback_lock:
+            self._load_abandoned = True
 
     @property
     def plugin_id(self) -> str:
@@ -851,6 +854,11 @@ class PluginContext(PluginCapabilityCtxMixin):
         ``pattern=`` or you swallow the core button flows."""
         self.register_platform_handler("telegram", factory)
 
+    def register_telegram_callback_handler(self, prefix: str, callback: Any) -> PluginRegistration:
+        """Register an authorization-gated, literal-prefix Telegram callback."""
+        from hermes_cli.plugins_telegram_callbacks import register_callback
+        return register_callback(self, prefix, callback)
+
     @_serialized_replacement
     def register_auxiliary_task(
         self, key: str, *, display_name: str, description: str,
@@ -1117,6 +1125,9 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
         self._aux_tasks: dict[str, dict[str, Any]] = {}
         self._approval_transports: dict[str, Any] = {}
         self._slack_action_handlers: list[tuple] = []
+        self._telegram_callback_handlers: list[tuple] = []
+        self._telegram_callback_lock = threading.Lock()
+        self._telegram_callback_dispatch_factory = None
         self._platform_handler_factories: dict[str, list[tuple]] = {}
         # Process-owned discovery listeners (``on_plugin_loaded``); never cleared by unload().
         self._plugin_loaded_listeners: list[Callable] = []
@@ -1448,6 +1459,10 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
     def get_slack_action_handlers(self) -> list[tuple]:
         """``(action_id, callback, plugin_name)`` tuples for the Slack adapter to wire at connect."""
         return list(self._slack_action_handlers)
+
+    def get_telegram_callback_handlers(self) -> list[tuple]:
+        """Return registered literal-prefix callbacks in registration order."""
+        return list(self._telegram_callback_handlers)
 
     def get_platform_handler_factories(self, platform: str) -> list[tuple]:
         """``(factory, plugin_name)`` tuples for one platform; adapters call ``factory(native,

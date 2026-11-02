@@ -204,7 +204,9 @@ class TestShutdownDeliversNoticeBeforeDisconnect:
         runner, adapter = make_restart_runner()
         runner._restart_drain_timeout = 0.01  # force the interrupt path
         runner._cron_drain_timeout = 0.01  # don't wait out the 30s cron drain budget
-        sched._running_job_ids.add("be62d36a9914")
+        # Register the real home-scoped key: interruption snapshots now preserve
+        # this owner even after the worker releases its in-memory registration.
+        assert sched.try_register_running_job("be62d36a9914")
 
         monkeypatch.setattr(_pr.process_registry, "kill_all", lambda task_id=None: 1)
         monkeypatch.setattr(_tt, "cleanup_all_environments", lambda: None)

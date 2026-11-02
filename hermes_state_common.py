@@ -637,6 +637,48 @@ CREATE TABLE IF NOT EXISTS worker_receipts (
     PRIMARY KEY (execution_id, sequence)
 );
 
+CREATE TABLE IF NOT EXISTS usage_events (
+    event_id TEXT PRIMARY KEY,
+    schema_version INTEGER NOT NULL,
+    event_kind TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    parent_session_id TEXT,
+    session_source TEXT NOT NULL,
+    model TEXT NOT NULL,
+    billing_provider TEXT NOT NULL DEFAULT '',
+    billing_base_url TEXT NOT NULL DEFAULT '',
+    billing_mode TEXT NOT NULL DEFAULT '',
+    task TEXT NOT NULL DEFAULT '',
+    execution_role TEXT NOT NULL,
+    task_id TEXT,
+    occurred_at REAL,
+    recorded_at REAL NOT NULL,
+    interval_start REAL,
+    interval_end REAL,
+    timing_kind TEXT NOT NULL CHECK ((timing_kind = 'point' AND occurred_at IS NOT NULL)
+        OR (timing_kind IN ('interval', 'unknown') AND occurred_at IS NULL)),
+    api_call_count INTEGER NOT NULL DEFAULT 0,
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+    reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+    estimated_cost_usd REAL,
+    actual_cost_usd REAL,
+    cost_status TEXT,
+    cost_source TEXT
+);
+CREATE TABLE IF NOT EXISTS usage_event_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT
+);
+CREATE TRIGGER IF NOT EXISTS usage_events_no_update BEFORE UPDATE ON usage_events
+BEGIN SELECT RAISE(ABORT, 'usage_events are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS usage_events_no_delete BEFORE DELETE ON usage_events
+BEGIN SELECT RAISE(ABORT, 'usage_events are immutable'); END;
+CREATE INDEX IF NOT EXISTS idx_usage_events_session ON usage_events(session_id);
+CREATE INDEX IF NOT EXISTS idx_usage_events_timing ON usage_events(timing_kind, occurred_at, interval_start, interval_end);
+
 CREATE TABLE IF NOT EXISTS state_meta (
     key TEXT PRIMARY KEY,
     value TEXT

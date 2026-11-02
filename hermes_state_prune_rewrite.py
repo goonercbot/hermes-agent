@@ -229,6 +229,10 @@ class SessionPruneRewriteMixin:
                 changed = [column for column, old, new in zip(_MESSAGE_ROW_COLUMNS, before, after)
                            if old != new and column not in _PRUNE_FIXED_COLUMNS]
                 if changed:
+                    from hermes_state_evidence_compat import has_evidence_references
+                    if has_evidence_references(conn, row_id=int(row["id"])):
+                        raise PruneRowUnresolvedError(
+                            "historical evidence references the source row; use archival generation")
                     updates.append((int(row["id"]), changed, [
                         value for column, value in zip(_MESSAGE_ROW_COLUMNS, after) if column in changed],
                         row["display_identity"],

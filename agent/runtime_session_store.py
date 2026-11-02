@@ -398,10 +398,15 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
 
     def queue_token_counts(self, session_id, **usage):
         self._session(session_id)
+        import time
+        usage['_usage_occurred_at'] = time.time()
         self._apply('usage.main', usage)
 
     def record_auxiliary_usage(self, session_id, task, **usage):
         self._session(session_id)
+        import time
+        if task != 'background_review':
+            usage['_usage_occurred_at'] = time.time()
         self._apply('usage.auxiliary', dict(usage, task=task))
 
     def flush_token_counts(self, timeout=5.0):

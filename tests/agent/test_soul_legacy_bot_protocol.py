@@ -1,6 +1,4 @@
-"""The plugin-era "## Messaging other agents" SOUL append is dead weight: the server injects
-the live section in Bot Chat only, so every copy in SOUL.md must vanish — at load time for
-sessions that start before the migration runs, and on disk once the migration runs."""
+"""Prompt filtering must not rewrite user-owned identity files on disk."""
 
 from tools import bot_mode_probe
 
@@ -26,7 +24,7 @@ def test_load_soul_md_drops_legacy_protocol_section(tmp_path, monkeypatch):
     assert "`@bot`" in bot_mode_probe.get_bot_mode_protocol_section(home)
 
 
-def test_migration_41_strips_every_profile_soul_once(tmp_path, monkeypatch):
+def test_migration_41_preserves_every_profile_soul(tmp_path, monkeypatch):
     from hermes_cli.config_migrations import _migrate_to_41
 
     home = tmp_path / ".hermes"
@@ -38,8 +36,8 @@ def test_migration_41_strips_every_profile_soul_once(tmp_path, monkeypatch):
     results = {"config_added": []}
     _migrate_to_41(results, quiet=True)
 
-    assert (home / "SOUL.md").read_text(encoding="utf-8") == "# Me\n\nBe terse.\n"
-    assert (home / "profiles" / "worker" / "SOUL.md").read_text(encoding="utf-8") == "# Worker\n"
-    assert results["config_added"] and "default" in results["config_added"][0] and "worker" in results["config_added"][0]
+    assert (home / "SOUL.md").read_text(encoding="utf-8") == LEGACY
+    assert (home / "profiles" / "worker" / "SOUL.md").read_text(encoding="utf-8") == "# Worker\n\n## Messaging other agents\nx\n"
+    assert results["config_added"] == []
     _migrate_to_41(results := {"config_added": []}, quiet=True)
-    assert results["config_added"] == []  # idempotent: nothing left to strip
+    assert results["config_added"] == []

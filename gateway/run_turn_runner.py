@@ -274,6 +274,7 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                         # callback carrying the final answer participates in final-send dedup.
                         on_missing_cursor="fallback" if want_interim_messages else "raise",
                     )
+                    from gateway.commentary_delivery import track_commentary
                     stream_consumer = GatewayStreamConsumer(
                         adapter=adapter, chat_id=ctx.source.chat_id, config=consumer_cfg,
                         metadata=ctx._status_thread_metadata,
@@ -282,6 +283,7 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                         ),
                         on_before_finalize=pause_typing_before_finalize,
                         initial_reply_to_id=ctx.event_message_id, run_still_current=ctx._run_still_current,
+                        on_commentary_delivered=lambda result, text: track_commentary(ctx, result, text),
                     )
                     ctx.stream_consumer_holder[0] = stream_consumer
                     # #105341: a consumer created only for interim commentary (text streaming off)

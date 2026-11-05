@@ -16,6 +16,12 @@ def track_progress(ctx, result):
                 ctx._cleanup_msg_ids.append(mid)
 
 
+def track_commentary(ctx, result, text):
+    if ctx._cleanup_progress and getattr(result, 'success', False):
+        track_progress(ctx, result)
+        ctx._commentary_messages.extend((mid, text) for mid in message_ids(result))
+
+
 def remember_commentary(ctx, future, text):
     if future is None or not ctx._cleanup_progress:
         return
@@ -23,9 +29,7 @@ def remember_commentary(ctx, future, text):
     def remember(done):
         with suppress(Exception):
             result = done.result()
-            track_progress(ctx, result)
-            if getattr(result, 'success', False):
-                ctx._commentary_messages.extend((mid, text) for mid in message_ids(result))
+            track_commentary(ctx, result, text)
     future.add_done_callback(remember)
 
 
@@ -39,6 +43,8 @@ def schedule_cleanup(response, adapter, ctx):
             and hasattr(adapter, 'register_post_delivery_callback')):
         return
     final_text = str(response.get('final_response') or '').strip()
+    from gateway.platforms.base import _strip_media_directives
+    final_body = _strip_media_directives(final_text).strip()
     if response.get('_complete_final_body') and final_text:
         adapter._confirm_final_delivery(ctx.session_key, ctx.run_generation, True)
     async def cleanup():
@@ -47,7 +53,8 @@ def schedule_cleanup(response, adapter, ctx):
         for future in ctx._commentary_delivery_futures:
             with suppress(Exception):
                 await asyncio.wrap_future(future)
-        keep = {mid for mid, text in ctx._commentary_messages if final_text and str(text).strip() == final_text}
+        keep = {mid for mid, text in ctx._commentary_messages
+                if str(text).strip() and str(text).strip() in (final_text, final_body)}
         for mid in dict.fromkeys(ctx._cleanup_msg_ids):
             current = ctx._run_still_current
             if callable(current) and not current():

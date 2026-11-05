@@ -370,6 +370,11 @@ class StreamFallbackMixin:
             # suppress the real final after multiple tool calls.
             if result.success:
                 self._notify_new_message()
+                if self._on_commentary_delivered is not None:
+                    try:
+                        self._on_commentary_delivered(result, text)
+                    except Exception:
+                        logger.debug("Commentary receipt callback failed", exc_info=True)
                 # Lets run.py confirm whether an interim send carried the final.
                 # Record the exact delivered text so run.py can confirm whether an interim "preview"
                 # actually carried the final response, vs. unrelated commentary delivered during a session

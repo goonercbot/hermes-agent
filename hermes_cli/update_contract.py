@@ -139,6 +139,8 @@ def evaluate_update_admission(project_root: Path) -> Optional[UpdateRefusal]:
         method = detect_install_method(project_root)
         if method == "docker":
             return _refusal("docker", method)
+        if method == "external":
+            return _refusal("external", method)
         if is_nix_install_method(method) or method == "apt":
             return _refusal(method if method == "apt" else "nix", method)
     except Exception as exc:

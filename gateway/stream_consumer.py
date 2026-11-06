@@ -942,8 +942,8 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         elif self._accumulated:
             await self._finalize_edit_path(tick)
         if self._final_content_delivered and self._superseded_reply_ids:
-            await self._delete_previews(self._superseded_reply_ids, skip=self._message_id,
-                                        label="Recovered reply")
+            await self._delete_previews(self._superseded_reply_ids - self._final_receipt_ids,
+                                        skip=self._message_id, label="Recovered reply")
             self._superseded_reply_ids.clear()
 
     async def _finalize_edit_path(self, tick: _Tick) -> None:

@@ -237,10 +237,14 @@ class StreamTransportMixin:
 
     def _track_preview_ids_from_result(self, result: Any) -> None:
         """Record the primary id plus any continuation ids from an oversized split."""
+        self._segment_fresh_message_ids.update(
+            str(mid) for mid in (getattr(result, "fresh_message_ids", None) or ()) if mid is not None)
         raw = getattr(result, "raw_response", None) or {}
         raw_ids = raw.get("message_ids") if isinstance(raw, dict) else None
+        partial_ids = raw.get("delivered_message_ids") if isinstance(raw, dict) else None
         for mid in (getattr(result, "message_id", None),
-                    *(getattr(result, "continuation_message_ids", None) or ()), *(raw_ids or ())):
+                    *(getattr(result, "continuation_message_ids", None) or ()), *(raw_ids or ()),
+                    *(partial_ids or ()), *(getattr(result, "fresh_message_ids", None) or ())):
             self._track_preview_id(mid)
 
     def _track_final_receipt(self, result: Any) -> None:
@@ -479,6 +483,9 @@ class StreamTransportMixin:
             self._confirmed_complete_body = complete_body(result) and (
                 not self._turn_split_delivery or self._body_receipts_complete)
         if not result.success:
+            raw = getattr(result, "raw_response", None)
+            if isinstance(raw, dict) and raw.get("partial_overflow"):
+                self._track_preview_ids_from_result(result)
             self._edit_supported = False
             return False
         if finalize:
@@ -590,6 +597,7 @@ class StreamTransportMixin:
         # duplicate #45517 fixed (#36965 / #25349).
         raw_response = getattr(result, "raw_response", None)
         if isinstance(raw_response, dict) and raw_response.get("partial_overflow"):
+            self._track_preview_ids_from_result(result)
             # Some overflow chunks landed but not the whole response: preserve the
             # visible prefix so got_done sends the missing tail.
             self._message_id = str(raw_response.get("last_message_id") or result.message_id

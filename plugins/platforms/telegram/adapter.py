@@ -1528,7 +1528,8 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         if message_id is not None:
             await self._record_rich_sent(chat_id, message_id, content)
         return SendResult(success=True, message_id=str(message_id) if message_id is not None else None,
-                          full_payload_delivered=True if message_id is not None else None)
+                          full_payload_delivered=True if message_id is not None else None,
+                          fresh_message_ids=(str(message_id),) if message_id is not None else ())
 
     def _rich_payload_base(self, chat_id: str, content: str) -> dict[str, Any]:
         payload: dict[str, Any] = {"chat_id": normalize_telegram_chat_id(chat_id), "rich_message": self._rich_message_payload(content)}
@@ -3683,6 +3684,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         error_types = self._telegram_error_types()
         chunks: list[str] = []
         delivered: list[str] = []
+        fresh: list[str] = []
         try:
             # Bot API 10.1 rich fast-path; falls through to legacy MarkdownV2 on permanent/capability
             # errors or DM-topic skips; returns directly on success or transient failure (no legacy resend).
@@ -3699,10 +3701,10 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
                     _separate_chunk_indicator_from_fence(re.sub(r" \((\d+)/(\d+)\)$", r" \\(\1/\2\\)", chunk))
                     for chunk in chunks
                ]
-            return await self._send_chunks(chat_id, chunks, delivered, reply_to, metadata, error_types)
+            return await self._send_chunks(chat_id, chunks, delivered, fresh, reply_to, metadata, error_types)
         except Exception as e:
             classified = self._classify_send_exception(e, error_types)
-            return self._with_partial_send(classified, chunks[len(delivered):], delivered, tail_certain=classified.retryable)
+            return self._with_partial_send(classified, chunks[len(delivered):], delivered, fresh, tail_certain=classified.retryable)
 
     def _classify_send_exception(self, e: Exception, error_types: tuple) -> SendResult:
         """The failed ``SendResult`` for an exception escaping the chunk loop. ``retryable`` doubles as
@@ -3724,7 +3726,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             error_kind=error_kind)
 
     async def _send_chunks(
-        self, chat_id: str, chunks: list[str], delivered: list[str], reply_to: Optional[str],
+        self, chat_id: str, chunks: list[str], delivered: list[str], fresh: list[str], reply_to: Optional[str],
         metadata: Optional[dict[str, Any]], error_types: tuple) -> SendResult:
         """Deliver formatted ``chunks`` in order, appending each landed message id to ``delivered``
         (pre-seeded with the ids of an earlier partial send when resuming — the chunk index used for
@@ -3739,23 +3741,27 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             if isinstance(outcome, SendResult):
                 # Every SendResult returned here is a DEFINITE non-delivery (flood cap, DM-topic refusal);
                 # ambiguous timeouts raise instead, so the remainder is safe to resume from.
-                return self._with_partial_send(outcome, chunks[len(delivered) - prior:], delivered)
+                return self._with_partial_send(outcome, chunks[len(delivered) - prior:], delivered, fresh)
             msg, used_thread_fallback = outcome
             delivered.append(str(msg.message_id))
+            if msg.message_id is not None:
+                fresh.append(str(msg.message_id))
         await self._retrigger_typing(chat_id, metadata)
         return SendResult(
             success=True, message_id=delivered[0] if delivered else None,
             full_payload_delivered=True if chunks and delivered else None,
+            fresh_message_ids=tuple(fresh),
             raw_response={
                 "message_ids": list(delivered), "requested_thread_id": requested_thread_id, "thread_fallback": used_thread_fallback})
 
     @staticmethod
     def _with_partial_send(
-        result: SendResult, undelivered: list[str], delivered: list[str], *, tail_certain: bool = True) -> SendResult:
+        result: SendResult, undelivered: list[str], delivered: list[str], fresh: list[str], *, tail_certain: bool = True) -> SendResult:
         """Mark a split-send failure that happened after earlier chunks landed with the ``partial_overflow``
         contract (the same key ``_edit_overflow_split`` sets and the stream consumer reads), so no caller
         re-sends the already-visible head. ``undelivered`` (the formatted remainder, for
         :meth:`_resume_partial_send`) is attached only when ``tail_certain``. No-op when nothing landed."""
+        result.fresh_message_ids = tuple(fresh)
         if not delivered:
             return result
         raw = dict(result.raw_response) if isinstance(result.raw_response, dict) else {}
@@ -3777,18 +3783,19 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         if not undelivered or not self._bot:
             return None
         delivered = list(raw.get("delivered_message_ids") or ())
+        fresh = list(result.fresh_message_ids)
         prior = len(delivered)
         async with self._chat_send_lock(chat_id):
             cooldown = self._send_flood_cooldown_remaining(chat_id)
             if cooldown is not None:
-                return self._with_partial_send(_flood_cap_result(cooldown), list(undelivered), delivered)
+                return self._with_partial_send(_flood_cap_result(cooldown), list(undelivered), delivered, fresh)
             error_types = self._telegram_error_types()
             try:
-                return await self._send_chunks(chat_id, list(undelivered), delivered, reply_to, metadata, error_types)
+                return await self._send_chunks(chat_id, list(undelivered), delivered, fresh, reply_to, metadata, error_types)
             except Exception as e:
                 classified = self._classify_send_exception(e, error_types)
                 return self._with_partial_send(
-                    classified, list(undelivered)[len(delivered) - prior:], delivered, tail_certain=classified.retryable)
+                    classified, list(undelivered)[len(delivered) - prior:], delivered, fresh, tail_certain=classified.retryable)
 
     async def send_or_update_status(
         self, chat_id: str, status_key: str, content: str, *, metadata: Optional[dict[str, Any]] = None) -> SendResult:
@@ -4041,6 +4048,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
                 return SendResult(success=False, error=_redact_telegram_error_text(e))
         # Continuations call self._bot.send_message directly to skip self.send's pre-chunking.
         continuation_ids: list[str] = []
+        fresh_ids: list[str] = []
         delivered_chunks = [first_chunk]
         prev_id = message_id
         thread_id = self._metadata_thread_id(metadata)
@@ -4058,15 +4066,18 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
                         "partial_overflow": True, "delivered_chunks": 1 + len(continuation_ids),
                         "total_chunks": len(chunks), "last_message_id": prev_id, "delivered_prefix": delivered_prefix,
                         "continuation_message_ids": tuple(continuation_ids)},
-                    continuation_message_ids=tuple(continuation_ids))
-            new_id = str(getattr(sent_msg, "message_id", "")) or prev_id
+                    continuation_message_ids=tuple(continuation_ids), fresh_message_ids=tuple(fresh_ids))
+            sent_id = getattr(sent_msg, "message_id", None)
+            new_id = str(sent_id) if sent_id is not None else prev_id
+            if sent_id is not None and new_id and new_id != str(message_id):
+                fresh_ids.append(new_id)
             continuation_ids.append(new_id)
             delivered_chunks.append(chunk)
             prev_id = new_id
         last_id = continuation_ids[-1] if continuation_ids else message_id
         logger.debug("[%s] Overflow split delivered %d chunks; last_id=%s", self.name, 1 + len(continuation_ids), last_id)
         return SendResult(success=True, message_id=last_id, continuation_message_ids=tuple(continuation_ids),
-                          full_payload_delivered=True if finalize else None)
+                          full_payload_delivered=True if finalize else None, fresh_message_ids=tuple(fresh_ids))
 
     async def delete_message(self, chat_id: str, message_id: str) -> bool:
         """Delete a bot-posted message (Bot API allows it within 48h); failures are non-fatal.

@@ -1611,6 +1611,9 @@ class SendResult:
     error_kind: Optional[str] = None
     # Explicit proof the complete requested body reached the transport.
     full_payload_delivered: Optional[bool] = None
+    # Positive transport evidence only; empty means no known newly created IDs.
+    # A resumed logical send may aggregate its earlier partial receipt.
+    fresh_message_ids: tuple[str, ...] = ()
 
 
 # Longest server ``retry_after`` ``_send_with_retry`` will sleep inline. Longer penalties return the

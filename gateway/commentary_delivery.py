@@ -71,7 +71,8 @@ def schedule_cleanup(response, adapter, ctx):
             current = ctx._run_still_current
             if callable(current) and not current():
                 return
-            if mid not in keep:
+            if (mid not in keep and not getattr(adapter, '_waiting_receipts_disabled', False)
+                    and (str(ctx.source.chat_id), mid) not in getattr(adapter, '_waiting_promoted_ids', set())):
                 with suppress(Exception):
                     await adapter.delete_message(ctx.source.chat_id, mid)
     adapter.register_post_delivery_callback(ctx.session_key, cleanup, generation=ctx.run_generation)

@@ -106,8 +106,7 @@ def schedule_waiting_resolution(response, adapter, ctx):
     from tools.delegate_waiting_reply import waiting_reply, resolving_reply, completed_owned
 
     if (adapter is None or not ctx.session_key or ctx.run_generation is None
-            or not callable(getattr(adapter, 'register_post_delivery_callback', None))
-            or not getattr(adapter, '_waiting_reply_receipts', None)):
+            or not callable(getattr(adapter, 'register_post_delivery_callback', None))):
         return
     agent = ctx.agent_holder[0]
     if waiting_reply(agent):
@@ -123,7 +122,9 @@ def schedule_waiting_resolution(response, adapter, ctx):
     current = ctx._run_still_current
     consumer = ctx.stream_consumer_holder[0]
     token = object()
-    ledger = adapter._waiting_reply_receipts
+    ledger = getattr(adapter, '_waiting_reply_receipts', None)
+    if ledger is None:
+        ledger = adapter._waiting_reply_receipts = OrderedDict()
     for key, record in list(ledger.items()):
         if key[1] == route[1]:
             pending = record.setdefault('_pending_finals', set())
@@ -136,8 +137,6 @@ def schedule_waiting_resolution(response, adapter, ctx):
         adapter._confirm_final_delivery(ctx.session_key, ctx.run_generation, True)
 
     async def cleanup():
-        if getattr(adapter, '_waiting_reply_receipts', None) is not ledger:
-            return
         final_ids = set(getattr(guard, '_hermes_final_delivery_ids', ()))
         stream_ids = set(getattr(consumer, '_final_receipt_ids', ())) if consumer is not None else set()
         keep = final_ids | stream_ids
@@ -146,15 +145,19 @@ def schedule_waiting_resolution(response, adapter, ctx):
             if getattr(consumer, 'message_id', None):
                 keep.add(str(consumer.message_id))
         # Even an incomplete or nontext genuine final must never remain eligible.
-        promoted = {(route[1], mid) for key, record in list(ledger.items()) if key[1] == route[1]
-                    for mid in keep.intersection(record['message_ids'])}
+        promoted = {(route[1], mid) for mid in keep
+                    if isinstance(mid, str) and 0 < len(mid) <= 1024}
         protected = getattr(adapter, '_waiting_promoted_ids', set())
-        if len(protected | promoted) > _MAX_IDS:
+        if len(promoted) != len(keep) or len(protected | promoted) > _MAX_IDS:
             adapter._waiting_receipts_disabled = True
-            ledger.clear()
+            current_ledger = getattr(adapter, '_waiting_reply_receipts', None)
+            if current_ledger is not None:
+                current_ledger.clear()
             return
         if promoted:
             adapter._waiting_promoted_ids = protected | promoted
+        if getattr(adapter, '_waiting_reply_receipts', None) is not ledger:
+            return
         for key, record in list(ledger.items()):
             if key[1] == route[1] and keep.intersection(record['message_ids']):
                 record['message_ids'] = record['message_ids'] - keep
@@ -202,6 +205,10 @@ def schedule_waiting_resolution(response, adapter, ctx):
             units = tuple(dict.fromkeys((*resolution.delegation_ids, *record['delegation_ids'])))
             if not completed_owned(resolution.identity, units):
                 return
+            if (getattr(adapter, '_waiting_receipts_disabled', False)
+                    or mid not in record['message_ids']
+                    or (str(chat), mid) in getattr(adapter, '_waiting_promoted_ids', set())):
+                continue
             try:
                 deleted = await adapter.delete_message(chat, mid)
             except Exception:

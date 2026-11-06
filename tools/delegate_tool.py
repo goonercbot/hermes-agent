@@ -552,7 +552,7 @@ def delegate_task(
     goal: Optional[str] = None, context: Optional[str] = None, tasks: Optional[list[dict[str, Any]]] = None,
     max_iterations: Optional[int] = None, role: Optional[str] = None, background: Optional[bool] = None,
     output_schema: Optional[dict[str, Any]] = None, images: Optional[list[str]] = None, action: Optional[str] = None,
-    subagent_id: Optional[str] = None, message: Optional[str] = None, parent_agent=None,
+    subagent_id: Optional[str] = None, message: Optional[str] = None, delegation_ids: Optional[list[str]] = None, parent_agent=None,
     credentials_cfg: Optional[dict[str, Any]] = None,
 ) -> str:
     """Spawn child agents (single ``goal`` or ``tasks=[...]`` batch) or control running ones. ``action``
@@ -563,10 +563,13 @@ def delegate_task(
         return tool_error("delegate_task requires a parent agent context.")
 
     normalized_action = (action or "").strip().lower()
+    if normalized_action == "classify_waiting_reply":
+        from tools.delegate_waiting_reply import classify_waiting_reply
+        return classify_waiting_reply(parent_agent, delegation_ids)
     if normalized_action in _CONTROL_ACTIONS:
         return _handle_control_action(normalized_action, subagent_id, message, parent_agent)
     if normalized_action and normalized_action != "spawn":
-        return tool_error(f"Unknown action '{action}'. Use spawn (default), list, steer, or stop.")
+        return tool_error(f"Unknown action '{action}'. Use spawn (default), list, steer, stop, or classify_waiting_reply.")
 
     # Operator kill switch (TUI / delegation.pause RPC): blocks NEW spawns only.
     if is_spawn_paused():
@@ -698,7 +701,10 @@ _DESCRIPTION_DELIVERY = (
     "Otherwise runs in the background: dispatch returns live transcript paths and results re-enter "
     "as a new message when subagents finish ({delivery}). Background results are delivered only "
     "BETWEEN your turns: finish whatever does not depend on them, then give a one-line status and END YOUR TURN. Never "
-    "wait or poll on transcripts, artifact files, or CI for a child. "
+    "wait or poll on transcripts, artifact files, or CI for a child. Before a final that is ONLY a temporary "
+    "waiting status, call action='classify_waiting_reply' with the exact live delegation unit IDs, "
+    "then immediately end the turn; use units[].delegation_id when multiple units are listed; "
+    "never use it for a genuine or substantive answer. "
     "While children run, `action` (list/steer/stop) controls them live.\n\n"
 )
 _ONESHOT_DESCRIPTION_DELIVERY = "Parallel children are joined and their results return in this tool call.\n\n"
@@ -842,9 +848,11 @@ DELEGATE_TASK_SCHEMA = {
                 "course-correction text into one child (subagent_id + "
                 "message) without stopping it; 'stop' = end one child "
                 "early (subagent_id; partial result still returns). "
-                "Control actions return immediately; goal/tasks are ignored unless spawning.",
-                enum=["spawn", "list", "steer", "stop"],
+                "'classify_waiting_reply' opts in the upcoming pure temporary wait (delegation_ids required), "
+                "never a genuine answer. Control actions return immediately; goal/tasks are ignored unless spawning.",
+                enum=["spawn", "list", "steer", "stop", "classify_waiting_reply"],
             ),
+            "delegation_ids": _p("array", "Exact live completion unit delegation IDs for action='classify_waiting_reply'.", items={"type": "string"}),
             "subagent_id": _p("string", "Target for action='steer'/'stop' (ids from the spawn response or action='list')."),
             "message": _p(
                 "string",
@@ -857,7 +865,7 @@ DELEGATE_TASK_SCHEMA = {
 }
 
 
-_LIVE_CONTROL_PARAMS = frozenset({"action", "subagent_id", "message"})
+_LIVE_CONTROL_PARAMS = frozenset({"action", "subagent_id", "message", "delegation_ids"})
 
 
 def oneshot_delegate_function(function: dict) -> dict:
@@ -925,6 +933,7 @@ registry.register(
         max_iterations=args.get("max_iterations"), role=args.get("role"),
         background=_model_background_value(args, kw.get("parent_agent")), output_schema=args.get("output_schema"),
         images=args.get("images"), action=args.get("action"), subagent_id=args.get("subagent_id"), message=args.get("message"),
+        delegation_ids=args.get("delegation_ids"),
         parent_agent=kw.get("parent_agent"),
     ),
     check_fn=check_delegate_requirements,

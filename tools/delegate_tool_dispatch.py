@@ -336,13 +336,18 @@ _BACKGROUND_NOTES = {
     "one": (
         "Subagent is running in the background; its full result re-enters the conversation as a new message when it "
         "finishes. Results are delivered only after you END YOUR TURN: do anything that does not depend on it, then "
-        "stop with a one-line status. Do not poll its transcript or artifacts to wait for it."
+        "stop with a one-line status. If that final is purely temporary waiting, first call "
+        "delegate_task(action='classify_waiting_reply', delegation_ids=[the exact unit IDs]). "
+        "Never classify a genuine or substantive answer. Do not poll its transcript or artifacts to wait for it."
     ),
     "many": (
         "{n} subagents are running in parallel in the background as {k} completion unit(s); each unit's results "
         "re-enter the conversation as their own new message when THAT unit finishes. Results are delivered only "
         "after you END YOUR TURN: do anything that does not depend on them, then stop with a one-line status. Do not "
-        "poll transcripts or artifacts to wait for them."
+        "poll transcripts or artifacts to wait for them. If the final is purely temporary waiting, first call "
+        "delegate_task(action='classify_waiting_reply', delegation_ids=[the exact unit IDs]); use each "
+        "units[].delegation_id when units are listed, not the call-wide delegation_id; "
+        "never classify a genuine or substantive answer."
     ),
     "control_hint": (
         "While a child runs you can orchestrate it live with this same tool: delegate_task(action='list') to see live "
@@ -444,10 +449,12 @@ def _dispatch_background(batch: _Batch) -> str:
         return _run_sync_with_note(batch, "no_async")
 
     parent_agent = batch.parent_agent
+    from tools.delegate_waiting_reply import dispatch_identity
     session_key, origin_ui_session_id = _resolve_async_session_key(parent_agent, batch.origin_ui_session_id)
     routing = dict(
         session_key=session_key, origin_ui_session_id=origin_ui_session_id, origin_session_id=wake_sid,
         parent_session_id=getattr(parent_agent, "session_id", None), max_async_children=_get_max_async_children(),
+        waiting_identity=dispatch_identity(parent_agent),
     )
 
     units = [replace(unit, refused=[]) for unit in _units_of(batch)]

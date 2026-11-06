@@ -60,6 +60,18 @@ def dispatch_identity(agent: Any) -> Optional[DispatchIdentity]:
         return DispatchIdentity(state["owner"], state["root"])
 
 
+def adopt_dispatch_identity(agent: Any, turn_id: str, identity: DispatchIdentity) -> bool:
+    """Adopt a proven owner and root before the first dispatch of this turn."""
+    with _lock:
+        state = _turn_state(agent)
+        if (type(identity) is not DispatchIdentity or not identity.owner_id or not identity.root_request_id
+                or state is None or state['turn'] != turn_id or state['dispatched'] or state['waiting'] is not None):
+            return False
+        agent._waiting_reply_owner = identity.owner_id
+        state['owner'], state['root'] = identity.owner_id, identity.root_request_id
+        return True
+
+
 def waiting_reply(agent: Any) -> Optional[WaitingReply]:
     """Return only this turn's opt-in; it is not proof of delivery or a complete final."""
     with _lock:

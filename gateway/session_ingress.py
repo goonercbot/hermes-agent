@@ -315,6 +315,8 @@ async def execute_admission(authority, ref, row):
         # turn's resolver never re-reads (and on a transient failure drops) an admitted completion.
         event.metadata['gateway_proven_session_id'] = (
             authority.physical_target(ref) if 'native_text_v1' in row['payload'] else event.metadata['gateway_session_id'])
+    if event.internal and hasattr(authority, 'take_waiting_lineage'):
+        event._waiting_lineage_proof = authority.take_waiting_lineage(ref, row, route)
     provenance = row['payload'].get('native_text_v1', {}).get('provenance')
     home = None
     if provenance is not None:

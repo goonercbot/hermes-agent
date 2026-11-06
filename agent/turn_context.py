@@ -594,6 +594,8 @@ def _bind_turn_identity(
     )
     agent._relay_pending_turn_id = None
     agent._current_turn_id = turn_id
+    from tools.waiting_lineage import adopt_bound_turn
+    adopt_bound_turn(agent, turn_id)
     agent._current_api_request_id = ""
     # Tripwire: warn when this turn starts before the previous turn-end persist
     # (concurrent turns interleave transcript writes). Cleared in _persist_session.

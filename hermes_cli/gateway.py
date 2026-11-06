@@ -2931,8 +2931,9 @@ def legacy_launchd_labels_for_install(exclude=()) -> list[str]:
 
 def get_python_path() -> str:
     from hermes_cli._launchers import resolve_store_python
+    from hermes_cli.external_service_binding import external_service_python
 
-    return str(resolve_store_python(PROJECT_ROOT) or sys.executable)
+    return str(external_service_python(PROJECT_ROOT, require_if_store=True) or resolve_store_python(PROJECT_ROOT) or sys.executable)
 
 
 # =============================================================================
@@ -3168,6 +3169,9 @@ def _prepare_service_launcher(*, system: bool = False, run_as_user: str | None =
         owner = (uid, username)
     token = set_hermes_home_override(home)
     try:
+        from hermes_cli.external_service_binding import external_service_python
+        if external_service_python(root, require_if_store=True) is not None:
+            return  # The external owner, not PM, owns this installation.
         # Publication gate: ask what stage_launcher will bind, so an inherited
         # HERMES_RUNTIME_DIR cannot stand in for this install's store (#131745).
         if resolve_store_python(root, publication=True) is None:

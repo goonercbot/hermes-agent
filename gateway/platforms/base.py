@@ -4471,15 +4471,18 @@ class BasePlatformAdapter(FinalDeliveryReceiptMixin, ABC):
         """Background task that actually processes the message."""
         delivery_attempted = delivery_succeeded = False  # feeds the processing-complete hook
 
-        def _record_delivery(result):
+        def _record_delivery(result, *, final_text=False):
             nonlocal delivery_attempted, delivery_succeeded
             if result is not None:
+                if not final_text:
+                    interrupt_event._hermes_nontext_delivery_attempted = True
                 delivery_attempted = True
                 delivery_succeeded = delivery_succeeded or bool(getattr(result, "success", False))
                 record_final_ids(interrupt_event, result)
         # Reuse the interrupt event handle_message() installed; new Event only if removed externally.
         interrupt_event = self._active_sessions.get(session_key) or asyncio.Event()
         interrupt_event._hermes_final_delivery_ids = set()
+        interrupt_event._hermes_nontext_delivery_attempted = False
         self._active_sessions[session_key] = interrupt_event
         _thread_metadata = _thread_metadata_for_event(event)
         typing_task = self._start_typing_refresh(event, interrupt_event, _thread_metadata)
@@ -4540,7 +4543,8 @@ class BasePlatformAdapter(FinalDeliveryReceiptMixin, ABC):
                 if text_content and not _tts_caption_delivered:
                     complete = await self._send_final_text(
                         event, session_key, text_content, _final_thread_metadata,
-                        is_ephemeral_response, _ephemeral_ttl, _record_delivery)
+                        is_ephemeral_response, _ephemeral_ttl,
+                        lambda result: _record_delivery(result, final_text=True))
                     self._confirm_final_delivery(session_key,
                         getattr(interrupt_event, "_hermes_run_generation", None), complete)
                 await self._deliver_attachments(

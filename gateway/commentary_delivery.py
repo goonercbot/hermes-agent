@@ -35,6 +35,8 @@ def remember_commentary(ctx, future, text):
 
 def schedule_cleanup(response, adapter, ctx):
     import asyncio
+    from gateway.waiting_reply_delivery import schedule_waiting_receipt
+    schedule_waiting_receipt(response, adapter, ctx)
     if not (ctx._cleanup_progress and adapter is not None and ctx.session_key
             and (ctx._cleanup_msg_ids or ctx._commentary_delivery_futures)
             and isinstance(response, dict) and not response.get('failed')

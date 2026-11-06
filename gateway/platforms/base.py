@@ -1808,7 +1808,7 @@ def _lazy_attr(obj: Any, name: str, factory: Callable[[], Any]) -> Any:
 _strip_media_directives = _strip_media_tag_directives
 
 
-from gateway.platforms.post_delivery import FinalDeliveryReceiptMixin
+from gateway.platforms.post_delivery import FinalDeliveryReceiptMixin, record_final_ids
 
 
 class BasePlatformAdapter(FinalDeliveryReceiptMixin, ABC):
@@ -4457,11 +4457,7 @@ class BasePlatformAdapter(FinalDeliveryReceiptMixin, ABC):
         if late_pending is not None:
             existing_task = self._session_tasks.get(session_key)
             if existing_task is not None and existing_task is not current_task:
-                # The in-band drain (or an earlier late-arrival drain) already spawned a follow-up task that
-                # owns this session. Re-queue the late-arrival event so that task picks it up — avoids
-                # spawning two concurrent _process_message_background tasks for the same key (#17758
-                # follow-up: prevents the create_task path from racing with itself across the
-                # in-band/finally boundary).
+                # Re-queue for the existing drain; spawning another races the in-band/finally boundary (#17758).
                 self._pending_messages[session_key] = late_pending
             else:
                 logger.debug(
@@ -4480,8 +4476,10 @@ class BasePlatformAdapter(FinalDeliveryReceiptMixin, ABC):
             if result is not None:
                 delivery_attempted = True
                 delivery_succeeded = delivery_succeeded or bool(getattr(result, "success", False))
+                record_final_ids(interrupt_event, result)
         # Reuse the interrupt event handle_message() installed; new Event only if removed externally.
         interrupt_event = self._active_sessions.get(session_key) or asyncio.Event()
+        interrupt_event._hermes_final_delivery_ids = set()
         self._active_sessions[session_key] = interrupt_event
         _thread_metadata = _thread_metadata_for_event(event)
         typing_task = self._start_typing_refresh(event, interrupt_event, _thread_metadata)

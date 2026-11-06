@@ -16,6 +16,12 @@ def track_progress(ctx, result):
                 ctx._cleanup_msg_ids.append(mid)
 
 
+def track_commentary(ctx, result, text):
+    if ctx._cleanup_progress and getattr(result, 'success', False):
+        track_progress(ctx, result)
+        ctx._commentary_messages.extend((mid, text) for mid in message_ids(result))
+
+
 def remember_commentary(ctx, future, text):
     if future is None or not ctx._cleanup_progress:
         return
@@ -23,9 +29,7 @@ def remember_commentary(ctx, future, text):
     def remember(done):
         with suppress(Exception):
             result = done.result()
-            track_progress(ctx, result)
-            if getattr(result, 'success', False):
-                ctx._commentary_messages.extend((mid, text) for mid in message_ids(result))
+            track_commentary(ctx, result, text)
     future.add_done_callback(remember)
 
 
@@ -39,6 +43,9 @@ def schedule_cleanup(response, adapter, ctx):
             and hasattr(adapter, 'register_post_delivery_callback')):
         return
     final_text = str(response.get('final_response') or '').strip()
+    from gateway.platforms.base import _strip_media_directives
+    final_body = _strip_media_directives(final_text).strip()
+    delivery_guard = adapter._active_sessions.get(ctx.session_key)
     if response.get('_complete_final_body') and final_text:
         adapter._confirm_final_delivery(ctx.session_key, ctx.run_generation, True)
     async def cleanup():
@@ -47,7 +54,16 @@ def schedule_cleanup(response, adapter, ctx):
         for future in ctx._commentary_delivery_futures:
             with suppress(Exception):
                 await asyncio.wrap_future(future)
-        keep = {mid for mid, text in ctx._commentary_messages if final_text and str(text).strip() == final_text}
+        keep = {mid for mid, text in ctx._commentary_messages
+                if str(text).strip() and str(text).strip() in (final_text, final_body)}
+        keep.update(getattr(delivery_guard, '_hermes_final_delivery_ids', ()))
+        consumer = ctx.stream_consumer_holder[0]
+        if consumer:
+            keep.update(consumer._final_receipt_ids)
+        if consumer and consumer.final_content_delivered:
+            keep.update(consumer._segment_preview_message_ids)
+            if consumer.message_id:
+                keep.add(str(consumer.message_id))
         for mid in dict.fromkeys(ctx._cleanup_msg_ids):
             current = ctx._run_still_current
             if callable(current) and not current():
@@ -69,6 +85,10 @@ async def edit_streamed_final(consumer, source, response, content, *, _sk, ok, f
         logger.warning(fail_exc, _sk, error)
         return False
     raw = getattr(result, 'raw_response', None)
+    if getattr(result, 'success', False) and not (isinstance(raw, dict) and raw.get('skipped')):
+        consumer._track_final_receipt(result)
+        if consumer.message_id and consumer.message_id != '__no_edit__':
+            consumer._final_receipt_ids.add(str(consumer.message_id))
     if (not getattr(result, 'success', False) or getattr(result, 'full_payload_delivered', None) is False
             or isinstance(raw, dict) and (raw.get('partial_overflow') or raw.get('skipped'))):
         logger.warning(fail_result, _sk, getattr(result, 'error', None))

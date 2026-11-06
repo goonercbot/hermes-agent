@@ -49,6 +49,7 @@ logger = logging.getLogger("gateway.stream_consumer")
 _DONE = object()
 _NEW_SEGMENT = object()
 _COMMENTARY = object()
+_STREAMED_COMMENTARY = object()
 _TOOL_PROGRESS = object()
 _FINAL_TEXT = object()
 _FLUSH = object()
@@ -89,6 +90,7 @@ class _Tick:
     got_reopen_seed: bool = False
     approval_boundary: Optional[tuple] = None  # (future, cancelled_flag)
     commentary_text: Optional[str] = None
+    streamed_commentary_text: Optional[str] = None
     # Set by _push_update for _finalize_turn / _end_segment.
     update_visible: bool = False
     draft_final_fresh_send: bool = False
@@ -121,7 +123,8 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         on_new_message: Optional[callable] = None,
         on_before_finalize: Optional[Callable[[], Any]] = None,
         initial_reply_to_id: Optional[str] = None,
-        run_still_current: Optional[Callable[[], bool]] = None):
+        run_still_current: Optional[Callable[[], bool]] = None,
+        on_commentary_delivered: Optional[Callable[[Any, str], None]] = None):
         self.adapter = adapter
         self.chat_id = chat_id
         self.cfg = config or StreamConsumerConfig()
@@ -129,6 +132,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         # Hooks (exceptions swallowed): on_new_message per fresh content bubble (next
         # tool-progress bubble goes BELOW it); on_before_finalize once (pause typing).
         self._on_new_message = on_new_message
+        self._on_commentary_delivered = on_commentary_delivered
         self._on_before_finalize = on_before_finalize
         self._initial_reply_to_id = initial_reply_to_id
         self._turn_id = str(uuid.uuid4())  # keys send_stream_frame() per concurrent consumer
@@ -163,6 +167,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         self._delivered_commentary_texts: list[str] = []
         self._delivered_segment_texts: list[str] = []  # finalized text per past segment
         self._last_segment_delivery: Optional[tuple[str, Optional[float], str, set[str]]] = None
+        self._last_segment_receipts: Optional[tuple[str, set[str]]] = None
         self._superseded_reply_ids: set[str] = set()
         self._in_think_block = False  # think-tag filter state (mirrors CLI _stream_delta)
         self._think_buffer = ""
@@ -206,6 +211,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         # Fallback sends only the missing tail after a partial overflow delivery.
         self._fallback_preserve_partial_messages = False
         self._segment_preview_message_ids: set[str] = set()
+        self._final_receipt_ids: set[str] = set()
         # Tool-progress overlay (native only): shown in the bubble until text arrives.
         self._tool_progress_lines: list[str] = []
         self._tool_progress_active: bool = False
@@ -416,6 +422,10 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         if text:
             self._queue.put((_COMMENTARY, text))
 
+    def on_streamed_commentary(self, text: str) -> None:
+        """Classify this completed segment before its receipts are reset."""
+        self._queue.put((_STREAMED_COMMENTARY, text))
+
     def flush_pending_sync(self, timeout: float = 5.0) -> bool:
         """Block the agent worker thread until everything queued so far is delivered:
         ``(_FLUSH, Event)`` barrier — run() drains earlier items (FIFO), finalizes the
@@ -458,6 +468,8 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
     def _reset_segment_state(self, *, preserve_no_edit: bool = False) -> None:
         if preserve_no_edit and self._message_id == "__no_edit__":
             return
+        if self._stream_ledger:
+            self._last_segment_receipts = (self._stream_ledger, set(self._segment_preview_message_ids))
         # Retain the segment's visible text so has_delivered_text still matches.
         finalized = self._clean_for_display(self._last_sent_text).strip()
         if finalized:
@@ -701,6 +713,10 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
             elif kind is _COMMENTARY:
                 tick.commentary_text = item[1]
                 return tick
+            elif kind is _STREAMED_COMMENTARY:
+                tick.streamed_commentary_text = item[1]
+                tick.got_segment_break = True
+                return tick
             elif kind is _FLUSH:
                 # Barrier: finalize like a tool boundary, signal at the end of the tick.
                 tick.got_flush = tick.got_segment_break = True
@@ -926,8 +942,8 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         elif self._accumulated:
             await self._finalize_edit_path(tick)
         if self._final_content_delivered and self._superseded_reply_ids:
-            await self._delete_previews(self._superseded_reply_ids, skip=self._message_id,
-                                        label="Recovered reply")
+            await self._delete_previews(self._superseded_reply_ids - self._final_receipt_ids,
+                                        skip=self._message_id, label="Recovered reply")
             self._superseded_reply_ids.clear()
 
     async def _finalize_edit_path(self, tick: _Tick) -> None:
@@ -992,7 +1008,26 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         if (self._accumulated and not tick.update_visible
                 and self._message_id != "__no_edit__"):
             await self._flush_segment_tail_on_edit_failure()
+        if tick.streamed_commentary_text:
+            self._register_streamed_commentary(tick.streamed_commentary_text)
         self._reset_segment_state(preserve_no_edit=True)
+
+    def _register_streamed_commentary(self, text: str) -> None:
+        """Only the classified segment's successful durable receipts are eligible."""
+        target = self._clean_for_display(text).strip()
+        segment = self._clean_for_display(self._stream_ledger).strip()
+        ids = set(self._segment_preview_message_ids) if target and target == segment else set()
+        if not ids and target and not segment and self._last_segment_receipts:
+            previous, prior_ids = self._last_segment_receipts
+            if self._clean_for_display(previous).strip() == target:
+                ids = set(prior_ids)
+        if ids and self._on_commentary_delivered:
+            from gateway.platforms.base import SendResult
+            try:
+                self._on_commentary_delivered(
+                    SendResult(success=True, continuation_message_ids=tuple(sorted(ids))), text)
+            except Exception:
+                logger.debug("streamed commentary receipt callback error", exc_info=True)
 
     async def _on_cancelled(self) -> None:
         """Best-effort final edit on task cancel: finalize=True so REQUIRES_EDIT_FINALIZE

@@ -566,10 +566,16 @@ def delegate_task(
     if normalized_action == "classify_waiting_reply":
         from tools.delegate_waiting_reply import classify_waiting_reply
         return classify_waiting_reply(parent_agent, delegation_ids)
+    if normalized_action == "resolve_waiting_reply":
+        from tools.delegate_waiting_reply import resolve_waiting_reply
+        return resolve_waiting_reply(parent_agent, delegation_ids)
     if normalized_action in _CONTROL_ACTIONS:
         return _handle_control_action(normalized_action, subagent_id, message, parent_agent)
     if normalized_action and normalized_action != "spawn":
-        return tool_error(f"Unknown action '{action}'. Use spawn (default), list, steer, stop, or classify_waiting_reply.")
+        return tool_error(f"Unknown action '{action}'. Use spawn, list, steer, stop, classify_waiting_reply, or resolve_waiting_reply.")
+
+    from tools.delegate_waiting_reply import invalidate_reply_intent
+    invalidate_reply_intent(parent_agent)
 
     # Operator kill switch (TUI / delegation.pause RPC): blocks NEW spawns only.
     if is_spawn_paused():
@@ -849,10 +855,11 @@ DELEGATE_TASK_SCHEMA = {
                 "message) without stopping it; 'stop' = end one child "
                 "early (subagent_id; partial result still returns). "
                 "'classify_waiting_reply' opts in the upcoming pure temporary wait (delegation_ids required), "
-                "never a genuine answer. Control actions return immediately; goal/tasks are ignored unless spawning.",
-                enum=["spawn", "list", "steer", "stop", "classify_waiting_reply"],
+                "never a genuine answer. 'resolve_waiting_reply' marks the next genuine final after all root work "
+                "is finished (completed delegation_ids required). Control actions return immediately; goal/tasks are ignored unless spawning.",
+                enum=["spawn", "list", "steer", "stop", "classify_waiting_reply", "resolve_waiting_reply"],
             ),
-            "delegation_ids": _p("array", "Exact live completion unit delegation IDs for action='classify_waiting_reply'.", items={"type": "string"}),
+            "delegation_ids": _p("array", "Exact live unit IDs for classify_waiting_reply, or completed unit IDs for resolve_waiting_reply.", items={"type": "string"}),
             "subagent_id": _p("string", "Target for action='steer'/'stop' (ids from the spawn response or action='list')."),
             "message": _p(
                 "string",

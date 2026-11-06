@@ -26,6 +26,13 @@ class WaitingReply:
     delegation_ids: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class ResolvingReply:
+    turn_id: str
+    identity: DispatchIdentity
+    delegation_ids: tuple[str, ...]
+
+
 def _turn_state(agent: Any) -> Optional[dict]:
     turn = getattr(agent, "_current_turn_id", None)
     if not isinstance(turn, str) or not turn:
@@ -34,7 +41,7 @@ def _turn_state(agent: Any) -> Optional[dict]:
     if not isinstance(state, dict) or state["turn"] != turn:
         owner = getattr(agent, "_waiting_reply_owner", None) or uuid4().hex
         agent._waiting_reply_owner = owner
-        state = {"turn": turn, "root": uuid4().hex, "owner": owner, "dispatched": False, "waiting": None}
+        state = {"turn": turn, "root": uuid4().hex, "owner": owner, "dispatched": False, "waiting": None, "resolution": None}
         agent._waiting_reply_turn = state
     return state
 
@@ -57,7 +64,17 @@ def dispatch_identity(agent: Any) -> Optional[DispatchIdentity]:
         if state is None:
             return None
         state["dispatched"] = True
+        state["resolution"] = None
+        state["waiting"] = None
         return DispatchIdentity(state["owner"], state["root"])
+
+
+def invalidate_reply_intent(agent):
+    with _lock:
+        state = _turn_state(agent)
+        if state is not None:
+            state['waiting'] = None
+            state['resolution'] = None
 
 
 def adopt_dispatch_identity(agent: Any, turn_id: str, identity: DispatchIdentity) -> bool:
@@ -79,6 +96,43 @@ def waiting_reply(agent: Any) -> Optional[WaitingReply]:
         if not isinstance(state, dict) or state["turn"] != getattr(agent, "_current_turn_id", None):
             return None
         return state["waiting"]
+
+
+def resolving_reply(agent: Any) -> Optional[ResolvingReply]:
+    with _lock:
+        state = getattr(agent, '_waiting_reply_turn', None)
+        if not isinstance(state, dict) or state['turn'] != getattr(agent, '_current_turn_id', None):
+            return None
+        return state.get('resolution')
+
+
+def completed_owned(identity, ids):
+    """All supplied units still exist and no unit of this identity remains active."""
+    from tools import async_delegation
+    if not ids or any(not isinstance(i, str) or not i for i in ids) or len(set(ids)) != len(ids):
+        return False
+    with async_delegation._records_lock:
+        if any(not (r := async_delegation._records.get(i)) or r.get('status') != 'completed'
+               or r.get('waiting_identity') != identity for i in ids):
+            return False
+        return not any(r.get('waiting_identity') == identity and r.get('status') in ('running', 'finalizing')
+                       for r in async_delegation._records.values())
+
+
+def resolve_waiting_reply(agent, delegation_ids):
+    import json
+    with _lock:
+        state = _turn_state(agent)
+        if state is not None:
+            state['resolution'] = None
+            state['waiting'] = None
+        if state is None or not isinstance(delegation_ids, list):
+            return tool_error('Provide completed owned unit IDs in an active turn.')
+        identity = DispatchIdentity(state['owner'], state['root'])
+        if not completed_owned(identity, delegation_ids):
+            return tool_error('Units must be completed, owned, and from this root; no root units may remain active.')
+        state['resolution'] = ResolvingReply(state['turn'], identity, tuple(delegation_ids))
+        return json.dumps({'status': 'resolved', 'note': 'Your next final resolves this request.'})
 
 
 def root_for_owned_units(agent: Any, delegation_ids: list[str]) -> Optional[str]:
@@ -113,6 +167,7 @@ def classify_waiting_reply(agent: Any, delegation_ids: Any) -> str:
         state = _turn_state(agent)
         if state is not None:
             state["waiting"] = None
+            state["resolution"] = None
         if (state is None or not isinstance(delegation_ids, list) or not delegation_ids
                 or any(not isinstance(uid, str) or not uid for uid in delegation_ids)
                 or len(set(delegation_ids)) != len(delegation_ids)):

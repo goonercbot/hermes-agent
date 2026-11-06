@@ -338,7 +338,9 @@ _BACKGROUND_NOTES = {
         "finishes. Results are delivered only after you END YOUR TURN: do anything that does not depend on it, then "
         "stop with a one-line status. If that final is purely temporary waiting, first call "
         "delegate_task(action='classify_waiting_reply', delegation_ids=[the exact unit IDs]). "
-        "Never classify a genuine or substantive answer. Do not poll its transcript or artifacts to wait for it."
+        "Never classify a genuine or substantive answer. Once all work for this request is finished, before the genuine "
+        "final call delegate_task(action='resolve_waiting_reply', delegation_ids=[completed unit IDs]). "
+        "Do not call resolve while any unit remains pending. Do not poll its transcript or artifacts to wait for it."
     ),
     "many": (
         "{n} subagents are running in parallel in the background as {k} completion unit(s); each unit's results "
@@ -347,7 +349,9 @@ _BACKGROUND_NOTES = {
         "poll transcripts or artifacts to wait for them. If the final is purely temporary waiting, first call "
         "delegate_task(action='classify_waiting_reply', delegation_ids=[the exact unit IDs]); use each "
         "units[].delegation_id when units are listed, not the call-wide delegation_id; "
-        "never classify a genuine or substantive answer."
+        "never classify a genuine or substantive answer. Once all work for this request is finished, before the genuine "
+        "final call delegate_task(action='resolve_waiting_reply', delegation_ids=[completed unit IDs]); "
+        "never resolve while a unit remains pending."
     ),
     "control_hint": (
         "While a child runs you can orchestrate it live with this same tool: delegate_task(action='list') to see live "

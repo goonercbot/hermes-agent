@@ -1,9 +1,14 @@
 """Explicit interpreter binding recorded by an external installation owner."""
 from __future__ import annotations
 
+from contextlib import suppress
+import ctypes
+import errno
 import json
 import os
+import stat
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -55,11 +60,38 @@ def external_service_python(root: Path, *, require_if_store: bool = False) -> st
     return _validate(root, binding.get('python'))
 
 
+def _refuse_acl(fd: int) -> None:
+    """Fail closed rather than lose a restrictive or inherited access ACL."""
+    if sys.platform == 'darwin':
+        libc = ctypes.CDLL(None, use_errno=True)
+        get_acl = libc.acl_get_fd_np
+        get_acl.argtypes = [ctypes.c_int, ctypes.c_int]
+        get_acl.restype = ctypes.c_void_p
+        free_acl = libc.acl_free
+        free_acl.argtypes = [ctypes.c_void_p]
+        free_acl.restype = ctypes.c_int
+        acl = get_acl(fd, 0x100)  # ACL_TYPE_EXTENDED
+        if acl:
+            free_acl(acl)
+            raise OSError('installation stamp ACL cannot be preserved')
+        error = ctypes.get_errno()
+        if error != errno.ENOENT:
+            raise OSError(error, 'cannot inspect installation stamp ACL')
+    elif sys.platform.startswith('linux'):
+        if any(name.startswith('system.posix_acl_') for name in os.listxattr(fd)):
+            raise OSError('installation stamp ACL cannot be preserved')
+    else:
+        raise OSError('cannot safely inspect installation stamp ACL')
+
+
 def bind_external_service_python(root: Path, python: Path) -> None:
     """Record an owner's explicit choice; never claim or publish a launcher."""
     root = Path(root).resolve()
     path = install_stamp_path(root)
-    stamp = json.loads(path.read_text(encoding='utf-8-sig'))
+    with path.open(encoding='utf-8-sig') as original:
+        metadata = os.fstat(original.fileno())
+        _refuse_acl(original.fileno())
+        stamp = json.load(original)
     if not isinstance(stamp, dict) or stamp.get('updateMechanism') != 'external':
         raise ValueError('installation is not externally owned')
     value = _validate(root, str(python))
@@ -70,8 +102,27 @@ def bind_external_service_python(root: Path, python: Path) -> None:
             json.dump(stamp, stream, indent=2)
             stream.write('\n')
             stream.flush()
+            _refuse_acl(stream.fileno())
+            staged = os.fstat(stream.fileno())
+            if (staged.st_uid, staged.st_gid) != (metadata.st_uid, metadata.st_gid):
+                if not hasattr(os, 'fchown'):
+                    raise OSError('cannot preserve installation stamp ownership')
+                os.fchown(stream.fileno(), metadata.st_uid, metadata.st_gid)
+            if not hasattr(os, 'fchmod'):
+                raise OSError('cannot preserve installation stamp mode')
+            os.fchmod(stream.fileno(), stat.S_IMODE(metadata.st_mode))
+            staged = os.fstat(stream.fileno())
+            if ((staged.st_uid, staged.st_gid, stat.S_IMODE(staged.st_mode)) !=
+                    (metadata.st_uid, metadata.st_gid, stat.S_IMODE(metadata.st_mode))):
+                raise OSError('cannot preserve installation stamp access metadata')
             os.fsync(stream.fileno())
         os.replace(temp, path)
+        with suppress(OSError):
+            directory_fd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
     finally:
         if os.path.exists(temp):
             os.unlink(temp)

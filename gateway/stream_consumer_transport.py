@@ -243,6 +243,11 @@ class StreamTransportMixin:
                     *(getattr(result, "continuation_message_ids", None) or ()), *(raw_ids or ())):
             self._track_preview_id(mid)
 
+    def _track_final_receipt(self, result: Any) -> None:
+        if getattr(result, "success", False):
+            from gateway.commentary_delivery import message_ids
+            self._final_receipt_ids.update(message_ids(result))
+
     def _adapter_prefers_fresh_final(self, text: str) -> bool:
         """Adapter's prefers_fresh_final_streaming hook (Telegram's richer send path);
         False without a real preview / hook, or on any error."""
@@ -292,10 +297,12 @@ class StreamTransportMixin:
         complete = complete_body(result)
         if is_turn_final:
             self._confirmed_complete_body = complete
+            self._track_final_receipt(result)
         new_message_id = getattr(result, "message_id", None)
         # Best-effort preview cleanup; never delete the message just sent.
         if complete:
-            await self._delete_previews(stale_ids, skip=new_message_id, label="Fresh-final")
+            from gateway.commentary_delivery import message_ids
+            await self._delete_previews(stale_ids - set(message_ids(result)), label="Fresh-final")
         self._preview_message_ids = set()
         self._adopt_message_id(new_message_id)
         self._track_preview_ids_from_result(result)
@@ -474,11 +481,13 @@ class StreamTransportMixin:
         if not result.success:
             self._edit_supported = False
             return False
+        if finalize:
+            self._track_final_receipt(result)
         self._already_sent = True
         self._last_sent_text = text
+        self._track_preview_ids_from_result(result)
         if result.message_id:
             self._adopt_message_id(result.message_id)
-            self._track_preview_ids_from_result(result)
         else:
             # No editable id: fallback mode + sentinel so we don't re-enter first-send.
             self._enter_fallback_mode(self._visible_prefix())
@@ -516,6 +525,8 @@ class StreamTransportMixin:
             # changed on screen, so the visible prefix and flood state stay as they were and the
             # next tick retries with the newer text.
             return True
+        if finalize and is_turn_final:
+            self._track_final_receipt(result)
         from gateway.platforms.post_delivery import complete_body
         if finalize:
             self._confirmed_complete_body = complete_body(result) and (

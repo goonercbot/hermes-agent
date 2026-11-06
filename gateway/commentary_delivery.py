@@ -58,6 +58,8 @@ def schedule_cleanup(response, adapter, ctx):
                 if str(text).strip() and str(text).strip() in (final_text, final_body)}
         keep.update(getattr(delivery_guard, '_hermes_final_delivery_ids', ()))
         consumer = ctx.stream_consumer_holder[0]
+        if consumer:
+            keep.update(consumer._final_receipt_ids)
         if consumer and consumer.final_content_delivered:
             keep.update(consumer._segment_preview_message_ids)
             if consumer.message_id:
@@ -83,6 +85,10 @@ async def edit_streamed_final(consumer, source, response, content, *, _sk, ok, f
         logger.warning(fail_exc, _sk, error)
         return False
     raw = getattr(result, 'raw_response', None)
+    if getattr(result, 'success', False) and not (isinstance(raw, dict) and raw.get('skipped')):
+        consumer._track_final_receipt(result)
+        if consumer.message_id and consumer.message_id != '__no_edit__':
+            consumer._final_receipt_ids.add(str(consumer.message_id))
     if (not getattr(result, 'success', False) or getattr(result, 'full_payload_delivered', None) is False
             or isinstance(raw, dict) and (raw.get('partial_overflow') or raw.get('skipped'))):
         logger.warning(fail_result, _sk, getattr(result, 'error', None))

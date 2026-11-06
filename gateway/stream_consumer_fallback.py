@@ -27,6 +27,8 @@ class StreamFallbackMixin:
             result = await self.adapter.send(
                 chat_id=self.chat_id, content=text, reply_to=reply_to_id,
                 metadata=self._metadata_for_send(final=final, expect_edits=not final))
+            if final:
+                self._track_final_receipt(result)
             if not (result.success and result.message_id):
                 self._edit_supported = False
                 return reply_to_id
@@ -144,6 +146,7 @@ class StreamFallbackMixin:
                 self._fallback_prefix = ""
                 return
             sent_any_chunk = True
+            self._track_final_receipt(result)
             last_successful_chunk = chunk
             last_message_id = result.message_id or last_message_id
             self._notify_new_message()
@@ -153,7 +156,7 @@ class StreamFallbackMixin:
         # the answer ("sent only the second half" symptom).
         if (stale_message_id and stale_message_id != last_message_id
                 and not self._fallback_preserve_partial_messages and continuation == final_text and complete):
-            await self._delete_previews([stale_message_id], label="Fallback partial",
+            await self._delete_previews({str(stale_message_id)} - self._final_receipt_ids, label="Fallback partial",
                                         skip_sentinel=False)
 
         self._message_id = last_message_id
@@ -266,9 +269,10 @@ class StreamFallbackMixin:
             return "ambiguous" if self._send_failure_may_have_delivered(result) else "failed"
 
         new_message_id = getattr(result, "message_id", None)
+        self._track_final_receipt(result)
         # Telegram reports delete failure by returning False; the flood window that
         # broke the finalize can reject this too — one bounded retry.
-        await self._delete_previews(stale_ids, skip=new_message_id, label="Empty fallback",
+        await self._delete_previews(stale_ids - self._final_receipt_ids, label="Empty fallback",
                                     retry_on_false=True)
         self._segment_preview_message_ids = set()
         self._message_id = new_message_id or "__no_edit__"

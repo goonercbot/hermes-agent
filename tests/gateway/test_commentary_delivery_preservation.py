@@ -14,6 +14,7 @@ from gateway.platforms.base import SendResult
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource
+from gateway.stream_consumer import GatewayStreamConsumer
 from gateway.turn_context import TurnContext
 from tests.gateway.test_run_progress_topics import ProgressCaptureAdapter
 
@@ -89,7 +90,8 @@ async def test_stale_generation_cannot_delete():
 async def test_transformed_edit_needs_complete_current_body(full, raw, expected):
     runner = object.__new__(GatewayRunner)
     edit = AsyncMock(return_value=SendResult(success=True, full_payload_delivered=full, raw_response=raw))
-    consumer = SimpleNamespace(message_id='streamed', adapter=SimpleNamespace(edit_message=edit))
+    consumer = GatewayStreamConsumer(SimpleNamespace(edit_message=edit), 'chat')
+    consumer._message_id = 'streamed'
     response = {}
     await runner._run_agent_edit_streamed_message(consumer, SimpleNamespace(chat_id='chat'), response,
         'transformed body', _sk='synthetic', ok=('edited',), fail_result='failed %s %s', fail_exc='exception %s %s')

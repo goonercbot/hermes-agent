@@ -334,6 +334,7 @@ class StreamFallbackMixin:
             result = await self.adapter.send(chat_id=self.chat_id, content=tail, metadata=_md)
             if result.success:
                 self._already_sent = True
+                self._track_preview_ids_from_result(result)
         except Exception as e:
             logger.error("Segment-break tail flush error: %s", e)
 

@@ -45,6 +45,7 @@ def schedule_cleanup(response, adapter, ctx):
     final_text = str(response.get('final_response') or '').strip()
     from gateway.platforms.base import _strip_media_directives
     final_body = _strip_media_directives(final_text).strip()
+    delivery_guard = adapter._active_sessions.get(ctx.session_key)
     if response.get('_complete_final_body') and final_text:
         adapter._confirm_final_delivery(ctx.session_key, ctx.run_generation, True)
     async def cleanup():
@@ -55,6 +56,12 @@ def schedule_cleanup(response, adapter, ctx):
                 await asyncio.wrap_future(future)
         keep = {mid for mid, text in ctx._commentary_messages
                 if str(text).strip() and str(text).strip() in (final_text, final_body)}
+        keep.update(getattr(delivery_guard, '_hermes_final_delivery_ids', ()))
+        consumer = ctx.stream_consumer_holder[0]
+        if consumer and consumer.final_content_delivered:
+            keep.update(consumer._segment_preview_message_ids)
+            if consumer.message_id:
+                keep.add(str(consumer.message_id))
         for mid in dict.fromkeys(ctx._cleanup_msg_ids):
             current = ctx._run_still_current
             if callable(current) and not current():

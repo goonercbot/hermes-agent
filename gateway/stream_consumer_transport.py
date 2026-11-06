@@ -298,6 +298,7 @@ class StreamTransportMixin:
             await self._delete_previews(stale_ids, skip=new_message_id, label="Fresh-final")
         self._preview_message_ids = set()
         self._adopt_message_id(new_message_id)
+        self._track_preview_ids_from_result(result)
         self._already_sent = True
         self._last_sent_text = text
         if is_turn_final:

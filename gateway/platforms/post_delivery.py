@@ -10,6 +10,12 @@ def complete_body(result):
             and not (isinstance(raw, dict) and (raw.get('partial_overflow') or raw.get('skipped'))))
 
 
+def record_final_ids(guard, result):
+    if getattr(result, 'success', False):
+        from gateway.commentary_delivery import message_ids
+        guard._hermes_final_delivery_ids.update(message_ids(result))
+
+
 class FinalDeliveryReceiptMixin:
     def _confirm_final_delivery(self, session_key, generation, complete):
         if not hasattr(self, '_confirmed_final_deliveries'):

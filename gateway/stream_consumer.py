@@ -213,6 +213,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         self._segment_preview_message_ids: set[str] = set()
         self._segment_fresh_message_ids: set[str] = set()
         self._final_receipt_ids: set[str] = set()
+        self._final_fresh_message_ids: set[str] = set()
         # Tool-progress overlay (native only): shown in the bubble until text arrives.
         self._tool_progress_lines: list[str] = []
         self._tool_progress_active: bool = False

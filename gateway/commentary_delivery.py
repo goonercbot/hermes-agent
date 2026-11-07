@@ -5,13 +5,18 @@ from contextlib import suppress
 def message_ids(result):
     raw = getattr(result, 'raw_response', None)
     ids = raw.get('message_ids', []) if isinstance(raw, dict) else []
+    delivered = raw.get('delivered_message_ids', []) if isinstance(raw, dict) else []
     return list(dict.fromkeys(str(mid) for mid in [getattr(result, 'message_id', None), *ids,
-        *(getattr(result, 'continuation_message_ids', None) or ())] if mid is not None))
+        *(delivered or ()), *(getattr(result, 'continuation_message_ids', None) or ())] if mid is not None))
 
 
 def track_progress(ctx, result):
     if ctx._cleanup_progress and getattr(result, 'success', False):
-        for mid in message_ids(result):
+        from gateway.config import Platform
+        # Telegram supplies creation receipts; other routes retain their existing
+        # ordinary-progress behavior, never used to classify a WAITING final.
+        ids = (getattr(result, 'fresh_message_ids', None) or ()) if getattr(ctx.source, 'platform', None) == Platform.TELEGRAM else message_ids(result)
+        for mid in (str(mid) for mid in ids if mid is not None):
             if mid not in ctx._cleanup_msg_ids:
                 ctx._cleanup_msg_ids.append(mid)
 
@@ -49,9 +54,16 @@ def schedule_cleanup(response, adapter, ctx):
     from gateway.platforms.base import _strip_media_directives
     final_body = _strip_media_directives(final_text).strip()
     delivery_guard = adapter._active_sessions.get(ctx.session_key)
+    if delivery_guard is None:
+        return
+    capture_state = {'chat': str(ctx.source.chat_id), 'revoked': set(), 'generation': ctx.run_generation}
+    captures = getattr(delivery_guard, '_waiting_live_captures', None)
+    if captures is None:
+        captures = delivery_guard._waiting_live_captures = []
+    captures.append(capture_state)
     if response.get('_complete_final_body') and final_text:
         adapter._confirm_final_delivery(ctx.session_key, ctx.run_generation, True)
-    async def cleanup():
+    async def cleanup_body():
         if not adapter._has_confirmed_final_delivery(ctx.session_key, ctx.run_generation):
             return
         for future in ctx._commentary_delivery_futures:
@@ -69,12 +81,25 @@ def schedule_cleanup(response, adapter, ctx):
                 keep.add(str(consumer.message_id))
         for mid in dict.fromkeys(ctx._cleanup_msg_ids):
             current = ctx._run_still_current
-            if callable(current) and not current():
-                return
-            if (mid not in keep and not getattr(adapter, '_waiting_receipts_disabled', False)
-                    and (str(ctx.source.chat_id), mid) not in getattr(adapter, '_waiting_promoted_ids', set())):
+            if (adapter._active_sessions.get(ctx.session_key) is not delivery_guard
+                    or getattr(delivery_guard, '_hermes_run_generation', None) != ctx.run_generation
+                    or delivery_guard.is_set() or callable(current) and not current()):
+                break
+            pending = getattr(adapter, '_waiting_pending_finals', {})
+            if capture_state.get('uncertain') or any(
+                    state[0] == capture_state['chat'] for state in pending.values()):
+                break
+            if mid not in keep and mid not in capture_state['revoked']:
                 with suppress(Exception):
                     await adapter.delete_message(ctx.source.chat_id, mid)
+    async def cleanup():
+        if not any(state is capture_state for state in captures) or capture_state.get('started'):
+            return
+        capture_state['started'] = True
+        try:
+            await cleanup_body()
+        finally:
+            captures[:] = [state for state in captures if state is not capture_state]
     adapter.register_post_delivery_callback(ctx.session_key, cleanup, generation=ctx.run_generation)
 
 

@@ -4444,11 +4444,14 @@ class BasePlatformAdapter(FinalDeliveryReceiptMixin, ABC):
         """Run the one-shot post-delivery callback (bounded, errors swallowed). The generation is
         read HERE — stamped on the interrupt event DURING the handler await; an earlier snapshot
         would let stale runs fire a fresher run's callbacks."""
-        await run_post_delivery_callback(self.pop_post_delivery_callback(
-            session_key, generation=getattr(interrupt_event, "_hermes_run_generation", None)),
-            _POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS)
-        getattr(self, "_confirmed_final_deliveries", {}).pop(
-            (session_key, getattr(interrupt_event, "_hermes_run_generation", None)), None)
+        generation = getattr(interrupt_event, "_hermes_run_generation", None)
+        try:
+            await run_post_delivery_callback(self.pop_post_delivery_callback(
+                session_key, generation=generation), _POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS)
+        finally:
+            from gateway.waiting_reply_delivery import dispose_pending_finals
+            dispose_pending_finals(self, interrupt_event, generation)
+            getattr(self, "_confirmed_final_deliveries", {}).pop((session_key, generation), None)
 
     def _finish_session_task(self, session_key: str, interrupt_event: asyncio.Event) -> None:
         """End-of-task guard/ownership reconciliation. A late ``_pending_messages`` arrival must not
@@ -4482,10 +4485,16 @@ class BasePlatformAdapter(FinalDeliveryReceiptMixin, ABC):
                 delivery_attempted = True
                 delivery_succeeded = delivery_succeeded or bool(getattr(result, "success", False))
                 record_final_ids(interrupt_event, result)
+                from gateway.commentary_delivery import message_ids
+                if not message_ids(result):
+                    interrupt_event._hermes_final_receipt_uncertain = True
         # Reuse the interrupt event handle_message() installed; new Event only if removed externally.
         interrupt_event = self._active_sessions.get(session_key) or asyncio.Event()
         interrupt_event._hermes_final_delivery_ids = set()
+        interrupt_event._hermes_final_fresh_message_ids = set()
         interrupt_event._hermes_nontext_delivery_attempted = False
+        interrupt_event._hermes_final_receipt_uncertain = False
+        interrupt_event._hermes_delivery_in_flight = False
         self._active_sessions[session_key] = interrupt_event
         _thread_metadata = _thread_metadata_for_event(event)
         typing_task = self._start_typing_refresh(event, interrupt_event, _thread_metadata)
@@ -4522,9 +4531,11 @@ class BasePlatformAdapter(FinalDeliveryReceiptMixin, ABC):
                 _tts_caption_delivered = False
                 for _tts_index, _tts_path in enumerate(_tts_paths):
                     try:
+                        interrupt_event._hermes_delivery_in_flight = True
                         _tts_caption_delivered |= await self._play_tts_file(
                             event, text_content, _tts_path, _tts_index == 0, _final_thread_metadata,
                             _record_delivery)
+                        interrupt_event._hermes_delivery_in_flight = False
                     finally:
                         with contextlib.suppress(OSError):
                             os.remove(_tts_path)
@@ -4544,16 +4555,20 @@ class BasePlatformAdapter(FinalDeliveryReceiptMixin, ABC):
                         or _tts_paths or _tts_caption_delivered:
                     self.pause_typing_for_chat(event.source.chat_id)
                 if text_content and not _tts_caption_delivered:
+                    interrupt_event._hermes_delivery_in_flight = True
                     complete = await self._send_final_text(
                         event, session_key, text_content, _final_thread_metadata,
                         is_ephemeral_response, _ephemeral_ttl,
                         lambda result: _record_delivery(result, final_text=True))
+                    interrupt_event._hermes_delivery_in_flight = False
                     self._confirm_final_delivery(session_key,
                         getattr(interrupt_event, "_hermes_run_generation", None), complete)
+                interrupt_event._hermes_delivery_in_flight = True
                 await self._deliver_attachments(
                     event, extracted, _final_thread_metadata,
                     anything_sent=delivery_attempted or _tts_caption_delivered,
                     record_delivery=_record_delivery)
+                interrupt_event._hermes_delivery_in_flight = False
             await self._release_turn_marker(event)
             processing_ok = delivery_succeeded if delivery_attempted else not bool(response)
             # Clean up the per-turn streaming-TTS flag.

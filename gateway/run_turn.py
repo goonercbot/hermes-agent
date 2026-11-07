@@ -1639,6 +1639,9 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
             display_kind=turn_ctx.persist_user_display_kind, reply_expected=turn_ctx.reply_expected)
         # Failed turns deliver their text but never their attachments (completed-turn parity).
         _deliver_media = not _delivery_result.get("failed")
+        _bg_guard = getattr(adapter, '_active_sessions', {}).get(session_key) if adapter else None
+        _queued_uncertain = False
+        _previous_receipt_uncertain = getattr(_bg_guard, '_hermes_final_receipt_uncertain', False)
         if first_response:
             logger.info(
                 "Queued follow-up for session %s: final text delivery confirmed; delivering explicit media before continuing."
@@ -1647,6 +1650,8 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
                 session_key or "?",
             )
             try:
+                if _bg_guard is not None:
+                    _bg_guard._hermes_delivery_in_flight = True
                 _text_delivered = await self._deliver_queued_first_response(
                     first_response, source=turn_ctx.source, adapter=adapter,
                     metadata=turn_ctx._status_thread_metadata, event_message_id=turn_ctx.event_message_id,
@@ -1658,6 +1663,11 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
                 )
             except Exception as e:
                 logger.warning("Failed to send first response before queued message: %s", e)
+            except BaseException:
+                if _bg_guard is not None:
+                    from gateway.waiting_reply_delivery import dispose_pending_finals
+                    dispose_pending_finals(adapter, _bg_guard, turn_ctx.run_generation)
+                raise
             else:
                 # One source of truth for "this turn's final already reached the chat": the normal
                 # completion path (`_hmwa_deliver_turn_response`) consults ``already_sent`` on the
@@ -1670,13 +1680,27 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
                     # The queued lane already uploaded this response's MEDIA: attachments; without
                     # this the completion path's already_sent rescan uploads every file twice.
                     result["media_already_delivered"] = _deliver_media
+            if _bg_guard is not None:
+                # The queued transport returns only a boolean, not the IDs it
+                # sent or edited. Preserve overlapping messages conservatively.
+                _bg_guard._hermes_final_receipt_uncertain = True
+                _bg_guard._hermes_delivery_in_flight = False
+                _queued_uncertain = True
         # Release deferred bg-review notifications: pop (no double-fire in base.py's finally) and call.
-        _bg_cb = self._pop_post_delivery_callback(adapter, session_key, turn_ctx.run_generation)
-        if callable(_bg_cb):
-            with suppress(Exception):
-                _bg_result = _bg_cb()
-                if inspect.isawaitable(_bg_result):
-                    await _bg_result
+        try:
+            _bg_cb = self._pop_post_delivery_callback(adapter, session_key, turn_ctx.run_generation)
+            if callable(_bg_cb):
+                with suppress(Exception):
+                    _bg_result = _bg_cb()
+                    if inspect.isawaitable(_bg_result):
+                        await _bg_result
+        finally:
+            if adapter is not None and _bg_guard is not None:
+                from gateway.waiting_reply_delivery import dispose_pending_finals
+                dispose_pending_finals(adapter, _bg_guard, turn_ctx.run_generation)
+                if (_queued_uncertain and
+                        getattr(_bg_guard, '_hermes_run_generation', None) == turn_ctx.run_generation):
+                    _bg_guard._hermes_final_receipt_uncertain = _previous_receipt_uncertain
 
     async def _run_agent_queued_followup(
         self, turn_ctx: TurnContext, adapter: Any, pending: Optional[str], pending_event: Any,
@@ -2076,6 +2100,8 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
                 if _heartbeat_msg_id:
                     try:
                         _notify_res = await _notify_adapter.edit_message(source.chat_id, _heartbeat_msg_id, _heartbeat_text)
+                        from gateway.commentary_delivery import track_progress
+                        track_progress(turn_ctx, _notify_res)
                     except Exception as _ee:
                         logger.debug("Heartbeat edit failed: %s", _ee)
                         _notify_res = None
@@ -2090,10 +2116,10 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
                         source.chat_id, _heartbeat_text,
                         metadata=_interim_metadata(_non_conversational_metadata(_status_thread_metadata, platform=source.platform)),
                     )
+                    from gateway.commentary_delivery import track_progress
+                    track_progress(turn_ctx, _notify_res)
                     if getattr(_notify_res, "success", False) and getattr(_notify_res, "message_id", None):
                         _heartbeat_msg_id = str(_notify_res.message_id)
-                        if turn_ctx._cleanup_progress:
-                            turn_ctx._cleanup_msg_ids.append(_heartbeat_msg_id)
             except Exception as _ne:
                 logger.debug("Long-running notification error: %s", _ne)
 

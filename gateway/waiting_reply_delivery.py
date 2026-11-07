@@ -1,17 +1,50 @@
 """Capture and resolve explicitly typed waiting finals in adapter-local memory."""
 from collections import OrderedDict
 
-# Eviction discards metadata only. Large individual receipts are not recorded at all.
-_MAX_RECORDS = 256
-_MAX_IDS = 256
-_MAX_UNITS = 256
+
+def finish_pending_final(adapter, token, *, uncertain=False):
+    """Retire one delivery barrier; unknown disposal taints only overlapping receipts."""
+    pending = getattr(adapter, '_waiting_pending_finals', {})
+    state = pending.pop(token, None)
+    if state is None:
+        return
+    chat, guard, consumer, _generation = state
+    keep = set(getattr(guard, '_hermes_final_delivery_ids', ()))
+    if consumer is not None:
+        keep.update(getattr(consumer, '_final_receipt_ids', ()))
+        keep.update(getattr(consumer, '_segment_preview_message_ids', ()))
+        if getattr(consumer, 'message_id', None):
+            keep.add(str(consumer.message_id))
+    for live_guard in tuple(adapter._active_sessions.values()):
+        for capture in getattr(live_guard, '_waiting_live_captures', ()):
+            if capture['chat'] == chat:
+                capture['revoked'].update(keep)
+                if uncertain:
+                    capture['uncertain'] = True
+    ledger = getattr(adapter, '_waiting_reply_receipts', {})
+    for key, record in list(ledger.items()):
+        if key[1] != chat:
+            continue
+        record['message_ids'] = record['message_ids'] - keep
+        if uncertain:
+            record.setdefault('_uncertain_ids', set()).update(record['message_ids'])
+        if not record['message_ids']:
+            ledger.pop(key, None)
+
+
+def dispose_pending_finals(adapter, guard, generation):
+    """The native delivery task ended without running its registered callback."""
+    for token, state in list(getattr(adapter, '_waiting_pending_finals', {}).items()):
+        if state[1] is guard and state[3] == generation:
+            finish_pending_final(adapter, token, uncertain=True)
+    captures = getattr(guard, '_waiting_live_captures', [])
+    captures[:] = [capture for capture in captures if capture.get('generation') != generation]
 
 
 def schedule_waiting_receipt(response, adapter, ctx):
     from tools.delegate_waiting_reply import waiting_reply
 
     if not (ctx._cleanup_progress and adapter is not None and ctx.session_key
-            and not getattr(adapter, '_waiting_receipts_disabled', False)
             and ctx.run_generation is not None and isinstance(response, dict)
             and not response.get('failed') and not response.get('partial')
             and not response.get('interrupted') and response.get('completed') is not False
@@ -23,12 +56,9 @@ def schedule_waiting_receipt(response, adapter, ctx):
     source = ctx.source
     chat = getattr(source, 'chat_id', None)
     text = response.get('final_response')
-    if not (waiting and waiting.delegation_ids and len(waiting.delegation_ids) <= _MAX_UNITS
-            and all(len(unit) <= 1024 for unit in waiting.delegation_ids)
-            and len(waiting.root_request_id) <= 1024
-            and isinstance(ctx.session_key, str) and len(ctx.session_key) <= 1024
-            and chat is not None and 0 < len(str(chat)) <= 1024
-            and len(str(getattr(source, 'thread_id', '') or '')) <= 1024
+    if not (waiting and waiting.delegation_ids
+            and isinstance(ctx.session_key, str) and ctx.session_key
+            and chat is not None
             and isinstance(text, str) and text.strip()):
         return
     # There is no complete attachment receipt. Reject potential attachment-bearing replies,
@@ -56,9 +86,19 @@ def schedule_waiting_receipt(response, adapter, ctx):
             return
         adapter._confirm_final_delivery(ctx.session_key, ctx.run_generation, True)
 
+    # A live capture owns its revocations until its callback runs.  This is not
+    # an adapter-lifetime history of final IDs.
+    capture_state = {'chat': str(chat), 'revoked': set(), 'generation': ctx.run_generation}
+    captures = getattr(guard, '_waiting_live_captures', None)
+    if captures is None:
+        captures = guard._waiting_live_captures = []
+    captures.append(capture_state)
+
     async def capture():
-        if (getattr(adapter, '_waiting_receipts_disabled', False)
-                or adapter._active_sessions.get(ctx.session_key) is not guard
+        if not any(state is capture_state for state in captures):
+            return
+        captures[:] = [state for state in captures if state is not capture_state]
+        if (adapter._active_sessions.get(ctx.session_key) is not guard
                 or getattr(guard, '_hermes_run_generation', None) != ctx.run_generation
                 or guard.is_set() or not current() or waiting_reply(agent) != waiting
                 or getattr(guard, '_hermes_nontext_delivery_attempted', False)
@@ -67,15 +107,10 @@ def schedule_waiting_receipt(response, adapter, ctx):
         # The streamed proof is established by the consumer before scheduling; normal
         # sends are confirmed by the adapter after the handler returns.
         if streamed:
-            ids = getattr(consumer, '_final_receipt_ids', ()) if consumer is not None else ()
+            ids = getattr(consumer, '_final_fresh_message_ids', ()) if consumer is not None else ()
         else:
-            ids = getattr(guard, '_hermes_final_delivery_ids', ())
-        ids = frozenset(ids)
-        if (not ids or len(ids) > _MAX_IDS
-                or any(not isinstance(mid, str) or not 0 < len(mid) <= 1024 for mid in ids)):
-            return
-        protected = getattr(adapter, '_waiting_promoted_ids', set())
-        ids = frozenset(mid for mid in ids if (str(chat), mid) not in protected)
+            ids = getattr(guard, '_hermes_final_fresh_message_ids', ())
+        ids = frozenset(mid for mid in ids if isinstance(mid, str) and mid) - capture_state['revoked']
         if not ids:
             return
         ledger = getattr(adapter, '_waiting_reply_receipts', None)
@@ -85,18 +120,17 @@ def schedule_waiting_receipt(response, adapter, ctx):
         if previous:
             ids = ids | previous['message_ids']
             units = tuple(dict.fromkeys((*previous['delegation_ids'], *waiting.delegation_ids)))
-            if len(ids) > _MAX_IDS or len(units) > _MAX_UNITS:
-                # Lost completeness means none of these receipts are safe to delete.
-                ledger.pop(key, None)
-                return
+
         else:
             units = waiting.delegation_ids
         ledger[key] = {'message_ids': ids, 'delegation_ids': units}
-        if previous and previous.get('_pending_finals'):
-            ledger[key]['_pending_finals'] = previous['_pending_finals'].copy()
+        uncertain_ids = set(previous.get('_uncertain_ids', ())) if previous else set()
+        if capture_state.get('uncertain'):
+            uncertain_ids.update(ids)
+        if uncertain_ids:
+            ledger[key]['_uncertain_ids'] = uncertain_ids
         ledger.move_to_end(key)
-        while len(ledger) > _MAX_RECORDS:
-            ledger.popitem(last=False)
+
 
     adapter.register_post_delivery_callback(ctx.session_key, capture, generation=ctx.run_generation)
 
@@ -125,18 +159,18 @@ def schedule_waiting_resolution(response, adapter, ctx):
     ledger = getattr(adapter, '_waiting_reply_receipts', None)
     if ledger is None:
         ledger = adapter._waiting_reply_receipts = OrderedDict()
-    for key, record in list(ledger.items()):
-        if key[1] == route[1]:
-            pending = record.setdefault('_pending_finals', set())
-            if len(pending) >= _MAX_IDS:
-                ledger.pop(key, None)  # Unknown outstanding finals: retain messages, forget eligibility.
-            else:
-                pending.add(token)
+    pending = getattr(adapter, '_waiting_pending_finals', None)
+    if pending is None:
+        pending = adapter._waiting_pending_finals = {}
+    pending[token] = (route[1], guard, consumer, ctx.run_generation)
     streamed = isinstance(response, dict) and response.get('_complete_final_body') is True
     if streamed and consumer is not None and getattr(consumer, '_final_receipt_ids', None):
         adapter._confirm_final_delivery(ctx.session_key, ctx.run_generation, True)
 
     async def cleanup():
+        finish_pending_final(adapter, token, uncertain=(
+            getattr(guard, '_hermes_final_receipt_uncertain', False)
+            or getattr(guard, '_hermes_delivery_in_flight', False)))
         final_ids = set(getattr(guard, '_hermes_final_delivery_ids', ()))
         stream_ids = set(getattr(consumer, '_final_receipt_ids', ())) if consumer is not None else set()
         keep = final_ids | stream_ids
@@ -145,17 +179,10 @@ def schedule_waiting_resolution(response, adapter, ctx):
             if getattr(consumer, 'message_id', None):
                 keep.add(str(consumer.message_id))
         # Even an incomplete or nontext genuine final must never remain eligible.
-        promoted = {(route[1], mid) for mid in keep
-                    if isinstance(mid, str) and 0 < len(mid) <= 1024}
-        protected = getattr(adapter, '_waiting_promoted_ids', set())
-        if len(promoted) != len(keep) or len(protected | promoted) > _MAX_IDS:
-            adapter._waiting_receipts_disabled = True
-            current_ledger = getattr(adapter, '_waiting_reply_receipts', None)
-            if current_ledger is not None:
-                current_ledger.clear()
-            return
-        if promoted:
-            adapter._waiting_promoted_ids = protected | promoted
+        for live_guard in tuple(adapter._active_sessions.values()):
+            for capture in getattr(live_guard, '_waiting_live_captures', ()):
+                if capture['chat'] == route[1]:
+                    capture['revoked'].update(keep)
         if getattr(adapter, '_waiting_reply_receipts', None) is not ledger:
             return
         for key, record in list(ledger.items()):
@@ -164,9 +191,6 @@ def schedule_waiting_resolution(response, adapter, ctx):
                 if not record['message_ids']:
                     ledger.pop(key, None)
 
-        valid_guard = (adapter._active_sessions.get(ctx.session_key) is guard
-                       and getattr(guard, '_hermes_run_generation', None) == ctx.run_generation
-                       and not guard.is_set() and callable(current) and current())
         text = response.get('final_response') if isinstance(response, dict) else None
         from gateway.platforms.base import BasePlatformAdapter
         text_only = (isinstance(text, str) and bool(text.strip()) and 'MEDIA:' not in text.upper()
@@ -179,13 +203,6 @@ def schedule_waiting_resolution(response, adapter, ctx):
                     and bool(stream_ids if streamed else final_ids)
                     and not getattr(guard, '_hermes_nontext_delivery_attempted', False)
                     and adapter._has_confirmed_final_delivery(ctx.session_key, ctx.run_generation))
-        if valid_guard and complete:
-            for key, record in list(ledger.items()):
-                if key[1] == route[1] and '_pending_finals' in record:
-                    record['_pending_finals'].discard(token)
-                    if not record['_pending_finals']:
-                        del record['_pending_finals']
-
         def owned():
             return (adapter._active_sessions.get(ctx.session_key) is guard
                     and getattr(guard, '_hermes_run_generation', None) == ctx.run_generation
@@ -197,17 +214,18 @@ def schedule_waiting_resolution(response, adapter, ctx):
             return
         key = (*route, resolution.identity.root_request_id)
         record = ledger.get(key)
-        if not record or record.get('_pending_finals'):
+        def blocked():
+            return any(state[0] == route[1] for state in pending.values())
+
+        if not record or blocked():
             return
         for mid in tuple(record['message_ids']):
-            if not owned() or ledger.get(key) is not record or record.get('_pending_finals'):
+            if not owned() or ledger.get(key) is not record or blocked():
                 return
             units = tuple(dict.fromkeys((*resolution.delegation_ids, *record['delegation_ids'])))
             if not completed_owned(resolution.identity, units):
                 return
-            if (getattr(adapter, '_waiting_receipts_disabled', False)
-                    or mid not in record['message_ids']
-                    or (str(chat), mid) in getattr(adapter, '_waiting_promoted_ids', set())):
+            if mid not in record['message_ids'] or mid in record.get('_uncertain_ids', ()):
                 continue
             try:
                 deleted = await adapter.delete_message(chat, mid)
@@ -218,5 +236,12 @@ def schedule_waiting_resolution(response, adapter, ctx):
                 if not record['message_ids']:
                     ledger.pop(key, None)
                     return
+        # After an owned resolution, uncertainty means retain the messages, not
+        # retain deletion eligibility forever. Failed deletes remain retryable.
+        if owned() and ledger.get(key) is record and not blocked():
+            uncertain = record.pop('_uncertain_ids', set())
+            record['message_ids'] = record['message_ids'] - uncertain
+            if not record['message_ids']:
+                ledger.pop(key, None)
 
     adapter.register_post_delivery_callback(ctx.session_key, cleanup, generation=ctx.run_generation)

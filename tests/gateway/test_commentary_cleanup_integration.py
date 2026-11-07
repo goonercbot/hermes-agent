@@ -41,7 +41,8 @@ class SplitAdapter(CleanupCaptureAdapter):
             self.sent.append({'content': content, 'message_id': 'comment-1'})
             return SendResult(success=True, message_id='comment-1',
                               raw_response={'message_ids': ['comment-1', 'comment-2']},
-                              continuation_message_ids=['comment-3'])
+                              continuation_message_ids=['comment-3'],
+                              fresh_message_ids=('comment-1', 'comment-2', 'comment-3'))
         self.final_count += 1
         final_id = f'final-{self.final_count}'
         self.sent.append({'content': content, 'message_id': final_id})

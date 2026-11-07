@@ -248,9 +248,12 @@ class StreamTransportMixin:
             self._track_preview_id(mid)
 
     def _track_final_receipt(self, result: Any) -> None:
-        if getattr(result, "success", False):
-            from gateway.commentary_delivery import message_ids
-            self._final_receipt_ids.update(message_ids(result))
+        from gateway.commentary_delivery import message_ids
+        self._final_receipt_ids.update(message_ids(result))
+        self._final_fresh_message_ids.update(
+            str(mid) for mid in (getattr(result, "fresh_message_ids", None) or ()) if mid is not None)
+        self._final_fresh_message_ids.update(
+            self._final_receipt_ids.intersection(self._segment_fresh_message_ids))
 
     def _adapter_prefers_fresh_final(self, text: str) -> bool:
         """Adapter's prefers_fresh_final_streaming hook (Telegram's richer send path);

@@ -196,10 +196,12 @@ def _take_post_delivery(authority, admission_id, source, route):
     adapter without the seam (a webhook sink, a bare test double) holds none."""
     resolve = getattr(authority.runner, '_adapter_for_source', None)
     native = admission_id in authority.native_waiters
-    slots = getattr(resolve(source), '_post_delivery_callbacks', None) if resolve and source and not native else None
+    adapter = resolve(source) if resolve and source and not native else None
+    slots = getattr(adapter, '_post_delivery_callbacks', None)
     entry = slots.pop(route, None) if slots is not None else None
     if entry is not None:
-        _registry(authority, 'post_delivery')[admission_id] = (slots, route, entry)
+        guard = getattr(adapter, '_active_sessions', {}).get(route)
+        _registry(authority, 'post_delivery')[admission_id] = (slots, route, entry, adapter, guard)
 
 
 def _hand_back_post_delivery(authority, admission_id):
@@ -207,7 +209,7 @@ def _hand_back_post_delivery(authority, admission_id):
     runs the slot, which goes back unless a newer turn's already took it."""
     taken = _registry(authority, 'post_delivery').pop(admission_id, None)
     if taken is not None:
-        slots, route, entry = taken
+        slots, route, entry, _, _ = taken
         slots.setdefault(route, entry)
 
 
@@ -229,6 +231,10 @@ async def fire_post_delivery(authority, admission_id):
         with await _execution_scope(authority, None):  # off-turn: the owning profile's scope
             await run_post_delivery_callback(callback, _POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS)
     finally:
+        _, route, _, adapter, guard = taken
+        if guard is not None:
+            from gateway.waiting_reply_delivery import dispose_pending_finals
+            dispose_pending_finals(adapter, guard, generation)
         receipt = _registry(authority, 'delivery_receipt_owners').pop(admission_id, None)
         if receipt is not None:
             adapter, route = receipt
@@ -481,7 +487,9 @@ async def deliver_settled(authority, admission_id):
                     _registry(authority, 'delivery_receipt_owners')[admission_id] = (adapter, session_key)
             else:
                 confirm = None
-            delivered = await deliver_response(adapter, event, session_key, response, on_final=confirm)
+            guard = taken[4] if taken is not None else None
+            delivered = await deliver_response(adapter, event, session_key, response, on_final=confirm,
+                                               delivery_guard=guard)
     except Exception:
         logger.exception('Delivery of settled admission %s failed', admission_id)
     finally:
@@ -493,7 +501,7 @@ async def deliver_settled(authority, admission_id):
             authority, admission_id, ProcessingOutcome.SUCCESS if delivered else ProcessingOutcome.FAILURE)
 
 
-async def deliver_response(adapter, event, session_key, response, *, on_final=None):
+async def deliver_response(adapter, event, session_key, response, *, on_final=None, delivery_guard=None):
     """Send a turn's reply; whether it was delivered (``_process_message_background``'s verdict:
     nothing to send, or at least one send that succeeded)."""
     from gateway.platforms.base import _thread_metadata_for_event, _mark_notify_metadata
@@ -503,13 +511,31 @@ async def deliver_response(adapter, event, session_key, response, *, on_final=No
     extracted = await adapter._extract_response_content(text, event, session_key, is_ephemeral_response=ttl > 0)
     metadata = _mark_notify_metadata(_thread_metadata_for_event(event))
     results = []
+    def record(result, *, nontext=False):
+        results.append(result)
+        if delivery_guard is not None and result is not None:
+            from gateway.platforms.post_delivery import record_final_ids
+            from gateway.commentary_delivery import message_ids
+            record_final_ids(delivery_guard, result)
+            if nontext:
+                delivery_guard._hermes_nontext_delivery_attempted = True
+            if not message_ids(result):
+                delivery_guard._hermes_final_receipt_uncertain = True
     if extracted.text_content:
+        if delivery_guard is not None:
+            delivery_guard._hermes_delivery_in_flight = True
         complete = await adapter._send_final_text(event, session_key, extracted.text_content,
-                                                  metadata, ttl > 0, ttl, results.append)
+                                                  metadata, ttl > 0, ttl, record)
+        if delivery_guard is not None:
+            delivery_guard._hermes_delivery_in_flight = False
         if on_final is not None:
             on_final(complete)
+    if delivery_guard is not None:
+        delivery_guard._hermes_delivery_in_flight = True
     await adapter._deliver_attachments(event, extracted, metadata, anything_sent=bool(results),
-                                       record_delivery=results.append)
+                                       record_delivery=lambda result: record(result, nontext=True))
+    if delivery_guard is not None:
+        delivery_guard._hermes_delivery_in_flight = False
     return any(getattr(result, 'success', False) for result in results if result is not None)
 
 

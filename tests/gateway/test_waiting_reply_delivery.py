@@ -54,7 +54,8 @@ def setup(agent):
 
 def receipt(complete=True):
     return SendResult(success=True, message_id='a', raw_response={'message_ids': ['a', 'b']},
-                      continuation_message_ids=('c',), full_payload_delivered=complete)
+                      continuation_message_ids=('c',), full_payload_delivered=complete,
+                      fresh_message_ids=('a', 'b', 'c'))
 
 
 def assert_record(adapter, agent, unit):
@@ -115,20 +116,20 @@ async def test_nontext_attempt_invalidates_normal_final(turn):
 
 
 @pytest.mark.asyncio
-async def test_metadata_eviction_never_deletes_messages(turn, monkeypatch):
+async def test_multiple_receipts_are_retained_without_eviction(turn):
     from gateway.platforms.post_delivery import record_final_ids
-    import gateway.waiting_reply_delivery as delivery
-    monkeypatch.setattr(delivery, '_MAX_RECORDS', 2)
     agent, unit = turn
     classify(agent, unit)
     adapter, guard, ctx = setup(agent)
     for thread in ('one', 'two', 'three'):
         ctx.source.thread_id = thread
         schedule_cleanup({'final_response': 'Still waiting.'}, adapter, ctx)
-        record_final_ids(guard, receipt())
+        record_final_ids(guard, SendResult(success=True, message_id=thread,
+                                            fresh_message_ids=(thread,)))
+        guard._hermes_final_fresh_message_ids = {thread}
         adapter._confirm_final_delivery('session', 1, True)
         await adapter._fire_post_delivery_callback('session', guard)
-    assert [key[2] for key in adapter._waiting_reply_receipts] == ['two', 'three']
+    assert [key[2] for key in adapter._waiting_reply_receipts] == ['one', 'two', 'three']
     assert not adapter.deleted
 
 

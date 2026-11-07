@@ -29,7 +29,7 @@ async def test_native_wait_to_proven_final_deletes_only_wait(tts, tmp_path):
         classify(agent, unit)
         adapter, guard, ctx = setup(agent)
         event = MessageEvent(text='question', message_type=MessageType.TEXT, source=ctx.source, message_id='in')
-        adapter._send_with_retry = AsyncMock(return_value=SendResult(success=True, message_id='wait', full_payload_delivered=True))
+        adapter._send_with_retry = AsyncMock(return_value=SendResult(success=True, message_id='wait', full_payload_delivered=True, fresh_message_ids=('wait',)))
         async def waiting(_):
             schedule_cleanup({'final_response': 'Waiting.'}, adapter, ctx)
             return 'Waiting.'
@@ -87,7 +87,8 @@ async def test_resolution_controls_and_receipt_union(case):
         for index, uid in enumerate(units):
             classify(agent, uid)
             schedule_cleanup({'final_response': 'Waiting.'}, adapter, ctx)
-            record_final_ids(guard, SendResult(success=True, message_id=f'wait{index}', full_payload_delivered=True))
+            guard._hermes_final_fresh_message_ids = set()
+            record_final_ids(guard, SendResult(success=True, message_id=f'wait{index}', full_payload_delivered=True, fresh_message_ids=(f'wait{index}',)))
             adapter._confirm_final_delivery('session', 1, True)
             await adapter._fire_post_delivery_callback('session', guard)
             guard._hermes_final_delivery_ids.clear()
@@ -214,7 +215,8 @@ async def test_unrelated_genuine_final_promotes_overlap_before_later_resolution(
         adapter, guard, ctx = setup(agent)
         schedule_cleanup({'final_response': 'Waiting.'}, adapter, ctx)
         record_final_ids(guard, SendResult(success=True, message_id='promoted',
-                                          raw_response={'message_ids': ['wait']}, full_payload_delivered=True))
+                                          raw_response={'message_ids': ['wait']}, full_payload_delivered=True,
+                                          fresh_message_ids=('promoted', 'wait')))
         adapter._confirm_final_delivery('session', 1, True)
         await adapter._fire_post_delivery_callback('session', guard)
         agent._current_turn_id = 'unrelated'
@@ -225,6 +227,7 @@ async def test_unrelated_genuine_final_promotes_overlap_before_later_resolution(
         await adapter._fire_post_delivery_callback('session', guard)
         from tools.delegate_waiting_reply import adopt_dispatch_identity
         agent._current_turn_id = 'another-wait'
+        guard._hermes_final_fresh_message_ids = set()
         assert adopt_dispatch_identity(agent, 'another-wait', identity)
         classify(agent, uid)
         guard._hermes_final_delivery_ids.clear()
@@ -270,7 +273,7 @@ async def test_native_admission_snapshot_to_resolution_delivery(messaging, monke
     adapter._active_sessions[m.route] = adapter._active_sessions.pop('session')
     ctx.session_key = m.route
     schedule_cleanup({'final_response': 'Waiting.'}, adapter, ctx)
-    record_final_ids(guard, SendResult(success=True, message_id='wait', full_payload_delivered=True))
+    record_final_ids(guard, SendResult(success=True, message_id='wait', full_payload_delivered=True, fresh_message_ids=('wait',)))
     adapter._confirm_final_delivery(m.route, 1, True)
     await adapter._fire_post_delivery_callback(m.route, guard)
     records['unit']['status'] = 'completed'
@@ -319,7 +322,8 @@ async def test_deletion_does_not_replace_newer_receipt_ledger():
         adapter, guard, ctx = setup(agent)
         schedule_cleanup({'final_response': 'Wait'}, adapter, ctx)
         record_final_ids(guard, SendResult(success=True, message_id='old1',
-                                          raw_response={'message_ids': ['old2']}, full_payload_delivered=True))
+                                          raw_response={'message_ids': ['old2']}, full_payload_delivered=True,
+                                          fresh_message_ids=('old1', 'old2')))
         adapter._confirm_final_delivery('session', 1, True)
         await adapter._fire_post_delivery_callback('session', guard)
         key = ('session', 'chat', 'thread', identity.root_request_id)

@@ -1001,6 +1001,8 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
             _voice_ack_guild=_voice_ack_guild, _voice_ack_loop=asyncio.get_running_loop(),
             **{name: getattr(disp, name) for name in self._DISPLAY_TO_TURN_CTX}, **turn_params,
         )
+        from gateway.waiting_reply_delivery import begin_request_capture
+        begin_request_capture(_cleanup_adapter, turn_ctx)
         turn_runner = TurnRunner(self, turn_ctx)
         turn_ctx.mute_notification_reply = diagnostic_turn_muted(
             turn_ctx.persist_user_display_metadata, source.platform, turn_ctx.user_config)
@@ -1642,6 +1644,35 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
         _bg_guard = getattr(adapter, '_active_sessions', {}).get(session_key) if adapter else None
         _queued_uncertain = False
         _previous_receipt_uncertain = getattr(_bg_guard, '_hermes_final_receipt_uncertain', False)
+        _queued_token = None
+        _queued_known = False
+        _queued_result_uncertain = False
+        _queued_receipt = None
+        if first_response and _deliver_media:
+            from gateway.platforms.base import BasePlatformAdapter
+            _queued_result_uncertain = ('MEDIA:' in first_response.upper()
+                or bool(BasePlatformAdapter.extract_images(first_response)[0]))
+        if first_response and _bg_guard is not None:
+            from types import SimpleNamespace
+            _queued_receipt = SimpleNamespace(_hermes_final_delivery_ids=set())
+            _queued_token = object()
+            _pending = getattr(adapter, '_waiting_pending_finals', None)
+            if _pending is None:
+                _pending = adapter._waiting_pending_finals = {}
+            _pending[_queued_token] = (str(turn_ctx.source.chat_id), _queued_receipt, _sc, turn_ctx.run_generation)
+
+        def _record_queued_receipt(receipt, edited_id):
+            nonlocal _queued_known, _queued_result_uncertain
+            from gateway.commentary_delivery import message_ids
+            from gateway.platforms.post_delivery import record_final_ids
+            record_final_ids(_queued_receipt, receipt)
+            ids = message_ids(receipt)
+            if edited_id and getattr(receipt, 'success', False):
+                _queued_receipt._hermes_final_delivery_ids.add(str(edited_id))
+                ids.append(str(edited_id))
+            _queued_known = _queued_known or bool(ids)
+            _queued_result_uncertain = _queued_result_uncertain or not getattr(receipt, "success", False)
+
         if first_response:
             logger.info(
                 "Queued follow-up for session %s: final text delivery confirmed; delivering explicit media before continuing."
@@ -1652,6 +1683,7 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
             try:
                 if _bg_guard is not None:
                     _bg_guard._hermes_delivery_in_flight = True
+                    _bg_guard._hermes_queued_delivery_token = _queued_token
                 _text_delivered = await self._deliver_queued_first_response(
                     first_response, source=turn_ctx.source, adapter=adapter,
                     metadata=turn_ctx._status_thread_metadata, event_message_id=turn_ctx.event_message_id,
@@ -1660,13 +1692,18 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
                     # The text send records a delivery-ledger obligation under this key, keyed on
                     # the raw inbound id (the anchor above is only the reply target).
                     session_key=session_key, inbound_message_id=turn_ctx.inbound_message_id,
+                    receipt_callback=_record_queued_receipt if _bg_guard is not None else None,
                 )
             except Exception as e:
                 logger.warning("Failed to send first response before queued message: %s", e)
             except BaseException:
                 if _bg_guard is not None:
-                    from gateway.waiting_reply_delivery import dispose_pending_finals
+                    from gateway.waiting_reply_delivery import dispose_pending_finals, finish_pending_final
+                    finish_pending_final(adapter, _queued_token, uncertain=True)
                     dispose_pending_finals(adapter, _bg_guard, turn_ctx.run_generation)
+                    if getattr(_bg_guard, '_hermes_queued_delivery_token', None) is _queued_token:
+                        _bg_guard._hermes_delivery_in_flight = False
+                        _bg_guard._hermes_queued_delivery_token = None
                 raise
             else:
                 # One source of truth for "this turn's final already reached the chat": the normal
@@ -1680,12 +1717,18 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
                     # The queued lane already uploaded this response's MEDIA: attachments; without
                     # this the completion path's already_sent rescan uploads every file twice.
                     result["media_already_delivered"] = _deliver_media
-            if _bg_guard is not None:
-                # The queued transport returns only a boolean, not the IDs it
-                # sent or edited. Preserve overlapping messages conservatively.
-                _bg_guard._hermes_final_receipt_uncertain = True
+            if (_bg_guard is not None and
+                    getattr(_bg_guard, '_hermes_queued_delivery_token', None) is _queued_token):
                 _bg_guard._hermes_delivery_in_flight = False
+                _bg_guard._hermes_queued_delivery_token = None
+            if (_bg_guard is not None and
+                    getattr(_bg_guard, '_hermes_run_generation', None) == turn_ctx.run_generation):
+                # A partial or unidentified transport result remains uncertain.
+                _bg_guard._hermes_final_receipt_uncertain = not _queued_known or _queued_result_uncertain
                 _queued_uncertain = True
+        if _queued_token is not None:
+            from gateway.waiting_reply_delivery import finish_pending_final
+            finish_pending_final(adapter, _queued_token, uncertain=not _queued_known or _queued_result_uncertain)
         # Release deferred bg-review notifications: pop (no double-fire in base.py's finally) and call.
         try:
             _bg_cb = self._pop_post_delivery_callback(adapter, session_key, turn_ctx.run_generation)

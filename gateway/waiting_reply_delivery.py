@@ -2,6 +2,34 @@
 from collections import OrderedDict
 
 
+def begin_request_capture(adapter, ctx):
+    """Keep revocations from before the first temporary transport operation."""
+    if not ctx._cleanup_progress or adapter is None:
+        return
+    guard = adapter._active_sessions.get(ctx.session_key)
+    if guard is None or getattr(guard, '_hermes_run_generation', None) != ctx.run_generation:
+        return
+    state = {'chat': str(ctx.source.chat_id), 'revoked': set(), 'generation': ctx.run_generation}
+    captures = getattr(guard, '_waiting_live_captures', None)
+    if captures is None:
+        captures = guard._waiting_live_captures = []
+    captures.append(state)
+    ctx._waiting_request_capture = state
+
+
+def capture_for_request(guard, ctx, chat):
+    prior = getattr(ctx, '_waiting_request_capture', None)
+    captures = getattr(guard, '_waiting_live_captures', None)
+    if captures is None:
+        captures = guard._waiting_live_captures = []
+    state = {'chat': str(chat), 'revoked': prior['revoked'] if prior else set(),
+             'generation': ctx.run_generation}
+    if prior and prior.get('uncertain'):
+        state['uncertain'] = True
+    captures.append(state)
+    return state, captures
+
+
 def finish_pending_final(adapter, token, *, uncertain=False):
     """Retire one delivery barrier; unknown disposal taints only overlapping receipts."""
     pending = getattr(adapter, '_waiting_pending_finals', {})
@@ -88,11 +116,7 @@ def schedule_waiting_receipt(response, adapter, ctx):
 
     # A live capture owns its revocations until its callback runs.  This is not
     # an adapter-lifetime history of final IDs.
-    capture_state = {'chat': str(chat), 'revoked': set(), 'generation': ctx.run_generation}
-    captures = getattr(guard, '_waiting_live_captures', None)
-    if captures is None:
-        captures = guard._waiting_live_captures = []
-    captures.append(capture_state)
+    capture_state, captures = capture_for_request(guard, ctx, chat)
 
     async def capture():
         if not any(state is capture_state for state in captures):

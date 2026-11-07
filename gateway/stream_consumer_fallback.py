@@ -135,6 +135,7 @@ class StreamFallbackMixin:
                 content=chunk, reply_to=None if sent_any_chunk else anchor,
                 retry_log="Flood control on fallback send, retrying in %.1fs")
             complete = complete and complete_body(result)
+            self._track_final_receipt(result)
             if not result or not result.success:
                 # Partial continuation landed: do NOT set _final_response_sent (the
                 # gateway must still deliver the full answer); _already_sent only
@@ -146,7 +147,6 @@ class StreamFallbackMixin:
                 self._fallback_prefix = ""
                 return
             sent_any_chunk = True
-            self._track_final_receipt(result)
             last_successful_chunk = chunk
             last_message_id = result.message_id or last_message_id
             self._notify_new_message()
@@ -263,13 +263,13 @@ class StreamFallbackMixin:
         except Exception as exc:
             logger.debug("Empty fallback final send failed: %s", exc)
             return "ambiguous" if self._send_failure_may_have_delivered(exc) else "failed"
+        self._track_final_receipt(result)
         if not getattr(result, "success", False):
             if self._is_flood_error(result):
                 return "preview"
             return "ambiguous" if self._send_failure_may_have_delivered(result) else "failed"
 
         new_message_id = getattr(result, "message_id", None)
-        self._track_final_receipt(result)
         # Telegram reports delete failure by returning False; the flood window that
         # broke the finalize can reject this too — one bounded retry.
         await self._delete_previews(stale_ids - self._final_receipt_ids, label="Empty fallback",

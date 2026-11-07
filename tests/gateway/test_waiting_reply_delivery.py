@@ -49,6 +49,8 @@ def setup(agent):
     ctx = TurnContext(source=source, session_key='session', run_generation=1,
                       _cleanup_progress=True, _run_still_current=lambda: True)
     ctx.agent_holder[0] = agent
+    from gateway.waiting_reply_delivery import begin_request_capture
+    begin_request_capture(adapter, ctx)
     return adapter, guard, ctx
 
 

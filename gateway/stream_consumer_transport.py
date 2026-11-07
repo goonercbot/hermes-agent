@@ -250,10 +250,11 @@ class StreamTransportMixin:
     def _track_final_receipt(self, result: Any) -> None:
         from gateway.commentary_delivery import message_ids
         self._final_receipt_ids.update(message_ids(result))
-        self._final_fresh_message_ids.update(
-            str(mid) for mid in (getattr(result, "fresh_message_ids", None) or ()) if mid is not None)
-        self._final_fresh_message_ids.update(
-            self._final_receipt_ids.intersection(self._segment_fresh_message_ids))
+        if getattr(result, "success", False):
+            self._final_fresh_message_ids.update(
+                str(mid) for mid in (getattr(result, "fresh_message_ids", None) or ()) if mid is not None)
+            self._final_fresh_message_ids.update(
+                set(message_ids(result)).intersection(self._segment_fresh_message_ids))
 
     def _adapter_prefers_fresh_final(self, text: str) -> bool:
         """Adapter's prefers_fresh_final_streaming hook (Telegram's richer send path);
@@ -298,13 +299,14 @@ class StreamTransportMixin:
         except Exception as e:
             logger.debug("Fresh-final send failed, falling back to edit: %s", e)
             return False
+        if is_turn_final:
+            self._track_final_receipt(result)
         if not getattr(result, "success", False):
             return False
         from gateway.platforms.post_delivery import complete_body
         complete = complete_body(result)
         if is_turn_final:
             self._confirmed_complete_body = complete
-            self._track_final_receipt(result)
         new_message_id = getattr(result, "message_id", None)
         # Best-effort preview cleanup; never delete the message just sent.
         if complete:

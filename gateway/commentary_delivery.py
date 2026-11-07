@@ -56,11 +56,8 @@ def schedule_cleanup(response, adapter, ctx):
     delivery_guard = adapter._active_sessions.get(ctx.session_key)
     if delivery_guard is None:
         return
-    capture_state = {'chat': str(ctx.source.chat_id), 'revoked': set(), 'generation': ctx.run_generation}
-    captures = getattr(delivery_guard, '_waiting_live_captures', None)
-    if captures is None:
-        captures = delivery_guard._waiting_live_captures = []
-    captures.append(capture_state)
+    from gateway.waiting_reply_delivery import capture_for_request
+    capture_state, captures = capture_for_request(delivery_guard, ctx, ctx.source.chat_id)
     if response.get('_complete_final_body') and final_text:
         adapter._confirm_final_delivery(ctx.session_key, ctx.run_generation, True)
     async def cleanup_body():
@@ -114,8 +111,8 @@ async def edit_streamed_final(consumer, source, response, content, *, _sk, ok, f
         logger.warning(fail_exc, _sk, error)
         return False
     raw = getattr(result, 'raw_response', None)
+    consumer._track_final_receipt(result)
     if getattr(result, 'success', False) and not (isinstance(raw, dict) and raw.get('skipped')):
-        consumer._track_final_receipt(result)
         if consumer.message_id and consumer.message_id != '__no_edit__':
             consumer._final_receipt_ids.add(str(consumer.message_id))
     if (not getattr(result, 'success', False) or getattr(result, 'full_payload_delivered', None) is False

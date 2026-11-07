@@ -68,7 +68,7 @@ class CleanupCaptureAdapter(BasePlatformAdapter):
         self.sent.append(
             {"chat_id": chat_id, "content": content, "message_id": mid, "metadata": metadata}
         )
-        return SendResult(success=True, message_id=mid)
+        return SendResult(success=True, message_id=mid, fresh_message_ids=(mid,))
 
     async def edit_message(self, chat_id, message_id, content) -> SendResult:
         self.edits.append({"chat_id": chat_id, "message_id": message_id, "content": content})
@@ -263,6 +263,8 @@ async def test_cleanup_chains_with_existing_callback(monkeypatch, tmp_path):
 
     source = SessionSource(platform=Platform.TELEGRAM, chat_id="-1001")
     session_key = "agent:main:telegram:group:-1001"
+    # The production adapter installs a live delivery guard before invoking the runner.
+    adapter._active_sessions[session_key] = asyncio.Event()
 
     pre_existing_fired = []
 

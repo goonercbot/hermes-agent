@@ -108,6 +108,8 @@ async def _admit_folded_completion(authority, adapter, event, evt, identity):
     import asyncio
     waiting = await asyncio.to_thread(_waiting_completion, authority, evt, event)
     if waiting is not None:
+        # A folded payload has another origin; do not infer its lineage.
+        event._waiting_lineage_proof = None
         unfolded = event.text, dict(event.metadata)
         _fold_completion(event, waiting, identity)
         try:

@@ -1030,7 +1030,9 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                 agent._silence_marker_needs_reply = not silence_allowed(
                     ctx.persist_user_display_kind, ctx.reply_expected)
                 try:
-                    result = agent.run_conversation(api_message, **kwargs)
+                    from tools.waiting_lineage import execution_proof
+                    with execution_proof(ctx.waiting_lineage_proof, ctx.session_id, ctx.session_key):
+                        result = agent.run_conversation(api_message, **kwargs)
                 finally:
                     agent._silence_marker_needs_reply = False
             if captured is not None:

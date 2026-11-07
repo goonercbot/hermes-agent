@@ -1,5 +1,6 @@
 """Authority-delivered replies gate cleanup on a complete synthetic transport receipt."""
 from contextlib import nullcontext
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -28,6 +29,9 @@ async def test_authority_delivers_then_fires_proof_gated_callback(monkeypatch, r
     source = SessionSource(platform=Platform.TELEGRAM, chat_id='chat', chat_type='dm')
     event = MessageEvent(text='question', message_type=MessageType.TEXT, source=source, message_id='in')
     route = 'authority-route'
+    guard = asyncio.Event()
+    guard._hermes_run_generation = 9
+    adapter._active_sessions[route] = guard
     ctx = TurnContext(_cleanup_progress=True, _cleanup_msg_ids=['progress'], session_key=route,
                       source=source, run_generation=9)
     schedule_cleanup({'final_response': 'answer'}, adapter, ctx)

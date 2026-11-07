@@ -138,6 +138,9 @@ class SessionAuthority:
         self.instance_id = instance_id
         self.db = db
         self.epoch = epoch
+        # Only committed native events; never serialized. Eviction fails closed.
+        from collections import OrderedDict
+        self._waiting_lineage = OrderedDict()
         self.sessions = {}
         self.waiters = {}
         self.events = {}
@@ -639,12 +642,44 @@ class SessionAuthority:
 
     def _admitted(self, ref, event, row):
         if event is not None:
+            from tools.waiting_lineage import CompletionProof
+            proof = getattr(event, '_waiting_lineage_proof', None)
+            live = self.sessions.get(ref.session_id)
+            if (type(proof) is CompletionProof and event.internal and live is not None
+                    and row['status'] == 'queued' and row['owner_epoch'] == self.epoch
+                    and row['target_session_id'] == ref.session_id and ref.profile_id == self.profile_id
+                    and proof.session_id == ref.session_id and proof.route == live.route):
+                key = (self.epoch, ref.profile_id, ref.session_id, row['admission_id'], live.route)
+                self._waiting_lineage[key] = (proof, row['seq'], self._waiting_payload_digest(row), self.route_epoch(live.route))
+                self._waiting_lineage.move_to_end(key)
+                while len(self._waiting_lineage) > 1024:
+                    self._waiting_lineage.popitem(last=False)
             event._gateway_accepted = True
             if row['status'] == 'queued' and (committed := getattr(event, '_on_commit', None)) is not None:
                 committed()  # a queued slash command's ack follows its commit (``_queue_command_turn``)
             mark_producer_admission(self, event, row)
         self._publish_pending(ref)
         return self._receipt(row)
+
+    def take_waiting_lineage(self, ref, row, route):
+        key = (self.epoch, ref.profile_id, ref.session_id, row['admission_id'], route)
+        item = self._waiting_lineage.pop(key, None)
+        if item is None:
+            return None
+        proof, seq, digest, route_epoch = item
+        live = self.sessions.get(ref.session_id)
+        if (ref.profile_id != self.profile_id or live is None or live.route != route
+                or self.route_epoch(route) != route_epoch or row['target_session_id'] != ref.session_id
+                or row['status'] != 'started' or row['owner_epoch'] != self.epoch
+                or type(row['generation']) is not int or row['seq'] != seq or self._waiting_payload_digest(row) != digest):
+            return None
+        return proof
+
+    @staticmethod
+    def _waiting_payload_digest(row):
+        import hashlib
+        from hermes_state_runtime import _json
+        return hashlib.sha256(_json(row['payload']).encode('utf-8')).digest()
 
     def _schedule_admitted(self, ref, _receipt=None):
         # tracked_write's ``after``: in the admitting caller's own step (see tracked_write).

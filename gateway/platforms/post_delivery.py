@@ -11,9 +11,16 @@ def complete_body(result):
 
 
 def record_final_ids(guard, result):
-    if getattr(result, 'success', False):
-        from gateway.commentary_delivery import message_ids
-        guard._hermes_final_delivery_ids.update(message_ids(result))
+    # Even a failed or partial send can have created or edited messages.  Their
+    # identity protects them from deletion; freshness is a separate proof.
+    from gateway.commentary_delivery import message_ids
+    if not hasattr(guard, '_hermes_final_delivery_ids'):
+        guard._hermes_final_delivery_ids = set()
+    guard._hermes_final_delivery_ids.update(message_ids(result))
+    if not hasattr(guard, '_hermes_final_fresh_message_ids'):
+        guard._hermes_final_fresh_message_ids = set()
+    guard._hermes_final_fresh_message_ids.update(
+        str(mid) for mid in (getattr(result, 'fresh_message_ids', None) or ()) if mid is not None)
 
 
 class FinalDeliveryReceiptMixin:

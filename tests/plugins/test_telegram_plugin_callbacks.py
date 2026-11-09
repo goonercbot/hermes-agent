@@ -60,13 +60,14 @@ def test_callback_dispatch_and_native_cleanup(tmp_path, monkeypatch):
     monkeypatch.setattr(CallbackQuery, "edit_message_text", edit_query)
     import tools.approval
     import tools.slash_confirm
-    monkeypatch.setattr(tools.approval, "resolve_gateway_approval",
-                        lambda session, choice: calls.append(("approval", session, choice)) or 1)
+    monkeypatch.setattr(tools.approval, "resolve_gateway_approval_card",
+                        lambda session, choice, request: calls.append(("approval", session, choice, request)) or 1)
     async def resolve_command(session, confirm, choice):
         calls.append(("confirm", session, confirm, choice))
     monkeypatch.setattr(tools.slash_confirm, "resolve", resolve_command)
     adapter.resume_typing_for_chat = lambda *args: None
     adapter._approval_state = {123: "session"}
+    adapter._approval_request_ids = {123: "request-123"}
     adapter._slash_confirm_state = {"abc": "session"}
 
     runner = object.__new__(GatewayRunner)
@@ -143,7 +144,7 @@ def test_callback_dispatch_and_native_cleanup(tmp_path, monkeypatch):
         monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "1")
         calls.clear()
         await application.process_update(update(19, 1, "ea:once:123"))
-        assert ("approval", "session", "once") in calls
+        assert ("approval", "session", "once", "request-123") in calls
         assert "edited" in calls
         calls.clear()
         await application.process_update(update(20, 1, "sc:once:abc"))

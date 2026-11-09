@@ -313,6 +313,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         metadata: Optional[dict[str, Any]] = None, event_message_id: Optional[str] = None,
         text_already_delivered: bool = False, deliver_media: bool = True, stream_consumer=None,
         session_key: Optional[str] = None, inbound_message_id: Optional[str] = None,
+        receipt_callback=None,
     ) -> bool:
         """Deliver a queued response using the normal text+attachment split.
 
@@ -343,6 +344,8 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                         _edit_res = await adapter.edit_message(
                             chat_id=source.chat_id, message_id=_sc_msg_id, content=text_content, finalize=True,
                         )
+                        if receipt_callback is not None:
+                            receipt_callback(_edit_res, _sc_msg_id)
                         if getattr(_edit_res, "success", False):
                             _reconciled = True
                             logger.info(
@@ -368,6 +371,8 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                     _sent = await self._send_queued_final_text(
                         adapter, source, text_content, metadata, event_message_id, session_key,
                         inbound_message_id)
+                    if receipt_callback is not None:
+                        receipt_callback(_sent, None)
                     if not getattr(_sent, "success", False):
                         # The text never landed. Report it undelivered and skip the attachments too:
                         # the caller's normal completion send replays the whole response (text and
@@ -1010,6 +1015,11 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                 text=synth_text, message_type=MessageType.TEXT, source=source, internal=True,
                 metadata=metadata,
             )
+            from tools.waiting_lineage import CompletionProof
+            proof = evt.get('_waiting_lineage_proof')
+            if (type(proof) is CompletionProof
+                    and self._session_key_for_source(source) == proof.route):
+                synth_event._waiting_lineage_proof = proof
             logger.info(
                 "Watch pattern notification — injecting for %s chat=%s thread=%s",
                 platform_name, source.chat_id, source.thread_id,
@@ -1347,7 +1357,13 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             # The rows this admission settles: a turn that cannot confirm the owner offers them again.
             completion_ids = [claim.delegation_id] if claim.claim_id else []
             completion_ids += [sibling["delegation_id"] for sibling, claim_id in sibling_claims if claim_id]
-            evt = {**evt, "completion_ids": completion_ids}
+            evt = {key: value for key, value in evt.items() if key != '_waiting_lineage_proof'}
+            evt["completion_ids"] = completion_ids
+            if claim.claim_id and all(claim_id for _, claim_id in sibling_claims):
+                from tools.waiting_lineage import prove_completion
+                proof = prove_completion(completion_ids, claim.owner_session_id, str(evt.get('session_key') or ''))
+                if proof is not None:
+                    evt['_waiting_lineage_proof'] = proof
             injection_result = await self._inject_watch_notification(synth_text, evt, raise_not_accepted=True)
             if injection_result is not True:
                 return injection_result

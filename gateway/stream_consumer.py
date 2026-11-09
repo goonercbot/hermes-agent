@@ -167,7 +167,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         self._delivered_commentary_texts: list[str] = []
         self._delivered_segment_texts: list[str] = []  # finalized text per past segment
         self._last_segment_delivery: Optional[tuple[str, Optional[float], str, set[str]]] = None
-        self._last_segment_receipts: Optional[tuple[str, set[str]]] = None
+        self._last_segment_receipts: Optional[tuple[str, set[str], set[str]]] = None
         self._superseded_reply_ids: set[str] = set()
         self._in_think_block = False  # think-tag filter state (mirrors CLI _stream_delta)
         self._think_buffer = ""
@@ -211,7 +211,9 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         # Fallback sends only the missing tail after a partial overflow delivery.
         self._fallback_preserve_partial_messages = False
         self._segment_preview_message_ids: set[str] = set()
+        self._segment_fresh_message_ids: set[str] = set()
         self._final_receipt_ids: set[str] = set()
+        self._final_fresh_message_ids: set[str] = set()
         # Tool-progress overlay (native only): shown in the bubble until text arrives.
         self._tool_progress_lines: list[str] = []
         self._tool_progress_active: bool = False
@@ -469,7 +471,8 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         if preserve_no_edit and self._message_id == "__no_edit__":
             return
         if self._stream_ledger:
-            self._last_segment_receipts = (self._stream_ledger, set(self._segment_preview_message_ids))
+            self._last_segment_receipts = (self._stream_ledger, set(self._segment_preview_message_ids),
+                                           set(self._segment_fresh_message_ids))
         # Retain the segment's visible text so has_delivered_text still matches.
         finalized = self._clean_for_display(self._last_sent_text).strip()
         if finalized:
@@ -1017,15 +1020,18 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         target = self._clean_for_display(text).strip()
         segment = self._clean_for_display(self._stream_ledger).strip()
         ids = set(self._segment_preview_message_ids) if target and target == segment else set()
+        fresh = set(self._segment_fresh_message_ids) if ids else set()
         if not ids and target and not segment and self._last_segment_receipts:
-            previous, prior_ids = self._last_segment_receipts
+            previous, prior_ids, prior_fresh = self._last_segment_receipts
             if self._clean_for_display(previous).strip() == target:
                 ids = set(prior_ids)
+                fresh = set(prior_fresh)
         if ids and self._on_commentary_delivered:
             from gateway.platforms.base import SendResult
             try:
                 self._on_commentary_delivered(
-                    SendResult(success=True, continuation_message_ids=tuple(sorted(ids))), text)
+                    SendResult(success=True, continuation_message_ids=tuple(sorted(ids)),
+                               fresh_message_ids=tuple(sorted(fresh & ids))), text)
             except Exception:
                 logger.debug("streamed commentary receipt callback error", exc_info=True)
 

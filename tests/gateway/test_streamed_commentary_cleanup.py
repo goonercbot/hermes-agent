@@ -35,7 +35,8 @@ async def test_streamed_commentary_receipts_are_cleaned(monkeypatch, tmp_path, s
                 seen.set()
                 return SendResult(success=True, message_id='comment-1',
                                   raw_response={'message_ids': ['comment-1', 'comment-2']},
-                                  continuation_message_ids=('comment-3',), full_payload_delivered=True)
+                                  continuation_message_ids=('comment-3',), full_payload_delivered=True,
+                                  fresh_message_ids=('comment-1', 'comment-2', 'comment-3'))
             final_id = 'comment-2' if scenario == 'reused_final' else 'final'
             self.sent.append({'content': content, 'message_id': final_id})
             return SendResult(success=True, message_id=final_id, full_payload_delivered=scenario != 'partial')

@@ -35,8 +35,12 @@ async def _fallback_split_final_reused_ids_survive(monkeypatch, tmp_path, reuse=
                 raw = {'message_ids': ['final-tail', 'comment-2' if reuse else 'final-2']}
                 continuation = ('comment-3' if reuse else 'final-3',)
             self.sent.append({'content': content, 'message_id': mid, 'raw': raw, 'continuation': continuation})
+            fresh = (('comment-1', 'comment-2', 'comment-3') if mid == 'comment-1' else
+                     ('final-preview',) if mid == 'final-preview' else
+                     ('final-tail',) if reuse else ('final-tail', 'final-2', 'final-3'))
             return SendResult(success=True, message_id=mid, raw_response=raw,
-                              continuation_message_ids=continuation, full_payload_delivered=True)
+                              continuation_message_ids=continuation, full_payload_delivered=True,
+                              fresh_message_ids=fresh)
 
         async def edit_message(self, chat_id, message_id, content, **kwargs):
             self.edits.append({'content': content, 'message_id': message_id})

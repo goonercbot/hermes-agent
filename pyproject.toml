@@ -37,8 +37,8 @@ dependencies = [
   # extra and gets prepared through PM when the
   # user picks that backend. Smaller `dependencies` = smaller blast
   # radius for the next supply-chain attack.
-  "openai==2.54.0; python_version >= '3.14'",
-  "certifi==2026.10.19; python_version >= '3.14'",
+  "openai==3.46.0; python_version >= '3.14'",
+  "certifi==2026.10.23; python_version >= '3.14'",
   # TLS trust comes from the OS certificate store (agent/ssl_verify.py), so
   # a corporate/internal root installed on the machine just works. certifi
   # above stays a direct pin because httpx/requests/openai each depend on
@@ -49,14 +49,12 @@ dependencies = [
   "python-dotenv==1.2.4; python_version >= '3.14'",
   "fire==0.7.1; python_version >= '3.14'",
   "httpx[socks]==0.28.1; python_version >= '3.14'",
-  "rich==14.3.4; python_version >= '3.14'",
+  "rich==15.0.0; python_version >= '3.14'",
   "tenacity==9.2.1; python_version >= '3.14'",
   "tomli-w==1.2.0; python_version >= '3.14'",  # Preserve relative dependency paths in staged plugin metadata.
-  # 0.18.17 requires ruamel.yaml.clib on 3.14, which has no Windows ARM64 wheel.
-  "ruamel.yaml==0.18.16; python_version >= '3.14'",
-  # 0.18.16 only pulls in its C parser below 3.14, so every 3.14 install parsed YAML
-  # (plugin manifests, config) in pure Python: ~5 s of gateway startup on 1 vCPU.
-  # Declared where clib ships a cp314 wheel; elsewhere hermes_yaml falls back to pure.
+  # ruamel.yaml 0.19 uses its Python parser by default; clib remains available
+  # for consumers using the explicitly selected oldlibyaml accelerator.
+  "ruamel.yaml==0.19.1; python_version >= '3.14'",
   "ruamel.yaml.clib==0.2.15; python_version >= '3.14' and platform_python_implementation == 'CPython' and (sys_platform == 'darwin' or (sys_platform == 'linux' and platform_machine in 'x86_64 aarch64 i686') or (sys_platform == 'win32' and platform_machine in 'AMD64 x86'))",
   "requests==2.34.2; python_version >= '3.14'",  # CVE-2026-25645
   "jinja2==3.1.6; python_version >= '3.14'",
@@ -72,7 +70,7 @@ dependencies = [
   # pydantic-core 2.41.5 (pulled by 2.12.5) segfaults when the OpenAI SDK's
   # Responses API resource is exercised from a non-main thread, which is the
   # codex_responses dispatch in agent/chat_completion_helpers.py:_call.
-  "pydantic==2.14.1; python_version >= '3.14'",
+  "pydantic==2.14.3; python_version >= '3.14'",
   # Interactive CLI (prompt_toolkit is used directly by cli.py)
   "prompt_toolkit==3.0.53; python_version >= '3.14'",
   # Cron scheduler (built-in feature — scheduled cron/interval jobs use croniter).
@@ -94,7 +92,7 @@ dependencies = [
   # (~108KB, no compiled extensions, no platform constraints), so unlike the
   # matrix extra's `mautrix`/`python-olm` it's safe to ship everywhere — keeps
   # it out of the lazy-install path that exists only for the heavy matrix deps.
-  "Markdown==3.11.2; python_version >= '3.14'",
+  "Markdown==3.11.3; python_version >= '3.14'",
   # Skills Hub (GitHub App JWT auth — optional, only needed for bot identity)
   "PyJWT[crypto]==2.15.1; python_version >= '3.14'",  # PYSEC-2026-175/177/178/179 + GHSA-ffc3-869f-jxw9, GHSA-42vr-xj54-vc7v (fixed in 2.14.0/2.15.0)
   # urllib3 2.8.0 fixes GHSA-8988-9cw3-xx77 (proxy TLS config ignored),
@@ -148,7 +146,7 @@ dependencies = [
   # we declare the working components inline and gate uvloop behind the
   # [uvloop] optional extra — desktop/server profiles pull it via [all].
   "uvicorn>=0.31.0,<1; python_version >= '3.14'",
-  "httptools>=0.6.3,<0.9; python_version >= '3.14'",
+  "httptools>=0.9.0,<0.11; python_version >= '3.14'",
   "watchfiles>=0.20,<2; python_version >= '3.14'",
   # Streaming multipart uploads for the dashboard file manager (NS-501).
   # FastAPI's UploadFile/Form depend on python-multipart; it is NOT pulled in
@@ -220,7 +218,7 @@ dependencies = [
   # 738 CPython reports sys_platform == 'android' and never matched.) Pre-GKI
   # devices can still slip through; they get the same resolution failure as
   # before, worked around by installing with `--no-deps` or an older release.
-  "nemo-relay>=0.11,<0.12; ((sys_platform == 'darwin' and platform_machine == 'arm64') or (sys_platform == 'linux' and platform_machine == 'x86_64' and 'android' not in platform_release) or (sys_platform == 'linux' and platform_machine == 'aarch64' and 'android' not in platform_release) or (sys_platform == 'win32' and platform_machine == 'AMD64') or (sys_platform == 'win32' and platform_machine == 'ARM64')) and python_version >= '3.14'",]
+  "nemo-relay==0.11.1; ((sys_platform == 'darwin' and platform_machine == 'arm64') or (sys_platform == 'linux' and platform_machine == 'x86_64' and 'android' not in platform_release) or (sys_platform == 'linux' and platform_machine == 'aarch64' and 'android' not in platform_release) or (sys_platform == 'win32' and platform_machine == 'AMD64') or (sys_platform == 'win32' and platform_machine == 'ARM64')) and python_version >= '3.14'",]
 
 [project.optional-dependencies]
 # High-performance event loop — uvloop replaces the stdlib asyncio loop with
@@ -423,7 +421,7 @@ pty = []
 mcp = [
   "mcp==2.3.0",
   "httpx2==2.15.1",
-  "starlette==1.9.0",
+  "starlette==1.10.0",
 ] # starlette: CVE-2026-48710
 # Backwards-compatible no-op alias. Relay is a core dependency on supported
 # wheel targets and intentionally unavailable on other platforms.
@@ -438,7 +436,7 @@ teams = [
 computer-use = [
   "mcp==2.3.0",
   "httpx2==2.15.1",
-  "starlette==1.9.0",
+  "starlette==1.10.0",
 ] # starlette: CVE-2026-48710
 acp = ["agent-client-protocol==0.9.0"]
 # mistral: Voxtral STT + TTS. Pinned to an exact verified-clean version.
@@ -516,10 +514,10 @@ youtube = [
 # and uvloop is gated behind the [uvloop] extra.  This keeps [web] safe for
 # termux-all which includes it.
 web = [
-  "fastapi==0.133.1",
+  "fastapi==0.162.0",
   "uvicorn==0.54.0",
-  "starlette==1.9.0",
-  "python-multipart==0.0.32",
+  "starlette==1.10.0",
+  "python-multipart==0.0.33",
 ]
 all = [
   # Policy (2026-05-12): `[all]` includes only extras that genuinely
@@ -562,7 +560,7 @@ dev = [
   "pytest-asyncio==1.4.0",
   "mcp==2.3.0",
   "httpx2==2.15.1",
-  "starlette==1.9.0",
+  "starlette==1.10.0",
   "ty==0.0.89",
   "ruff==0.15.22",
   "setuptools==84.1.0",
@@ -626,12 +624,14 @@ piper = "(platform_machine != 'ARM64' or sys_platform != 'win32') and (platform_
 google-meet = "sys_platform != 'android'"
 
 [tool.uv]
+# Task-owned platform lock: retain already selected transitives.
+constraint-dependencies = ["anyio==4.16.0", "click==8.5.1", "jiter==0.19.0", "pycparser==3.12", "typing-inspection==0.4.5", "wcwidth==0.9.4"]
+environments = ["python_version == '3.14' and sys_platform == 'darwin' and platform_machine == 'arm64' and platform_python_implementation == 'CPython' and implementation_name == 'cpython'"]
 # uv otherwise enables the dev group by default, including in payload builds.
 default-groups = []
 # 3.11 is an install bridge for pre-PM updaters, never a runtime, so the lock
 # covers 3.14 only. Without this the lock must resolve every supported version,
 # where extras that only ever coexist on 3.14 (kittentts vs neutts) conflict.
-environments = ["python_version >= '3.14'"]
 override-dependencies = [
   # discord.py's latest published version, 2.7.1, pins pynacl at <1.6. however, pynacl 1.5.0 has known vulnerabilities.
   # discord.py has updated pynacl to 1.6 on `main`, but has not yet published a patch release.

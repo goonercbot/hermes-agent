@@ -262,7 +262,7 @@ def _install_method_stamp(path: Path) -> Optional[str]:
 
 
 def detect_install_method(project_root: Optional[Path] = None) -> str:
-    """Detect how Hermes was installed: apt/docker/nix/nixos/home-manager/git/unknown.
+    """Detect apt/docker/nix/nixos/home-manager/git/external/unknown installs.
     Order: code-scoped ``<install tree>/.install_method`` stamp (authoritative) -> legacy
     ``$HERMES_HOME/.install_method`` -> managed marker -> /nix/store path -> .git dir -> unknown.
     The stamp lives next to the code because HERMES_HOME is shared data: a container and a host
@@ -307,6 +307,13 @@ def detect_install_method(project_root: Optional[Path] = None) -> str:
             return "git"
     except OSError:
         pass
+
+    # An externally maintained archive is not a git checkout merely because
+    # its provenance mentions git. Only a sealed tree can use this label.
+    from hermes_cli.steward import read_install_stamp
+
+    if not git_path.exists() and read_install_stamp(root).get("updateMechanism") == "external":
+        return "external"
     return "unknown"
 
 
@@ -328,6 +335,7 @@ def is_nix_install_method(method: str) -> bool:
 _UPDATE_COMMAND_BY_METHOD = {
     "docker": "docker pull nousresearch/hermes-agent:latest",
     "apt": "pkg upgrade hermes-agent",  # "apt" == Termux APT by contract; uses Termux's `pkg`.
+    "external": "Update using the tool that installed this Hermes build",
 }
 
 

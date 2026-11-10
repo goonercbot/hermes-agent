@@ -1136,7 +1136,12 @@ def _plugin_api_mounted(app, name: str) -> bool:
     prefix = f"/api/plugins/{name}"
     return any(
         getattr(r, "endpoint", None) is not _plugin_api_hot_mount
-        and (getattr(r, "path", "") == prefix or getattr(r, "path", "").startswith(prefix + "/"))
+        and (
+            getattr(r, "path", "") == prefix
+            or getattr(r, "path", "").startswith(prefix + "/")
+            # FastAPI 0.162 keeps included routers as entries instead of flattening them.
+            or getattr(getattr(r, "include_context", None), "prefix", None) == prefix
+        )
         for r in app.router.routes
     )
 

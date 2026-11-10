@@ -397,7 +397,8 @@ def test_plugin_websockets_run_the_core_host_origin_gate(monkeypatch, host, orig
 
     import hermes_cli.web_server as ws
 
-    assert "/api/plugins/kanban/events" in {getattr(r, "path", "") for r in ws.app.routes}
+    from hermes_cli.web_server_dashboard import _plugin_api_mounted
+    assert _plugin_api_mounted(ws.app, "kanban")
     monkeypatch.setattr(ws.app.state, "bound_host", "127.0.0.1", raising=False)
     monkeypatch.setattr(ws.app.state, "bound_port", 9119, raising=False)
     monkeypatch.setattr(ws.app.state, "auth_required", False, raising=False)
@@ -413,6 +414,23 @@ def test_plugin_websockets_run_the_core_host_origin_gate(monkeypatch, host, orig
             with client.websocket_connect(url, headers=headers):
                 pass
         assert exc.value.code == 4403
+
+
+def test_included_plugin_router_is_counted_without_suppressing_other_plugins():
+    from fastapi import APIRouter, FastAPI
+    from hermes_cli.web_server_dashboard import _plugin_api_mounted
+
+    app, router = FastAPI(), APIRouter()
+
+    @router.get("/events")
+    def events():
+        return {"ok": True}
+
+    app.include_router(router, prefix="/api/plugins/example")
+    assert _plugin_api_mounted(app, "example")
+    assert not _plugin_api_mounted(app, "example-other")
+    app.router.routes.clear()
+    assert not _plugin_api_mounted(app, "example")
 
 
 @pytest.mark.parametrize("path", ["socket", "raw", "raw-decorated"])

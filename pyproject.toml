@@ -514,7 +514,7 @@ youtube = [
 # and uvloop is gated behind the [uvloop] extra.  This keeps [web] safe for
 # termux-all which includes it.
 web = [
-  "fastapi==0.162.0",
+  "fastapi==0.162.2",
   "uvicorn==0.54.0",
   "starlette==1.10.0",
   "python-multipart==0.0.33",

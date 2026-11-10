@@ -3565,19 +3565,17 @@ class _StreamingCall(StreamingWaitMonitor):
         """Classify a failed attempt: True = retry; False = stop with
         ``result["error"]`` set (unless our own interrupt force-closed the
         socket). Runs inside the ``except`` so ``logger.exception`` works."""
-        import httpx as _httpx
+        from agent.stream_transport_errors import http_transport_error_types
         # Our own interrupt force-close: no retry/fallback/"reconnecting" (the
         # poll loop raises InterruptedError).
         if self._request_cancelled["value"]:
             logger.debug("Streaming worker caught %s after request cancellation — exiting without retry.", type(e).__name__)
             return False
         e = self._as_lifetime_error(e)  # a cap kill: transient, and its copy names the setting
-        _is_timeout = isinstance(e, (_httpx.ReadTimeout, _httpx.ConnectTimeout, _httpx.PoolTimeout, StreamLifetimeExceeded))
-        # ReadError: abort/reset mid-body (stale-kill shutdown under a parked reader, ECONNRESET) — retry loop owns it.
-        # anthropic.APIConnectionError: the Anthropic SDK wraps connect/read drops
-        # (incl. stale-kill aborts) in its own type, not httpx's.
-        _is_conn_err = isinstance(e, (_httpx.ConnectError, _httpx.ReadError, _httpx.RemoteProtocolError, ConnectionError,
-                                      *_anthropic_connection_error_types()))
+        _timeouts, _connections = http_transport_error_types()
+        _is_timeout = isinstance(e, (*_timeouts, StreamLifetimeExceeded))
+        # SDK 2.x stream bodies expose raw httpx2 errors; earlier SDKs also wrap drops.
+        _is_conn_err = isinstance(e, (*_connections, ConnectionError, *_anthropic_connection_error_types()))
         _is_stream_parse_err = self.agent._is_provider_stream_parse_error(e)
         _is_empty_stream = isinstance(e, EmptyStreamError)
         _is_sse_conn_err = not _is_timeout and not _is_conn_err and _is_sse_connection_error(e)

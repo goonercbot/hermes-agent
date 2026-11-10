@@ -9,7 +9,7 @@ def test_anthropic_sdk_stream_runs_through_relay_managed_execution(
     monkeypatch,
 ):
     anthropic = pytest.importorskip("anthropic")
-    httpx = pytest.importorskip("httpx")
+    httpx = pytest.importorskip("httpx2")
     pytest.importorskip("nemo_relay")
     from agent import relay_runtime
     from run_agent import AIAgent

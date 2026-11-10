@@ -376,8 +376,8 @@ def _attribution_headers() -> dict[str, str]:
 
 
 def _client_timeout(timeout):
-    """httpx.Timeout with the caller's read timeout (default 900s) and a 10s connect."""
-    from httpx import Timeout
+    """SDK-compatible timeout with the caller's read timeout (default 900s)."""
+    from httpx2 import Timeout
     read = timeout if (isinstance(timeout, (int, float)) and timeout > 0) else 900.0
     return Timeout(timeout=float(read), connect=10.0)
 
@@ -408,13 +408,14 @@ def _build_anthropic_client_with_bearer_hook(
     sdk = _require_sdk("Azure Foundry Anthropic-style endpoints with Entra ID auth", verb="Install with")
     normalize_proxy_env_vars()
     from agent.azure_identity_adapter import build_bearer_http_client
+    from httpx2 import Client
     normalized_base_url, kwargs = _base_client_kwargs(base_url, timeout)
     # A key_cmd on the native host can print a Console API key, which (as in the static path's
     # _auth_style) belongs in x-api-key; OAuth tokens and Azure/third-party routes keep Bearer. The
     # auth header follows each mint, the OAuth identity below the first one: a key_cmd switching
     # between OAuth and a Console key mid-session needs a client rebuild.
     kwargs["http_client"] = build_bearer_http_client(
-        token_provider, timeout=kwargs["timeout"],
+        token_provider, timeout=kwargs["timeout"], client_factory=Client,
         sends_as_api_key=(lambda token: not _is_oauth_token(token)) if is_native_anthropic_host(base_url) else None,
     )
     kwargs["auth_token"] = "entra-id-bearer-via-http-hook"
@@ -444,6 +445,9 @@ def _new_sdk_client(sdk, kwargs: dict[str, Any], headers: dict[str, str], route:
     ``with_options()``, which re-runs the constructor and re-reads the environment."""
     merged = dict(headers)
     if "api_key" in kwargs and "auth_token" not in kwargs:
+        # SDK 2.x sends even api_key as Bearer. Preserve Hermes's Console/proxy
+        # x-api-key contract and the omission across with_options() copies.
+        merged["X-Api-Key"] = kwargs["api_key"]
         merged["Authorization"] = sdk.Omit()
     elif "auth_token" in kwargs and "api_key" not in kwargs:
         merged["X-Api-Key"] = sdk.Omit()

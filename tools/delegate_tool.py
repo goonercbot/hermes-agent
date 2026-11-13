@@ -555,6 +555,7 @@ def delegate_task(
     output_schema: Optional[dict[str, Any]] = None, images: Optional[list[str]] = None, action: Optional[str] = None,
     subagent_id: Optional[str] = None, message: Optional[str] = None, delegation_ids: Optional[list[str]] = None, parent_agent=None,
     credentials_cfg: Optional[dict[str, Any]] = None,
+    usage_execution_role: Optional[str] = None,
 ) -> str:
     """Spawn child agents (single ``goal`` or ``tasks=[...]`` batch) or control running ones. ``action``
     list/steer/stop run synchronously and bypass the pause gate, depth limit and async dispatch. ``role`` is legacy
@@ -562,6 +563,10 @@ def delegate_task(
     dispatch handle when running in the background."""
     if parent_agent is None:
         return tool_error("delegate_task requires a parent agent context.")
+    if usage_execution_role is not None:
+        from hermes_state_usage_context import ROLES
+        if usage_execution_role not in ROLES:
+            return tool_error('Invalid execution role for usage accounting.')
 
     normalized_action = (action or "").strip().lower()
     if normalized_action == "classify_waiting_reply":
@@ -666,6 +671,10 @@ def delegate_task(
     )
     if err:
         return tool_error(err)
+    if usage_execution_role is not None:
+        # Internal dispatch metadata, never a change to the child's prompt/tools.
+        for _, _, child in children:
+            child._execution_role = usage_execution_role
     batch = _Batch(
         task_list, children, parent_agent, creds, context, top_role, max_children,
         live_deleg_id, live_writers, live_paths, *origin, overall_start,

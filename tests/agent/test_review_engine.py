@@ -225,6 +225,7 @@ def test_start_review_dispatches_background_and_completes(monkeypatch):
     ]
     result = start_review(_fake_parent(), msgs, "check the tests")
     assert result["status"] == "dispatched"
+    assert fake_child._execution_role == 'independent_review'
 
     # The reviewer briefing carries the conversation excerpt + user prompt.
     assert "PR #77 opened" in built["context"]

@@ -39,8 +39,10 @@ def cost_fields(status, source):
     return status, source
 
 
-def new_part(values, *, occurred_at=None):
-    return {**values, 'event_id': 'delta:' + uuid.uuid4().hex, 'occurred_at': occurred_at}
+def new_part(values, *, occurred_at=None, attribution=None):
+    from hermes_state_usage_context import current_usage_context, validate_usage_context
+    context = current_usage_context() if attribution is None else validate_usage_context(attribution)
+    return {**context, **values, 'event_id': 'delta:' + uuid.uuid4().hex, 'occurred_at': occurred_at}
 
 
 def append_event(conn, session_id, part, *, task='', kind='delta', timing='point', interval=None, auxiliary=False):
@@ -55,6 +57,8 @@ def append_event(conn, session_id, part, *, task='', kind='delta', timing='point
     fallback = {} if task else session
     status, source = cost_fields(part.get('cost_status'), part.get('cost_source'))
     role = part.get('execution_role')
+    if auxiliary:
+        role = 'independent_review' if task == 'review' else 'auxiliary'
     if role not in ('controller', 'implementation', 'independent_review', 'auxiliary', 'worker_unspecified', 'unknown'):
         role = 'auxiliary' if auxiliary else 'unknown'
     start, end = interval if timing == 'interval' else (None, None)

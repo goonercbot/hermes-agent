@@ -43,6 +43,7 @@ class TurnFacadeMixin:
         from agent import relay_runtime
         from agent.aux_accounting import reset_accounting_context, set_accounting_context
         from agent.auxiliary_client import scoped_runtime_main
+        from hermes_state_usage_context import set_usage_context, reset_usage_context, role_for_agent
         from agent.conversation_loop import run_conversation
         from agent.portal_tags import (
             reset_affinity_scope, reset_conversation_context, set_affinity_scope,
@@ -73,7 +74,7 @@ class TurnFacadeMixin:
         relay_lease = relay_turn = lease = None
         # Scope tokens start None: early returns leave the try before the set_*() calls and
         # the finally resets each one unconditionally.
-        token = affinity_token = acct_token = None
+        token = affinity_token = acct_token = usage_token = None
         task_started = task_finished = False
         relay_outcome = "failed"
 
@@ -138,6 +139,7 @@ class TurnFacadeMixin:
             acct_token = set_accounting_context(
                 getattr(self, "_session_db", None), getattr(self, "session_id", None)
             )
+            usage_token = set_usage_context(effective_task_id, role_for_agent(self))
 
             # Keep the ContextVar scope local (agent tokens may be observed from another thread).
             # A host that owns this thread (Hermes Console) may cancel the turn cross-thread.
@@ -209,6 +211,8 @@ class TurnFacadeMixin:
                         self._relay_pending_turn_id = None
                     if acct_token is not None:
                         reset_accounting_context(acct_token)
+                    if usage_token is not None:
+                        reset_usage_context(usage_token)
                     if token is not None:
                         reset_conversation_context(token)
                     if affinity_token is not None:

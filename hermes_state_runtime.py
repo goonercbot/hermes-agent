@@ -874,6 +874,11 @@ def _worker_usage(db, conn, session_id, payload, *, auxiliary=False):
     from hermes_state_usage import _MODEL_USAGE_FIELDS, _TOKEN_COUNTERS
     from hermes_state_usage_history import append_event, new_part
     payload = dict(payload)
+    from hermes_state_usage_context import validate_usage_context
+    try:
+        attribution = validate_usage_context(payload.pop('_usage_attribution', {}))
+    except (ValueError, TypeError):
+        raise RuntimeStoreError('invalid_params') from None
     occurred_at = payload.pop('_usage_occurred_at', None)
     if occurred_at is not None:
         import math
@@ -907,10 +912,10 @@ def _worker_usage(db, conn, session_id, payload, *, auxiliary=False):
         if not payload.get('task'):
             raise RuntimeStoreError('invalid_params')
         db._record_model_usage(conn, session_id, **({'api_call_count': 1} | payload))
-        part = new_part({'api_call_count': 1} | payload, occurred_at=occurred_at)
+        part = new_part({'api_call_count': 1} | payload, occurred_at=occurred_at, attribution=attribution)
         append_event(conn, session_id, part, task=payload['task'], auxiliary=True)
     else:
-        part = new_part(payload, occurred_at=occurred_at)
+        part = new_part(payload, occurred_at=occurred_at, attribution=attribution)
         db._update_token_counts_in_transaction(conn, session_id, **payload, _usage_event_parts=[part])
         # The managed worker's platform is the policy label (gui), not the in-process
         # agent surface (desktop). Stamp the same created_surface the insert uses.

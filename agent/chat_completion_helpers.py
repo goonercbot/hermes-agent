@@ -3393,13 +3393,13 @@ class _StreamingCall(StreamingWaitMonitor):
         runaway = None
 
         from agent import relay_llm
-        from agent.anthropic_adapter import normalize_stream_usage, sanitize_anthropic_kwargs
+        from agent.anthropic_adapter import anthropic_sdk_kwargs, normalize_stream_usage, sanitize_anthropic_kwargs
         accumulator = relay_llm.AnthropicStreamAccumulator()
 
         def _open_anthropic_stream(next_api_kwargs: dict[str, Any]):
             final_kwargs = dict(next_api_kwargs)
             sanitize_anthropic_kwargs(final_kwargs, log_prefix=getattr(self.agent, "log_prefix", ""))
-            manager = request_client.messages.stream(**final_kwargs)
+            manager = request_client.messages.stream(**anthropic_sdk_kwargs(final_kwargs, request_client.messages.stream))
             _stream_context["manager"] = manager
             return normalize_stream_usage(manager.__enter__())
 

@@ -91,6 +91,9 @@ def test_managed_sdk_body_drop_recovers_without_duplicate_text(managed_stream, e
     requests = []
 
     def respond(request):
+        body = json.loads(request.content)
+        assert body["temperature"] == 1
+        assert body["thinking"] == {"type": "enabled", "budget_tokens": 1024}
         requests.append(request)
         options = {"stream": DroppedBody()} if len(requests) == 1 else {"content": _complete()}
         return httpx2.Response(200, headers={"content-type": "text/event-stream"}, request=request, **options)
@@ -104,7 +107,8 @@ def test_managed_sdk_body_drop_recovers_without_duplicate_text(managed_stream, e
         return client
 
     agent._create_request_anthropic_client = make_client
-    kwargs = {"model": "claude-test", "max_tokens": 16, "messages": [{"role": "user", "content": "hi"}]}
+    kwargs = {"model": "claude-test", "max_tokens": 2048, "messages": [{"role": "user", "content": "hi"}],
+              "temperature": 1, "thinking": {"type": "enabled", "budget_tokens": 1024}}
     if phase == "delivered_text":
         result = agent._interruptible_streaming_api_call(kwargs)
         assert len(requests) == 1

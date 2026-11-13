@@ -618,6 +618,30 @@ def _apply_claude_code_identity(system, anthropic_tools, anthropic_messages, to_
     return system
 
 
+def anthropic_sdk_kwargs(api_kwargs: dict[str, Any], method: Any) -> dict[str, Any]:
+    """Preserve compat-wire sampling after SDK 2.x removed native sampling kwargs.
+
+    Older SDKs still receive their native keywords. Only these known wire fields
+    move; unrelated unknown arguments must continue to fail rather than being hidden.
+    Work on copies, including extra_body, so retries retain the original payload.
+    """
+    import inspect
+
+    kwargs = {key: value for key, value in api_kwargs.items() if key != "stream"}
+    try:
+        parameters = inspect.signature(method).parameters
+    except (TypeError, ValueError):
+        return kwargs
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values()):
+        return kwargs
+    moved = {key: kwargs.pop(key) for key in ("temperature", "top_p", "top_k")
+             if key in kwargs and key not in parameters}
+    if moved:
+        # SDK extra_body has precedence over its named arguments; retain that contract.
+        kwargs["extra_body"] = {**moved, **(kwargs.get("extra_body") or {})}
+    return kwargs
+
+
 def _thinking_kwargs(reasoning_config: dict[str, Any], model: str, effective_max_tokens: int) -> dict[str, Any]:
     """Map ``reasoning_config`` to Anthropic thinking kwargs. Adaptive models (Claude 4.6+,
     Kimi/Moonshot) get ``thinking.type=adaptive`` + ``output_config.effort``; older models and
@@ -817,7 +841,7 @@ def _is_stream_unavailable_error(exc: Exception) -> bool:
 
 def _stream_final_message(stream_fn, api_kwargs, log_prefix, on_stream_event, on_response):
     """``messages.stream()`` -> final Message, ticking the best-effort callbacks."""
-    with stream_fn(**{k: v for k, v in api_kwargs.items() if k != "stream"}) as stream:
+    with stream_fn(**anthropic_sdk_kwargs(api_kwargs, stream_fn)) as stream:
         stream = normalize_stream_usage(stream)  # MiniMax usage:null (#60683), same as the main turn
         if callable(on_response):
             try:
@@ -886,4 +910,4 @@ def create_anthropic_message(
             logger.debug(
                 "%sAnthropic Messages stream unavailable; falling back to messages.create(): %s", log_prefix, exc
             )
-    return messages_api.create(**{k: v for k, v in api_kwargs.items() if k != "stream"})
+    return messages_api.create(**anthropic_sdk_kwargs(api_kwargs, messages_api.create))

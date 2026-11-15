@@ -394,7 +394,7 @@ async def test_canonical_sse_projects_reasoning_and_model_switch_receipts(api, o
             _clarify_callback_sync=None, _notice_callback_sync=None,
             _attach_session_title_callback=lambda agent, ctx: None)
         assert api_execution.get() is not None
-        admission_id = api_execution.get()['admission_id']
+        admission_id = owner.sessions[sid].event_stream.execution['admission_id']
         owner.api_observers.setdefault(admission_id, []).append(
             {'status_callback': lambda kind, message: observed.append((kind, message))})
         TurnRunner._wire_turn_agent_callbacks(holder, agent, {}, None, None, None, False)

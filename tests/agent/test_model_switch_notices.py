@@ -13,7 +13,7 @@ class RecordingAgent(StatusOutputMixin):
         self.model = "backup"
         self.provider = "backup-provider"
         self.events = []
-        self.status_callback = lambda kind, text: self.events.append((kind, str(text)))
+        self.status_callback = lambda kind, text: self.events.append((kind, str(text))) or True
         self._vprint = lambda *a, **kw: None
         self.log_prefix = ""
 

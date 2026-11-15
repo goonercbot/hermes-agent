@@ -985,12 +985,12 @@ class GatewayTurnProgressMixin:
         except Exception:
             logger.debug("Failed to attach session title callback", exc_info=True)
 
-    def _status_callback_sync(self, event_type: str, message: str) -> None:
+    def _status_callback_sync(self, event_type: str, message: str):
         from gateway.run import _prepare_gateway_status_message, _redact_gateway_user_facing_secrets, _send_or_update_status_coro
         from gateway.warning_notifications import is_warning_status, render_notification
         ctx = self._ctx
-        if ctx.mute_notification_reply or not self._status_live():
-            return
+        if not self._status_live() or (ctx.mute_notification_reply and event_type != "model_switch"):
+            return False
         # Lifecycle diagnostics (including provider fallback notices) are UI affordances for a
         # human caller. Sending them to a known bot peer can create a new inbound turn and a loop.
         from gateway.bot_peer_notices import automatic_notices_allowed
@@ -1002,12 +1002,14 @@ class GatewayTurnProgressMixin:
             text = _redact_gateway_user_facing_secrets(str(message))
             if local_viewer_turn(self):
                 getattr(self, "_publish_execution")("status.update", {"kind": "model_switch", "text": text})
+                return True
             else:
-                self._schedule(
-                    ctx._status_adapter.send(ctx._status_chat_id, text, metadata=ctx._status_thread_metadata),
+                from gateway.model_switch_notices import deliver_model_switch
+                return self._schedule(
+                    deliver_model_switch(ctx._status_adapter, ctx.source, text, ctx._status_thread_metadata,
+                                         self._status_live, chat_id=ctx._status_chat_id),
                     "model switch notice delivery failed",
                 )
-            return
         prepared = _prepare_gateway_status_message(ctx.source.platform, event_type, message)
         if prepared is None:
             logger.debug(

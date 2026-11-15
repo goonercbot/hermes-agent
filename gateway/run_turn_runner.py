@@ -483,6 +483,7 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         from gateway.run_turn_progress import local_viewer_turn
         agent.status_callback, agent.notice_callback = ctx._status_callback_sync, (
             self._local_notice_callback_sync if local_viewer_turn(self) else self._notice_callback_sync)
+        agent._model_switch_callback = lambda text: self._status_callback_sync("model_switch", text)
         agent.reasoning_callback = None  # per turn: a reused agent never keeps an earlier API turn's sink
         if self._approval_owner is not None:
             from gateway.session_api_turn import api_execution, wire_api_observers
@@ -1350,8 +1351,9 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             # Reuse the in-agent one-shot notice so the pre-agent provider switch is user-visible too.
             agent._pending_fallback_notice = pending_fallback_notice
         self._wire_turn_agent_callbacks(agent, turn_route, reasoning_config, stream_delta_cb, interim_cb, want_interim)
-        from agent.model_switch import bind_model_switch_state, emit_model_switch
+        from agent.model_switch import bind_model_switch_state, emit_model_switch, flush_model_switch_notices
         bind_model_switch_state(agent, runner.session_store._entries.get(ctx.session_key or ""))
+        flush_model_switch_notices(agent)
         emit_pending_switch = getattr(agent, "_emit_pending_fallback_notice", None)
         if pending_fallback_notice and callable(emit_pending_switch):
             emit_pending_switch()

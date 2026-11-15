@@ -316,18 +316,14 @@ class GatewayTurnHygieneMixin:
         from gateway.run import _stamp_hygiene_compression_provenance
         _stamp_hygiene_compression_provenance(agent, desc, getattr(ActivityProvenance, provenance_name), debug_label)
 
-    async def _hmwa_hygiene_notify(self, source, meta, message, what, *, model_switch=False):
+    async def _hmwa_hygiene_notify(self, source, meta, message, what):
         """Best-effort user notice on the hygiene thread; failure is logged, never raised."""
         from gateway.bot_peer_notices import automatic_notices_allowed
         try:
             _adapter = self._delivery_adapter_for(source) if automatic_notices_allowed(source) else None
             if _adapter and source.chat_id:
-                if model_switch:
-                    from gateway.run import _redact_gateway_user_facing_secrets
-                    await _adapter.send(source.chat_id, _redact_gateway_user_facing_secrets(str(message)), metadata=meta)
-                else:
-                    await _adapter.emit_warning(source.chat_id, message, metadata=meta,
-                                                logical_platform=source.platform)
+                await _adapter.emit_warning(source.chat_id, message, metadata=meta,
+                                            logical_platform=source.platform)
         except Exception as _werr:
             logger.warning("Failed to deliver %s to user: %s", what, _werr)
 
@@ -723,17 +719,8 @@ class GatewayTurnHygieneMixin:
             _hyg_agent._print_fn = lambda *a, **kw: None
 
             loop = asyncio.get_running_loop()
-            from agent.model_switch import bind_model_switch_state
-            bind_model_switch_state(_hyg_agent, session_entry)
-
-            def model_status(kind, message):
-                if kind == "model_switch":
-                    asyncio.run_coroutine_threadsafe(
-                        self._hmwa_hygiene_notify(source, attempt.meta, message, "compression model switch", model_switch=True),
-                        loop,
-                    )
-
-            setattr(_hyg_agent, "status_callback", model_status)
+            from gateway.model_switch_notices import bind_compression_notice_sink
+            bind_compression_notice_sink(self, _hyg_agent, source, session_entry, attempt.meta)
             _hyg_commit_fence = CompressionCommitFence(total_ceiling_seconds=hs.total_ceiling_seconds)
             # Default executor (NOT self._get_executor): a hung summary must never occupy an
             # agent-work slot. MUST run in the caller's contextvars (multiplex secret scope).

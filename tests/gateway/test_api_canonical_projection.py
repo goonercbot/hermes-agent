@@ -359,7 +359,7 @@ def test_run_status_reports_waiting_for_approval_while_a_prompt_is_pending(api, 
      '"reasoning_content": "THINKING"'),
     ('/v1/responses', {'input': 'hi', 'stream': True}, 'response.reasoning_summary_text.delta'),
 ])
-async def test_canonical_sse_projects_the_turn_reasoning(api, owner, path, body, marker):
+async def test_canonical_sse_projects_reasoning_and_model_switch_receipts(api, owner, path, body, marker):
     """Chat and Responses SSE under the authority get the agent's reasoning, like the direct
     path: the real per-turn wiring hands the admission's observers the reasoning callback."""
     from gateway.run_turn_runner import TurnRunner
@@ -370,24 +370,47 @@ async def test_canonical_sse_projects_the_turn_reasoning(api, owner, path, body,
         sid = event.source.chat_id
         turn = _turn_runner(owner, SimpleNamespace(session_id=sid))
         agent = SimpleNamespace(reasoning_callback=None)  # AIAgent's own default
+        canonical, observed, allowed = [], [], [True]
+        def canonical_status(kind, message):
+            if not allowed[0]:
+                return False  # same refusal contract as mute/bot/stale ownership
+            canonical.append((kind, message))
+            return True
         holder = SimpleNamespace(
             _ctx=SimpleNamespace(
                 progress_callback=None, native_tool_start_callback=None, voice_ack_callback=None,
                 _voice_ack_guild=[None], voice_turn=False, _native_slack_task_cards=False,
                 native_tool_complete_callback=None, _step_callback_sync=None,
-                _hooks_ref=SimpleNamespace(loaded_hooks=[]), _status_callback_sync=None, _event_callback_sync=None,
+                _hooks_ref=SimpleNamespace(loaded_hooks=[]), _status_callback_sync=canonical_status, _event_callback_sync=None,
                 _status_adapter=None, session_key='', user_config={}, source=event.source,
                 mute_notification_reply=False, _thinking_enabled=False, agent_holder=[None], tools_holder=[None],
                 process_task_id=None, process_baseline=None, run_generation=0),
             _approval_owner=turn._approval_owner, combined_tool_start_callback=None,
             combined_tool_complete_callback=None,
+            _status_callback_sync=canonical_status,
             _runner=SimpleNamespace(_service_tier=None, _consume_pending_turn_sidecar_notes=lambda key: []),
             _make_bg_review_callbacks=lambda: (lambda message: None, lambda: None),
             _merge_turn_request_overrides=TurnRunner._merge_turn_request_overrides,
             _clarify_callback_sync=None, _notice_callback_sync=None,
             _attach_session_title_callback=lambda agent, ctx: None)
         assert api_execution.get() is not None
+        admission_id = api_execution.get()['admission_id']
+        owner.api_observers.setdefault(admission_id, []).append(
+            {'status_callback': lambda kind, message: observed.append((kind, message))})
         TurnRunner._wire_turn_agent_callbacks(holder, agent, {}, None, None, None, False)
+        from agent.model_switch import emit_model_switch
+        emit_model_switch(agent, 'main', 'p', 'backup')
+        emit_model_switch(agent, 'main', 'p', 'backup')
+        assert len(canonical) == len(observed) == 1
+        assert canonical == observed and observed[0][0] == 'model_switch'
+        assert not agent._model_switch_state.pending
+        # The observer must not consume a notice refused by the canonical ownership/bot gate.
+        allowed[0] = False
+        emit_model_switch(agent, 'main', 'p', 'preferred')
+        assert len(observed) == 1 and len(agent._model_switch_state.pending) == 1
+        allowed[0] = True
+        emit_model_switch(agent, 'main', 'p', 'preferred')
+        assert len(canonical) == len(observed) == 2 and not agent._model_switch_state.pending
         if agent.reasoning_callback:  # AIAgent._fire_reasoning_delta calls it only when wired
             agent.reasoning_callback('THINKING')
         execution_result.get()['result'] = {'final_response': 'ANSWER', 'messages': []}

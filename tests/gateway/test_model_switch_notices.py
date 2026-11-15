@@ -9,6 +9,7 @@ from gateway.model_switch_notices import bind_compression_notice_sink
 from gateway.platforms.base import SendResult
 from gateway.run_turn_progress import GatewayTurnProgressMixin
 from gateway.session import Platform, SessionSource
+from tests.waiting import async_wait_until
 
 
 def foreground(adapter, source, muted=False):
@@ -95,7 +96,7 @@ async def test_notice_through_real_relay_does_not_seal_open_stream(lane):
         gateway = NS(session_store=NS(_entries={"key": entry}), _delivery_adapter_for=lambda s: adapter)
         bind_compression_notice_sink(gateway, agent, source, entry, metadata)
         emit_model_switch(agent, "compression", "p", "backup")
-        await asyncio.sleep(0.02)
+        await async_wait_until(lambda: not any(p.in_flight for p in agent._model_switch_state.pending), what="model-switch delivery settled")
         assert not agent._model_switch_state.pending
     assert adapter._open_draft_by_chat.get(key) == 5
     assert not any(op.get("op") == "draft_seal" for op in ops)
@@ -112,15 +113,15 @@ async def test_compression_sink_rechecks_entry_and_failed_receipt_then_retries()
     gateway = NS(session_store=NS(_entries=entries), _delivery_adapter_for=lambda s: adapter)
     bind_compression_notice_sink(gateway, agent, source, entry, {"thread_id": "topic"})
     emit_model_switch(agent, "compression", "p", "backup")
-    await asyncio.sleep(0.02)
+    await async_wait_until(lambda: not any(p.in_flight for p in agent._model_switch_state.pending), what="model-switch delivery settled")
     assert len(agent._model_switch_state.pending) == 1
     entries["key"] = NS()
     flush_model_switch_notices(agent)
-    await asyncio.sleep(0.02)
+    await async_wait_until(lambda: not any(p.in_flight for p in agent._model_switch_state.pending), what="model-switch delivery settled")
     assert adapter.send.await_count == 1
     entries["key"] = entry
     flush_model_switch_notices(agent)
-    await asyncio.sleep(0.02)
+    await async_wait_until(lambda: not any(p.in_flight for p in agent._model_switch_state.pending), what="model-switch delivery settled")
     assert not agent._model_switch_state.pending and adapter.send.await_count == 2
 
 
@@ -154,7 +155,7 @@ async def test_manual_compression_real_caller_announces_fallback_and_recovery(mo
     with session_auxiliary_scope({"compression": {"provider": "p", "model": "preferred"}}):
         await GatewaySessionCommandsMixin._run_manual_compression(gateway, source, entry,
             [{"role": "user", "content": "retain"}], NS(), notice_metadata={"thread_id": "topic"})
-    await asyncio.sleep(0.02)
+    await async_wait_until(lambda: not any(p.in_flight for p in agent._model_switch_state.pending), what="model-switch delivery settled")
     notices = [call.args[1] for call in adapter.send.await_args_list]
     assert len(notices) == 2
     assert "preferred via p → backup via p" in notices[0]

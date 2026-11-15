@@ -483,7 +483,8 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         from gateway.run_turn_progress import local_viewer_turn
         agent.status_callback, agent.notice_callback = ctx._status_callback_sync, (
             self._local_notice_callback_sync if local_viewer_turn(self) else self._notice_callback_sync)
-        agent._model_switch_callback = lambda text: self._status_callback_sync("model_switch", text)
+        # Resolve the current composed callback, including request-owned API observers.
+        agent._model_switch_callback = lambda text: agent.status_callback("model_switch", text)
         agent.reasoning_callback = None  # per turn: a reused agent never keeps an earlier API turn's sink
         if self._approval_owner is not None:
             from gateway.session_api_turn import api_execution, wire_api_observers

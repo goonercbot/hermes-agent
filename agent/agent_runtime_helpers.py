@@ -1442,9 +1442,12 @@ def restore_primary_runtime(agent) -> bool:
         if provider_fallback_active:
             # Notification surfaces are best-effort and must never undo a successful restore.
             with contextlib.suppress(Exception):
-                agent._emit_diagnostic_status(
-                    f"✅ Primary model restored: {agent.model} via {agent.provider}; "
-                    f"fallback {previous_model} via {previous_provider} is no longer active."
+                from agent.model_switch import emit_model_switch
+                emit_model_switch(
+                    agent, "main", agent.provider, agent.model,
+                    previous=(previous_provider, previous_model),
+                    text=f"🔔 Main agent model switched: {previous_model} via {previous_provider} → "
+                         f"{agent.model} via {agent.provider} (preferred route selected; response not yet verified).",
                 )
         return True
     except Exception as e:

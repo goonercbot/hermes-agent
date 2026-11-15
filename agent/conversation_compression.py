@@ -2950,7 +2950,9 @@ def _run_summary_dispatch(
     # Publish progress to the commit fence so hosts extend deadlines while tokens
     # flow. Any active hook (even no-op) selects the streamed path: the timeout is
     # inactivity-based and a byte-trickling provider hits the stream total ceiling.
-    from agent.auxiliary_client import aux_interrupt_protection, aux_progress_hook
+    from agent.auxiliary_client import aux_interrupt_protection, aux_progress_hook, aux_route_hook
+    from agent.auxiliary_task_config import _get_auxiliary_task_config
+    from agent.model_switch import emit_model_switch
     from agent.conversation_compression_deadline import compression_deadline_scope
     _progress_hook = commit_fence.touch_progress if commit_fence is not None else (lambda: None)
     # Return leg: cancel frees the owner but the provider daemon streams on to its own larger
@@ -2971,6 +2973,15 @@ def _run_summary_dispatch(
             or (commit_fence is not None and commit_fence.is_cancelled)
         )
 
+    configured = _get_auxiliary_task_config("compression")
+    configured_provider = str(configured.get("provider") or "auto")
+    configured_model = str(configured.get("model") or "")
+    baseline = (configured_provider, configured_model) if configured_provider != "auto" and configured_model else None
+
+    def announce_route(provider, model):
+        if not _compression_cancel_requested() and _caller_attempt_is_current(agent.context_compressor):
+            emit_model_switch(agent, "compression", provider, model, previous=baseline)
+
     _attempt_ctx_token = _COMPRESSOR_ATTEMPT_GENERATION.set(attempt_generation)
     try:
         # F6: never start expensive summary work for an already-cancelled
@@ -2985,6 +2996,7 @@ def _run_summary_dispatch(
             with (
                 aux_progress_hook(_progress_hook), compression_deadline_scope(commit_fence),
                 aux_interrupt_protection(cancel_check=_compression_cancel_requested),
+                aux_route_hook(announce_route),
             ):
                 # This attempt is now doing real summary work: publish it as the working attempt so later
                 # no-op entry claims (lock sit-outs, gates, the cancelled-fence skip above) cannot supersede

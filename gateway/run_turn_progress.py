@@ -997,6 +997,17 @@ class GatewayTurnProgressMixin:
         if not automatic_notices_allowed(ctx.source):
             logger.debug("status_callback suppressed for bot-authored message: %s", event_type)
             return
+        if event_type == "model_switch":
+            # A route change is an operator-visible event, not temporary progress or retry noise.
+            text = _redact_gateway_user_facing_secrets(str(message))
+            if local_viewer_turn(self):
+                getattr(self, "_publish_execution")("status.update", {"kind": "model_switch", "text": text})
+            else:
+                self._schedule(
+                    ctx._status_adapter.send(ctx._status_chat_id, text, metadata=ctx._status_thread_metadata),
+                    "model switch notice delivery failed",
+                )
+            return
         prepared = _prepare_gateway_status_message(ctx.source.platform, event_type, message)
         if prepared is None:
             logger.debug(

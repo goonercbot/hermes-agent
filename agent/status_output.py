@@ -241,9 +241,7 @@ class StatusOutputMixin:
             buf.clear()
 
     def _emit_pending_fallback_notice(self) -> None:
-        """Surface the one-shot fallback-switch notice on successful recovery: a provider switch is durable
-        state operators must see, unlike the retry chatter ``_clear_status_buffer`` drops. Emitted once, then
-        cleared; on terminal failure the buffered switch line is flushed instead (``_flush_status_buffer``)."""
+        """Surface a pre-agent fallback as soon as the host has wired its callbacks."""
         notice = getattr(self, "_pending_fallback_notice", None)
         if not notice:
             return
@@ -251,7 +249,9 @@ class StatusOutputMixin:
         self._pending_fallback_notice = None
         for item in notice if isinstance(notice, list) else [notice]:
             try:
-                self._emit_diagnostic_status(item)
+                from agent.model_switch import emit_model_switch
+                emit_model_switch(self, "main", getattr(self, "provider", ""), getattr(self, "model", ""),
+                                  text=item, force=isinstance(notice, list))
             except Exception:
                 # One surface failure must not hide later switches from the same chain.
                 continue

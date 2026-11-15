@@ -719,6 +719,8 @@ class GatewayTurnHygieneMixin:
             _hyg_agent._print_fn = lambda *a, **kw: None
 
             loop = asyncio.get_running_loop()
+            from gateway.model_switch_notices import bind_compression_notice_sink
+            bind_compression_notice_sink(self, _hyg_agent, source, session_entry, attempt.meta)
             _hyg_commit_fence = CompressionCommitFence(total_ceiling_seconds=hs.total_ceiling_seconds)
             # Default executor (NOT self._get_executor): a hung summary must never occupy an
             # agent-work slot. MUST run in the caller's contextvars (multiplex secret scope).

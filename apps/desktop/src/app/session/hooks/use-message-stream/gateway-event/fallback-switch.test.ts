@@ -47,6 +47,17 @@ afterEach(() => {
 })
 
 describe('desktop fallback switch', () => {
+  it.each([
+    '🔔 Compression model selected: preferred via p → backup via q.',
+    '🔔 Main agent model switched: backup via q → preferred via p.',
+    '🔔 Compression model selected: same-model via p → same-model via q.'
+  ])('renders a durable model_switch event: %s', notice => {
+    const { ctx, updateSessionState } = statusContext(notice, 'model_switch')
+    expect(handleStatusEvent(ctx)).toBe(true)
+    expect(systemText(updateSessionState)).toBe(notice)
+    expect(ctx.deps.flushQueuedDeltas).toHaveBeenCalledWith('sess-1')
+  })
+
   it('shows a model fallback switch in the transcript', () => {
     const notice =
       '⚠️ Model fallback: wan2.7-image-pro via alibaba-token-plan unavailable (bad request); using qwen3.8-max via alibaba-token-plan.'

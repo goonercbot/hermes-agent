@@ -132,14 +132,15 @@ class TestRestorePrimaryRuntime:
         agent.model = "primary-model"
         agent._primary_runtime["model"] = "primary-model"
         mock_client = _mock_resolve()
+        emitted = []
+        agent.status_callback = lambda kind, message: emitted.append(message) or True
         with patch(
             "agent.auxiliary_client.resolve_provider_client",
             return_value=(mock_client, None),
         ):
             assert agent._try_activate_fallback() is True
-
-        emitted = []
-        agent._emit_status = emitted.append
+        assert len(emitted) == 1  # the fallback notice was actually acknowledged
+        emitted.clear()
         with (
             patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()),
             patch.object(

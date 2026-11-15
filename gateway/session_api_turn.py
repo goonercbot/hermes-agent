@@ -491,9 +491,18 @@ def wire_api_observers(agent, owner, want_interim):
     status, interim = agent.status_callback, agent.interim_assistant_callback
 
     def status_callback(kind, message=None):
+        if kind == 'model_switch' and status is not None:
+            # The canonical sink owns mute/bot/generation checks and its delivery receipt.
+            receipt = status(kind, message)
+            if receipt is False or receipt is None:
+                return receipt
+            publish('status_callback', kind, message)
+            return receipt
+        if kind == 'model_switch':
+            return publish('status_callback', kind, message)
         publish('status_callback', kind, message)
         if status is not None:
-            status(kind, message)
+            return status(kind, message)
 
     def interim_assistant_callback(text, *, already_streamed=False):
         publish('interim_assistant_callback', text, already_streamed=already_streamed)

@@ -376,8 +376,8 @@ def _attribution_headers() -> dict[str, str]:
 
 
 def _client_timeout(timeout):
-    """httpx.Timeout with the caller's read timeout (default 900s) and a 10s connect."""
-    from httpx import Timeout
+    """SDK-compatible timeout with the caller's read timeout (default 900s)."""
+    from httpx2 import Timeout
     read = timeout if (isinstance(timeout, (int, float)) and timeout > 0) else 900.0
     return Timeout(timeout=float(read), connect=10.0)
 
@@ -408,13 +408,14 @@ def _build_anthropic_client_with_bearer_hook(
     sdk = _require_sdk("Azure Foundry Anthropic-style endpoints with Entra ID auth", verb="Install with")
     normalize_proxy_env_vars()
     from agent.azure_identity_adapter import build_bearer_http_client
+    from httpx2 import Client
     normalized_base_url, kwargs = _base_client_kwargs(base_url, timeout)
     # A key_cmd on the native host can print a Console API key, which (as in the static path's
     # _auth_style) belongs in x-api-key; OAuth tokens and Azure/third-party routes keep Bearer. The
     # auth header follows each mint, the OAuth identity below the first one: a key_cmd switching
     # between OAuth and a Console key mid-session needs a client rebuild.
     kwargs["http_client"] = build_bearer_http_client(
-        token_provider, timeout=kwargs["timeout"],
+        token_provider, timeout=kwargs["timeout"], client_factory=Client,
         sends_as_api_key=(lambda token: not _is_oauth_token(token)) if is_native_anthropic_host(base_url) else None,
     )
     kwargs["auth_token"] = "entra-id-bearer-via-http-hook"
@@ -444,6 +445,9 @@ def _new_sdk_client(sdk, kwargs: dict[str, Any], headers: dict[str, str], route:
     ``with_options()``, which re-runs the constructor and re-reads the environment."""
     merged = dict(headers)
     if "api_key" in kwargs and "auth_token" not in kwargs:
+        # SDK 2.x sends even api_key as Bearer. Preserve Hermes's Console/proxy
+        # x-api-key contract and the omission across with_options() copies.
+        merged["X-Api-Key"] = kwargs["api_key"]
         merged["Authorization"] = sdk.Omit()
     elif "auth_token" in kwargs and "api_key" not in kwargs:
         merged["X-Api-Key"] = sdk.Omit()
@@ -612,6 +616,30 @@ def _apply_claude_code_identity(system, anthropic_tools, anthropic_messages, to_
             if isinstance(block, dict) and block.get("type") == "tool_use" and "name" in block:
                 block["name"] = to_wire(block["name"])  # tool_result pairs by id, not name
     return system
+
+
+def anthropic_sdk_kwargs(api_kwargs: dict[str, Any], method: Any) -> dict[str, Any]:
+    """Preserve compat-wire sampling after SDK 2.x removed native sampling kwargs.
+
+    Older SDKs still receive their native keywords. Only these known wire fields
+    move; unrelated unknown arguments must continue to fail rather than being hidden.
+    Work on copies, including extra_body, so retries retain the original payload.
+    """
+    import inspect
+
+    kwargs = {key: value for key, value in api_kwargs.items() if key != "stream"}
+    try:
+        parameters = inspect.signature(method).parameters
+    except (TypeError, ValueError):
+        return kwargs
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values()):
+        return kwargs
+    moved = {key: kwargs.pop(key) for key in ("temperature", "top_p", "top_k")
+             if key in kwargs and key not in parameters}
+    if moved:
+        # SDK extra_body has precedence over its named arguments; retain that contract.
+        kwargs["extra_body"] = {**moved, **(kwargs.get("extra_body") or {})}
+    return kwargs
 
 
 def _thinking_kwargs(reasoning_config: dict[str, Any], model: str, effective_max_tokens: int) -> dict[str, Any]:
@@ -813,7 +841,7 @@ def _is_stream_unavailable_error(exc: Exception) -> bool:
 
 def _stream_final_message(stream_fn, api_kwargs, log_prefix, on_stream_event, on_response):
     """``messages.stream()`` -> final Message, ticking the best-effort callbacks."""
-    with stream_fn(**{k: v for k, v in api_kwargs.items() if k != "stream"}) as stream:
+    with stream_fn(**anthropic_sdk_kwargs(api_kwargs, stream_fn)) as stream:
         stream = normalize_stream_usage(stream)  # MiniMax usage:null (#60683), same as the main turn
         if callable(on_response):
             try:
@@ -882,4 +910,4 @@ def create_anthropic_message(
             logger.debug(
                 "%sAnthropic Messages stream unavailable; falling back to messages.create(): %s", log_prefix, exc
             )
-    return messages_api.create(**{k: v for k, v in api_kwargs.items() if k != "stream"})
+    return messages_api.create(**anthropic_sdk_kwargs(api_kwargs, messages_api.create))

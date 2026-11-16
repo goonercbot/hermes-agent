@@ -47,7 +47,10 @@ class PluginContext(PluginCapabilityCtxMixin):
 
     def _abandon_load(self) -> None:
         """Mark this load as timed out; every later ``register_*``/``subscribe``/``on_unload`` is ignored."""
-        self._load_abandoned = True
+        # Coordinate with the compatibility callback registrar: a timed-out
+        # worker cannot publish a handler after the host's rollback sweep.
+        with self._manager._telegram_callback_lock:
+            self._load_abandoned = True
 
     @property
     def plugin_id(self) -> str:
@@ -656,6 +659,11 @@ class PluginContext(PluginCapabilityCtxMixin):
         handler per group and core registers a catch-all ``CallbackQueryHandler`` — always scope with
         ``pattern=`` or you swallow the core button flows."""
         self.register_platform_handler("telegram", factory)
+
+    def register_telegram_callback_handler(self, prefix: str, callback: Any) -> PluginRegistration:
+        """Register an authorization-gated, literal-prefix Telegram callback."""
+        from hermes_cli.plugins_telegram_callbacks import register_callback
+        return register_callback(self, prefix, callback)
 
     @_serialized_replacement
     def register_auxiliary_task(

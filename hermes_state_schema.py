@@ -992,6 +992,8 @@ class SessionSchemaMixin:
         self._conn.commit()
         # After the commit: the repair takes its own write transaction, and only once per store.
         advance_legacy_refusal_repair(self, self._conn)
+        from hermes_state_usage_history import initialize
+        initialize(self._conn)
 
     def _stamp_settled_fts_layout(self, cursor: sqlite3.Cursor) -> None:
         """Write ``fts_storage_version`` once the stored layout is exactly current and nothing is in flight.

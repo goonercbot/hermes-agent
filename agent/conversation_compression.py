@@ -2926,7 +2926,9 @@ def _run_summary_dispatch(
     # Publish progress to the commit fence so hosts extend deadlines while tokens
     # flow. Any active hook (even no-op) selects the streamed path: the timeout is
     # inactivity-based and a byte-trickling provider hits the stream total ceiling.
-    from agent.auxiliary_client import aux_interrupt_protection, aux_progress_hook
+    from agent.auxiliary_client import aux_interrupt_protection, aux_progress_hook, aux_route_hook
+    from agent.auxiliary_task_config import _get_auxiliary_task_config
+    from agent.model_switch import emit_model_switch
     from agent.conversation_compression_deadline import compression_deadline_scope
     _progress_hook = commit_fence.touch_progress if commit_fence is not None else (lambda: None)
     # Return leg: cancel frees the owner but the provider daemon streams on to its own larger
@@ -2947,6 +2949,15 @@ def _run_summary_dispatch(
             or (commit_fence is not None and commit_fence.is_cancelled)
         )
 
+    configured = _get_auxiliary_task_config("compression")
+    configured_provider = str(configured.get("provider") or "auto")
+    configured_model = str(configured.get("model") or "")
+    baseline = (configured_provider, configured_model) if configured_provider != "auto" and configured_model else None
+
+    def announce_route(provider, model):
+        if not _compression_cancel_requested() and _caller_attempt_is_current(agent.context_compressor):
+            emit_model_switch(agent, "compression", provider, model, previous=baseline)
+
     _attempt_ctx_token = _COMPRESSOR_ATTEMPT_GENERATION.set(attempt_generation)
     try:
         # F6: never start expensive summary work for an already-cancelled
@@ -2961,6 +2972,7 @@ def _run_summary_dispatch(
             with (
                 aux_progress_hook(_progress_hook), compression_deadline_scope(commit_fence),
                 aux_interrupt_protection(cancel_check=_compression_cancel_requested),
+                aux_route_hook(announce_route),
             ):
                 # This attempt is now doing real summary work: publish it as the working attempt so later
                 # no-op entry claims (lock sit-outs, gates, the cancelled-fence skip above) cannot supersede
@@ -3291,30 +3303,7 @@ def _publish_rotated_compaction(
     _carry_session_state_to_child(agent, old_session_id, old_title)
 
 
-def _warn_summary_or_aux_fallback(agent: Any) -> None:
-    """Surface a failed summary, or a recovered-but-broken aux compression model, once."""
-    summary_error = getattr(agent.context_compressor, "_last_summary_error", None)
-    if summary_error:
-        if getattr(agent, "_last_compression_summary_warning", None) != summary_error:
-            agent._last_compression_summary_warning = summary_error
-            agent._emit_warning(f"⚠ Compression summary failed: {summary_error}. Inserted a fallback context marker.")
-    else:
-        # Aux model may have errored and been recovered on main; tell the user their
-        # auxiliary.compression.model is broken even though compression succeeded.
-        _aux_fail_model = getattr(agent.context_compressor, "_last_aux_model_failure_model", None)
-        _aux_fail_err = getattr(agent.context_compressor, "_last_aux_model_failure_error", None)
-        # Dedup on (model, error) so we don't spam on every compaction
-        _aux_key = (_aux_fail_model, _aux_fail_err)
-        if _aux_fail_model and getattr(agent, "_last_aux_fallback_warning_key", None) != _aux_key:
-            agent._last_aux_fallback_warning_key = _aux_key
-            logger.warning(
-                "Configured compression model %r failed (%s); recovered using the main model.",
-                _aux_fail_model, _aux_fail_err or "unknown error",
-            )
-            agent._emit_warning(
-                f"ℹ Configured compression model '{_aux_fail_model}' failed, so Hermes summarised "
-                "with your main model instead. Check auxiliary.compression.model in your config."
-            )
+from agent.conversation_compression_notices import _warn_summary_or_aux_fallback
 
 
 def _reset_read_dedup_caches(task_id: str, *, session_id: str = "") -> None:

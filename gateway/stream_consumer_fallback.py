@@ -27,6 +27,8 @@ class StreamFallbackMixin:
             result = await self.adapter.send(
                 chat_id=self.chat_id, content=text, reply_to=reply_to_id,
                 metadata=self._metadata_for_send(final=final, expect_edits=not final))
+            if final:
+                self._track_final_receipt(result)
             if not (result.success and result.message_id):
                 self._edit_supported = False
                 return reply_to_id
@@ -126,10 +128,14 @@ class StreamFallbackMixin:
         # Thread only a FULL resend (it replaces the preview); a tail continuation
         # keeps its existing unthreaded delivery on every platform.
         anchor = self._initial_reply_to_id if continuation == final_text else None
+        from gateway.platforms.post_delivery import complete_body
+        complete = continuation == final_text or getattr(self, '_body_receipts_complete', False)
         for chunk in chunks:
             result = await self._send_with_flood_retry(
                 content=chunk, reply_to=None if sent_any_chunk else anchor,
                 retry_log="Flood control on fallback send, retrying in %.1fs")
+            complete = complete and complete_body(result)
+            self._track_final_receipt(result)
             if not result or not result.success:
                 # Partial continuation landed: do NOT set _final_response_sent (the
                 # gateway must still deliver the full answer); _already_sent only
@@ -149,11 +155,12 @@ class StreamFallbackMixin:
         # re-sent.  If only the missing tail went out, the partial IS the head of
         # the answer ("sent only the second half" symptom).
         if (stale_message_id and stale_message_id != last_message_id
-                and not self._fallback_preserve_partial_messages and continuation == final_text):
-            await self._delete_previews([stale_message_id], label="Fallback partial",
+                and not self._fallback_preserve_partial_messages and continuation == final_text and complete):
+            await self._delete_previews({str(stale_message_id)} - self._final_receipt_ids, label="Fallback partial",
                                         skip_sentinel=False)
 
         self._message_id = last_message_id
+        self._confirmed_complete_body = complete
         self._already_sent = True
         # Recorder substitutes the unsplit ledger on a split turn.
         self._mark_final_delivered(record=final_text)
@@ -256,6 +263,7 @@ class StreamFallbackMixin:
         except Exception as exc:
             logger.debug("Empty fallback final send failed: %s", exc)
             return "ambiguous" if self._send_failure_may_have_delivered(exc) else "failed"
+        self._track_final_receipt(result)
         if not getattr(result, "success", False):
             if self._is_flood_error(result):
                 return "preview"
@@ -264,7 +272,7 @@ class StreamFallbackMixin:
         new_message_id = getattr(result, "message_id", None)
         # Telegram reports delete failure by returning False; the flood window that
         # broke the finalize can reject this too — one bounded retry.
-        await self._delete_previews(stale_ids, skip=new_message_id, label="Empty fallback",
+        await self._delete_previews(stale_ids - self._final_receipt_ids, label="Empty fallback",
                                     retry_on_false=True)
         self._segment_preview_message_ids = set()
         self._message_id = new_message_id or "__no_edit__"
@@ -330,6 +338,7 @@ class StreamFallbackMixin:
             result = await self.adapter.send(chat_id=self.chat_id, content=tail, metadata=_md)
             if result.success:
                 self._already_sent = True
+                self._track_preview_ids_from_result(result)
         except Exception as e:
             logger.error("Segment-break tail flush error: %s", e)
 
@@ -366,6 +375,11 @@ class StreamFallbackMixin:
             # suppress the real final after multiple tool calls.
             if result.success:
                 self._notify_new_message()
+                if self._on_commentary_delivered is not None:
+                    try:
+                        self._on_commentary_delivered(result, text)
+                    except Exception:
+                        logger.debug("Commentary receipt callback failed", exc_info=True)
                 # Lets run.py confirm whether an interim send carried the final.
                 # Record the exact delivered text so run.py can confirm whether an interim "preview"
                 # actually carried the final response, vs. unrelated commentary delivered during a session

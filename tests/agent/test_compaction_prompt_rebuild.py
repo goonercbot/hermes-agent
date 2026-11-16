@@ -12,6 +12,7 @@ forever-chats, gateway channels). New contract:
    back to its last good bytes (fail-open), never silently vanishes
 """
 import unittest
+import pytest
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -226,6 +227,39 @@ class TestWorkspaceSnapshotPinnedAcrossCompaction(unittest.TestCase):
             pass_session_id=False, session_id="s1", _emit_status=lambda *a, **k: None, **over,
         )
 
+    @pytest.mark.platforms("posix")
+    def test_directory_alias_reuses_the_snapshot_through_real_cwd_resolution(self):
+        import subprocess
+        import tempfile
+        from pathlib import Path
+        from agent.runtime_cwd import set_session_cwd, reset_session_cwd
+        from agent.system_prompt import build_system_prompt, invalidate_system_prompt
+
+        with tempfile.TemporaryDirectory(prefix="workspace-alias-") as tmp:
+            repo = _init_repo(Path(tmp) / "project", "initial-snapshot").resolve()
+            alias = Path(tmp) / "alias"
+            alias.symlink_to(repo, target_is_directory=True)
+            agent = self._pin_agent(_cached_system_prompt=None)
+            hints = f"Host: x\nUser home directory: /h\nCurrent working directory: {alias}"
+            with patch("agent.prompt_builder.load_soul_md", return_value=""), \
+                 patch("agent.prompt_builder.build_environment_hints", return_value=hints):
+                token = set_session_cwd(str(alias))
+                try:
+                    first = build_system_prompt(agent)
+                finally:
+                    reset_session_cwd(token)
+                subprocess.run(["git", "commit", "-qm", "later-must-not-replace-snapshot", "--allow-empty"],
+                               cwd=repo, check=True)
+                token = set_session_cwd(str(repo))
+                try:
+                    invalidate_system_prompt(agent)
+                    self.assertEqual(build_system_prompt(agent), first)
+                    db = SimpleNamespace(get_session=lambda sid: {"system_prompt": first})
+                    resumed = self._pin_agent(_cached_system_prompt=None, _session_db=db)
+                    self.assertEqual(build_system_prompt(resumed), first)
+                finally:
+                    reset_session_cwd(token)
+
     def test_binding_the_launch_dir_explicitly_replays_the_pin(self):
         """CLI-shaped first build (no cwd bound -> launch dir), then TUI /compress binds that same dir:
         one workspace, so the rebuild replays the session-start snapshot."""
@@ -279,7 +313,7 @@ class TestWorkspaceSnapshotPinnedAcrossCompaction(unittest.TestCase):
             with patch("agent.prompt_builder.load_soul_md", return_value=""), env(other), \
                  patch("agent.system_prompt.resolve_context_cwd", return_value=other):
                 moved = self._pin_agent(_cached_system_prompt=None, _session_db=db)
-                self.assertIn(f"- Root: {other}", build_system_prompt(moved))
+                self.assertIn(f"- Root: {other.resolve()}", build_system_prompt(moved))
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
@@ -300,7 +334,7 @@ class TestWorkspaceSnapshotPinnedAcrossCompaction(unittest.TestCase):
                        return_value=f"Host: x\nUser home directory: /h\nCurrent working directory: {repo}"), \
                  patch("agent.system_prompt.resolve_context_cwd", return_value=repo):
                 resumed = self._pin_agent(_cached_system_prompt=None, _session_db=db)
-                self.assertIn(f"- Root: {repo}", build_system_prompt(resumed))
+                self.assertIn(f"- Root: {repo.resolve()}", build_system_prompt(resumed))
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 

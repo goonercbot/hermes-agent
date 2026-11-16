@@ -38,7 +38,7 @@ async def test_delivery_precedes_slow_media_collection(tmp_path, monkeypatch, pa
 
     monkeypatch.setattr('gateway.session_finite.execute_finite_admission', execute)
 
-    async def send(adapter, event, key, response):
+    async def send(adapter, event, key, response, *, on_final=None, delivery_guard=None):
         assert get_session_admission(db, admission_id=event.message_id)['status'] == 'terminal'
         order.append('send')
         if path == 'send_failure':
@@ -258,7 +258,7 @@ async def test_cancelled_drain_keeps_delivery_and_collection_owned(tmp_path, mon
         owner.pending_deliveries[row['admission_id']] = (object(), object(), 'route', 'reply', None)
         return 'reply'
 
-    async def send(*args):
+    async def send(*args, on_final=None, delivery_guard=None):
         if phase == 'delivery':
             blocked.set()
             await async_wait_until(resume.is_set, timeout=5, what='delivery resume')
@@ -347,7 +347,7 @@ async def test_media_turns_settling_together_collect_one_at_a_time(tmp_path, mon
             object(), SimpleNamespace(message_id=row['admission_id']), 'route', 'reply', None)
         return 'reply'
 
-    async def send(adapter, event, key, response):
+    async def send(adapter, event, key, response, *, on_final=None, delivery_guard=None):
         sent.append(event.message_id)
 
     monkeypatch.setattr(recovery, '_release_media', slow_release)

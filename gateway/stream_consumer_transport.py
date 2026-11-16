@@ -237,11 +237,24 @@ class StreamTransportMixin:
 
     def _track_preview_ids_from_result(self, result: Any) -> None:
         """Record the primary id plus any continuation ids from an oversized split."""
+        self._segment_fresh_message_ids.update(
+            str(mid) for mid in (getattr(result, "fresh_message_ids", None) or ()) if mid is not None)
         raw = getattr(result, "raw_response", None) or {}
         raw_ids = raw.get("message_ids") if isinstance(raw, dict) else None
+        partial_ids = raw.get("delivered_message_ids") if isinstance(raw, dict) else None
         for mid in (getattr(result, "message_id", None),
-                    *(getattr(result, "continuation_message_ids", None) or ()), *(raw_ids or ())):
+                    *(getattr(result, "continuation_message_ids", None) or ()), *(raw_ids or ()),
+                    *(partial_ids or ()), *(getattr(result, "fresh_message_ids", None) or ())):
             self._track_preview_id(mid)
+
+    def _track_final_receipt(self, result: Any) -> None:
+        from gateway.commentary_delivery import message_ids
+        self._final_receipt_ids.update(message_ids(result))
+        if getattr(result, "success", False):
+            self._final_fresh_message_ids.update(
+                str(mid) for mid in (getattr(result, "fresh_message_ids", None) or ()) if mid is not None)
+            self._final_fresh_message_ids.update(
+                set(message_ids(result)).intersection(self._segment_fresh_message_ids))
 
     def _adapter_prefers_fresh_final(self, text: str) -> bool:
         """Adapter's prefers_fresh_final_streaming hook (Telegram's richer send path);
@@ -286,13 +299,22 @@ class StreamTransportMixin:
         except Exception as e:
             logger.debug("Fresh-final send failed, falling back to edit: %s", e)
             return False
+        if is_turn_final:
+            self._track_final_receipt(result)
         if not getattr(result, "success", False):
             return False
+        from gateway.platforms.post_delivery import complete_body
+        complete = complete_body(result)
+        if is_turn_final:
+            self._confirmed_complete_body = complete
         new_message_id = getattr(result, "message_id", None)
         # Best-effort preview cleanup; never delete the message just sent.
-        await self._delete_previews(stale_ids, skip=new_message_id, label="Fresh-final")
+        if complete:
+            from gateway.commentary_delivery import message_ids
+            await self._delete_previews(stale_ids - set(message_ids(result)), label="Fresh-final")
         self._preview_message_ids = set()
         self._adopt_message_id(new_message_id)
+        self._track_preview_ids_from_result(result)
         self._already_sent = True
         self._last_sent_text = text
         if is_turn_final:
@@ -460,14 +482,24 @@ class StreamTransportMixin:
         result = await self.adapter.send(
             chat_id=self.chat_id, content=text, reply_to=self._initial_reply_to_id,
             metadata=self._metadata_for_send(final=finalize, expect_edits=not finalize))
+        from gateway.platforms.post_delivery import complete_body
+        self._body_receipts_complete = getattr(self, '_body_receipts_complete', True) and complete_body(result)
+        if finalize:
+            self._confirmed_complete_body = complete_body(result) and (
+                not self._turn_split_delivery or self._body_receipts_complete)
         if not result.success:
+            raw = getattr(result, "raw_response", None)
+            if isinstance(raw, dict) and raw.get("partial_overflow"):
+                self._track_preview_ids_from_result(result)
             self._edit_supported = False
             return False
+        if finalize:
+            self._track_final_receipt(result)
         self._already_sent = True
         self._last_sent_text = text
+        self._track_preview_ids_from_result(result)
         if result.message_id:
             self._adopt_message_id(result.message_id)
-            self._track_preview_ids_from_result(result)
         else:
             # No editable id: fallback mode + sentinel so we don't re-enter first-send.
             self._enter_fallback_mode(self._visible_prefix())
@@ -505,6 +537,13 @@ class StreamTransportMixin:
             # changed on screen, so the visible prefix and flood state stay as they were and the
             # next tick retries with the newer text.
             return True
+        if finalize and is_turn_final:
+            self._track_final_receipt(result)
+        from gateway.platforms.post_delivery import complete_body
+        if finalize:
+            self._confirmed_complete_body = complete_body(result) and (
+                not self._turn_split_delivery or getattr(self, '_body_receipts_complete', False))
+        self._body_receipts_complete = getattr(self, '_body_receipts_complete', True) and complete_body(result)
         self._already_sent = True
         self._track_preview_ids_from_result(result)
         # Oversized edit split across continuations: message_id is now the LAST
@@ -563,6 +602,7 @@ class StreamTransportMixin:
         # duplicate #45517 fixed (#36965 / #25349).
         raw_response = getattr(result, "raw_response", None)
         if isinstance(raw_response, dict) and raw_response.get("partial_overflow"):
+            self._track_preview_ids_from_result(result)
             # Some overflow chunks landed but not the whole response: preserve the
             # visible prefix so got_done sends the missing tail.
             self._message_id = str(raw_response.get("last_message_id") or result.message_id

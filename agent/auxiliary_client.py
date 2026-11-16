@@ -2599,6 +2599,19 @@ def _set_relay_auxiliary_route(provider: str | None, model: str | None, api_mode
     context["api_mode"] = str(api_mode or "chat_completions")
 
 
+_AUX_ROUTE_HOOK = contextvars.ContextVar("aux_route_hook", default=None)
+
+
+@contextlib.contextmanager
+def aux_route_hook(hook):
+    """Observe concrete request routing inside one compression attempt, not preflight probes."""
+    token = _AUX_ROUTE_HOOK.set(hook)
+    try:
+        yield
+    finally:
+        _AUX_ROUTE_HOOK.reset(token)
+
+
 def _record_route_info(
     route_info: Optional[dict[str, str]], provider: Optional[str], model: Optional[str]
 ) -> None:
@@ -2606,6 +2619,12 @@ def _record_route_info(
     if route_info is not None:
         route_info["provider"] = provider or "auto"
         route_info["model"] = model or "default"
+    hook = _AUX_ROUTE_HOOK.get()
+    if callable(hook):
+        try:
+            hook(provider or "auto", model or "default")
+        except Exception:
+            logger.warning("Auxiliary route notice failed", exc_info=True)
 
 
 def _relay_auxiliary_metadata(
@@ -6340,35 +6359,7 @@ def _is_anthropic_compat_endpoint(provider: str, base_url: str) -> bool:
 _ANTHROPIC_MEDIA_BLOCKS = {"image_url": ("image", "image/png"), "video_url": ("video", "video/mp4")}
 
 
-def _convert_openai_images_to_anthropic(messages: list) -> list:
-    """Convert OpenAI ``image_url``/``video_url`` blocks to Anthropic ``image``/``video``;
-    only list-content messages with such blocks change."""
-    converted = []
-    for msg in messages:
-        content = msg.get("content")
-        if not isinstance(content, list):
-            converted.append(msg)
-            continue
-        new_content = []
-        changed = False
-        for block in content:
-            block_type = block.get("type")
-            if block_type not in _ANTHROPIC_MEDIA_BLOCKS:
-                new_content.append(block)
-                continue
-            url = (block.get(block_type) or {}).get("url", "")
-            anth_type, media_type = _ANTHROPIC_MEDIA_BLOCKS[block_type]
-            if url.startswith("data:"):
-                header, _, b64data = url.partition(",")
-                if ":" in header and ";" in header:
-                    media_type = header.split(":", 1)[1].split(";", 1)[0]
-                source = {"type": "base64", "media_type": media_type, "data": b64data}
-            else:
-                source = {"type": "url", "url": url}
-            new_content.append({"type": anth_type, "source": source})
-            changed = True
-        converted.append({**msg, "content": new_content} if changed else msg)
-    return converted
+from agent.auxiliary_media import _convert_openai_images_to_anthropic
 
 
 _NOUS_PROVIDER_NAMES = frozenset({"nous", "nous-portal", "nousresearch"})

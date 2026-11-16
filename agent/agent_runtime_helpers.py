@@ -745,20 +745,7 @@ _SEQUENCE_REPAIR_PASSES = (
     _merge_consecutive_users,
 )
 
-def _normalize_sentinel_encoded_content(messages: list[dict]) -> None:
-    """Decode any sentinel-encoded row content in place before the alternation passes run, so an
-    image-bearing turn is never merged as text (#125299). A multimodal turn can re-enter the working set
-    as its ``\\x00json:[…]`` string (e.g. after a proactive prune re-inserts history, #124102). A body
-    that no longer parses stays a sentinel string; ``_merge_consecutive_users`` refuses to weld it."""
-    from hermes_state import SessionDB  # lazy: the persistence layer owns the sentinel codec
-
-    for msg in messages:
-        if not isinstance(msg, dict):
-            continue
-        content = msg.get("content")
-        decoded = SessionDB._decode_content(content)
-        if decoded is not content:
-            msg["content"] = decoded
+from agent.agent_runtime_helpers_content import _normalize_sentinel_encoded_content
             # Keep any `_db_persisted` marker: re-encoding reproduces the stored scalar, and dropping
             # it makes the append-only flush re-append this user turn as a duplicate (#125331).
 
@@ -1444,9 +1431,12 @@ def restore_primary_runtime(agent) -> bool:
         if provider_fallback_active:
             # Notification surfaces are best-effort and must never undo a successful restore.
             with contextlib.suppress(Exception):
-                agent._emit_diagnostic_status(
-                    f"✅ Primary model restored: {agent.model} via {agent.provider}; "
-                    f"fallback {previous_model} via {previous_provider} is no longer active."
+                from agent.model_switch import emit_model_switch
+                emit_model_switch(
+                    agent, "main", agent.provider, agent.model,
+                    previous=(previous_provider, previous_model),
+                    text=f"🔔 Main agent model switched: {previous_model} via {previous_provider} → "
+                         f"{agent.model} via {agent.provider} (preferred route selected; response not yet verified).",
                 )
         return True
     except Exception as e:

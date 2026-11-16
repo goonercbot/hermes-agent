@@ -136,26 +136,7 @@ def _raw_process_event_session_id(evt: dict) -> str:
     return str(evt.get("origin_session_id") or session_key or "").strip()
 
 
-def _local_completion_card(evt: dict) -> dict[str, str]:
-    """The card of a local process notice: the async-result card the in-process TUI wrote for a
-    completion or async delegation (a gateway-side ``/review`` reports as one), and a liveness tick's
-    one-line receipt. The claim's ``message.start`` carries it, and an idle classic CLI only opens a
-    turn that has one. ``{}`` for a watch match."""
-    from tools.process_registry_notifications import (
-        PROCESS_COMPLETE_DISPLAY_KIND, async_delegation_display_text, process_completion_display_text)
-    evt_type = evt.get("type", "completion")
-    if evt_type == "completion":
-        return {"display_kind": PROCESS_COMPLETE_DISPLAY_KIND,
-                "display_text": evt.get("_display_text") or process_completion_display_text([evt])}
-    if evt_type == "async_delegation":
-        return {"display_kind": "async_delegation_complete", "display_text": async_delegation_display_text(evt)}
-    if evt_type == "heartbeat":
-        # The wake stays machinery (no bubble, and a quiet tick may end in silence); the receipt lets an
-        # idle CLI open the turn with one line and show the agent's reply.
-        from gateway.response_filters import INTERNAL_NOTIFICATION_DISPLAY_KIND
-        from tools.process_registry_notifications import heartbeat_display_text
-        return {"display_kind": INTERNAL_NOTIFICATION_DISPLAY_KIND, "display_text": heartbeat_display_text(evt)}
-    return {}
+from gateway.run_notifications_cards import _local_completion_card
 
 
 def _watch_notification_metadata(evt: dict, source) -> dict[str, Any]:
@@ -314,6 +295,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         metadata: Optional[dict[str, Any]] = None, event_message_id: Optional[str] = None,
         text_already_delivered: bool = False, deliver_media: bool = True, stream_consumer=None,
         session_key: Optional[str] = None, inbound_message_id: Optional[str] = None,
+        receipt_callback=None,
     ) -> bool:
         """Deliver a queued response using the normal text+attachment split.
 
@@ -344,6 +326,8 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                         _edit_res = await adapter.edit_message(
                             chat_id=source.chat_id, message_id=_sc_msg_id, content=text_content, finalize=True,
                         )
+                        if receipt_callback is not None:
+                            receipt_callback(_edit_res, _sc_msg_id)
                         if getattr(_edit_res, "success", False):
                             _reconciled = True
                             logger.info(
@@ -369,6 +353,8 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                     _sent = await self._send_queued_final_text(
                         adapter, source, text_content, metadata, event_message_id, session_key,
                         inbound_message_id)
+                    if receipt_callback is not None:
+                        receipt_callback(_sent, None)
                     if not getattr(_sent, "success", False):
                         # The text never landed. Report it undelivered and skip the attachments too:
                         # the caller's normal completion send replays the whole response (text and
@@ -416,14 +402,23 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         notify_path = _hermes_home / ".restart_notify.json"
         if not notify_path.exists():
             return None
+        remove_marker = False
         try:
             data = json.loads(notify_path.read_text(encoding="utf-8-sig"))
             platform_str = data.get("platform")
             chat_id = data.get("chat_id")
             thread_id = data.get("thread_id")
             if not platform_str or not chat_id:
+                remove_marker = True
                 return None
             platform = Platform(platform_str)
+            from gateway.lifecycle_privacy import lifecycle_target_allowed
+            profile = self._marker_profile(data)
+            profile_config = (getattr(self, "_profile_configs", None) or {}).get(profile) or self.config
+            platform_cfg = profile_config.platforms.get(platform)
+            if not lifecycle_target_allowed(platform_cfg, platform, chat_id, thread_id, chat_type=data.get("chat_type")):
+                remove_marker = True
+                return None
             # Relay-aware transport over the REQUESTER'S profile adapter map; ``self.adapters`` is the
             # default profile's, so a secondary's "restarted" notice would leave through the wrong bot.
             transport = resolve_delivery_transport(
@@ -431,8 +426,8 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             if transport is None:
                 logger.debug("Restart notification skipped: no live transport for %s", platform_str)
                 return None
-            platform_cfg = self.config.platforms.get(platform)
             if platform_cfg is not None and not platform_cfg.gateway_restart_notification:
+                remove_marker = True
                 logger.info(
                     "Restart notification suppressed: %s has gateway_restart_notification=false", platform_str
                 )
@@ -455,12 +450,14 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                 )
                 return None
             logger.info("Sent restart notification to %s:%s", platform_str, chat_id)
+            remove_marker = True
             return str(platform_str), str(chat_id), str(thread_id) if thread_id else None
         except Exception as e:
             logger.warning("Restart notification failed: %s", e)
             return None
         finally:
-            notify_path.unlink(missing_ok=True)
+            if remove_marker:
+                notify_path.unlink(missing_ok=True)
 
     def _home_channel_transports(self):
         """Yield ``(platform, platform_cfg, home, transport)`` for every home channel with a live transport."""
@@ -553,11 +550,13 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                 delivered = {tuple(target) for target in data.get("delivered_targets", [])}
                 # Owed targets come from config, not live transports: a removed home or an opt-out
                 # (gateway_restart_notification=false) must not keep the marker alive forever.
+                from gateway.lifecycle_privacy import lifecycle_target_allowed
                 owed = {
                     _served_notice_target_key(
                         profile, platform.value, cfg.home_channel.chat_id, cfg.home_channel.thread_id)
                     for profile, platform, cfg in self._served_home_channel_configs()
                     if cfg.home_channel and cfg.home_channel.chat_id and cfg.gateway_restart_notification
+                    and lifecycle_target_allowed(cfg, platform, cfg.home_channel.chat_id, cfg.home_channel.thread_id)
                 }
                 delivered |= await self._send_home_channel_startup_notifications(skip_targets=delivered)
                 if owed <= delivered:
@@ -590,6 +589,9 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             if _served_notice_target_key(profile, platform.value, home.chat_id, home.thread_id) in skipped
         }
         for profile, platform, platform_cfg, home, transport in targets:
+            from gateway.lifecycle_privacy import lifecycle_target_allowed
+            if not lifecycle_target_allowed(platform_cfg, platform, home.chat_id, home.thread_id):
+                continue
             if not platform_cfg.gateway_restart_notification:
                 logger.info(
                     "Home-channel startup notification suppressed: %s has gateway_restart_notification=false",
@@ -995,6 +997,11 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                 text=synth_text, message_type=MessageType.TEXT, source=source, internal=True,
                 metadata=metadata,
             )
+            from tools.waiting_lineage import CompletionProof
+            proof = evt.get('_waiting_lineage_proof')
+            if (type(proof) is CompletionProof
+                    and self._session_key_for_source(source) == proof.route):
+                synth_event._waiting_lineage_proof = proof
             logger.info(
                 "Watch pattern notification — injecting for %s chat=%s thread=%s",
                 platform_name, source.chat_id, source.thread_id,
@@ -1332,7 +1339,13 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             # The rows this admission settles: a turn that cannot confirm the owner offers them again.
             completion_ids = [claim.delegation_id] if claim.claim_id else []
             completion_ids += [sibling["delegation_id"] for sibling, claim_id in sibling_claims if claim_id]
-            evt = {**evt, "completion_ids": completion_ids}
+            evt = {key: value for key, value in evt.items() if key != '_waiting_lineage_proof'}
+            evt["completion_ids"] = completion_ids
+            if claim.claim_id and all(claim_id for _, claim_id in sibling_claims):
+                from tools.waiting_lineage import prove_completion
+                proof = prove_completion(completion_ids, claim.owner_session_id, str(evt.get('session_key') or ''))
+                if proof is not None:
+                    evt['_waiting_lineage_proof'] = proof
             injection_result = await self._inject_watch_notification(synth_text, evt, raise_not_accepted=True)
             if injection_result is not True:
                 return injection_result

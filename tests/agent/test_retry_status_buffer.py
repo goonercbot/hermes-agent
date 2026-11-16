@@ -129,8 +129,9 @@ def test_pending_fallback_notice_emitted_once_on_success():
     though the noisy retry buffer is dropped."""
     agent = _make_bare_agent()
     emitted = []
-    agent._emit_status = lambda msg: emitted.append(msg)
+    agent.status_callback = lambda kind, msg: emitted.append(msg) or True
 
+    # Preserve the pre-agent deferred-notice compatibility path, now a dedicated event.
     # Simulate try_activate_fallback: buffer the noisy switch line AND record
     # the durable one-shot notice.
     agent._buffer_status("🔄 Primary model failed — switching to fallback: m2 via p2")
@@ -155,7 +156,7 @@ def test_pending_fallback_notice_emitted_once_on_success():
 def test_pending_fallback_notice_emits_all_switches_in_order():
     agent = _make_bare_agent()
     emitted = []
-    agent._emit_status = emitted.append
+    agent.status_callback = lambda kind, msg: emitted.append(msg) or True
     agent._pending_fallback_notice = ["primary → fallback-1", "fallback-1 → fallback-2"]
 
     agent._emit_pending_fallback_notice()
@@ -174,10 +175,12 @@ def test_pending_fallback_notice_continues_after_callback_error():
         if message == "first":
             raise RuntimeError("surface unavailable")
 
-    agent._emit_status = emit
+    agent.status_callback = lambda kind, msg: emit(msg) or True
     agent._emit_pending_fallback_notice()
 
-    assert attempted == ["first", "second"]
+    # The failed notice is retained and retried, without hiding the second switch.
+    assert attempted == ["first", "first", "second"]
+    assert [notice.text for notice in agent._model_switch_state.pending] == ["first"]
     assert agent._pending_fallback_notice is None
 
 

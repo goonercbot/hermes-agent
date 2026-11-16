@@ -108,6 +108,9 @@ class SessionUsageMixin:
         """Enqueue a token/cost delta for the background writer (same kwargs as
         :meth:`update_token_counts`). After close() stopped the writer, falls back to the
         synchronous path and may raise."""
+        from hermes_state_usage_history import new_part
+        kwargs = dict(kwargs)
+        kwargs['_usage_event_parts'] = [new_part(kwargs, occurred_at=time.time())]
         with self._token_queue_cond:
             thread = self._token_writer_thread
             writer_alive = thread is not None and thread.is_alive()
@@ -238,8 +241,12 @@ class SessionUsageMixin:
                     if value is not None:
                         # All-None runs stay None so COALESCE keeps the stored value.
                         merged[f] = (merged.get(f) or 0.0) + value
+                merged.setdefault('_usage_event_parts', []).extend(kwargs.get('_usage_event_parts', []))
             else:
-                groups.append((key, session_id, dict(kwargs)))
+                copy = dict(kwargs)
+                if '_usage_event_parts' in copy:
+                    copy['_usage_event_parts'] = list(copy['_usage_event_parts'])
+                groups.append((key, session_id, copy))
         return [(sid, kw) for _, sid, kw in groups]
 
     def _stop_token_writer(self, join_timeout: float = 10.0) -> None:
@@ -288,7 +295,7 @@ class SessionUsageMixin:
         actual_cost_usd: Optional[float]=None, cost_status: Optional[str]=None, cost_source: Optional[str]=None,
         pricing_version: Optional[str]=None, billing_provider: Optional[str]=None, billing_base_url: Optional[str]=None,
         billing_mode: Optional[str]=None, api_call_count: int=0, absolute: bool=False,
-        source: Optional[str]=None, task: str = "",
+        source: Optional[str]=None, task: str = "", _usage_event_parts=None,
     ) -> None:
         """Update totals and route attribution, ensuring the legacy missing-row backfill.
         *absolute*=False increments (per-API-call deltas, CLI path); *absolute*=True sets directly
@@ -300,6 +307,9 @@ class SessionUsageMixin:
         values.pop('self')
         values.pop('session_id')
         values.pop('source')
+        if _usage_event_parts is None:
+            from hermes_state_usage_history import new_part
+            values['_usage_event_parts'] = [new_part(values, occurred_at=time.time())]
         # Ensure the row exists: under concurrent load create_session() may have failed on
         # locking, and the UPDATE would silently affect 0 rows. When this guard is the first
         # writer it must carry the agent's real source: the turn lease treats an existing row as
@@ -314,6 +324,7 @@ class SessionUsageMixin:
         actual_cost_usd: Optional[float]=None, cost_status: Optional[str]=None, cost_source: Optional[str]=None,
         pricing_version: Optional[str]=None, billing_provider: Optional[str]=None, billing_base_url: Optional[str]=None,
         billing_mode: Optional[str]=None, api_call_count: int=0, absolute: bool=False, task: str="",
+        _usage_event_parts=None,
     ) -> None:
         usage = {k: v for k, v in locals().items() if k in _MODEL_USAGE_FIELDS}
         sql = _TOKEN_UPDATE_ABSOLUTE_SQL if absolute else _TOKEN_UPDATE_DELTA_SQL
@@ -339,7 +350,7 @@ class SessionUsageMixin:
         record_model_usage = (not absolute) and has_usage
 
         row = conn.execute(
-            "SELECT model, billing_provider, api_call_count FROM sessions WHERE id = ?", (session_id,),
+            "SELECT * FROM sessions WHERE id = ?", (session_id,),
         ).fetchone()
         existing = dict(row) if row is not None else {}
         # create_session records the requested route before any API call. If that fails
@@ -358,6 +369,19 @@ class SessionUsageMixin:
         conn.execute(sql, params)
         if record_model_usage:
             self._record_model_usage(conn, session_id, task=task, **usage)
+        from hermes_state_usage_history import AMOUNTS, append_event, new_part
+        parts = _usage_event_parts if _usage_event_parts is not None else [new_part(usage)]
+        if absolute:
+            after = dict(conn.execute('SELECT * FROM sessions WHERE id=?', (session_id,)).fetchone())
+            part = dict(parts[0])
+            for key in AMOUNTS:
+                before, current = existing.get(key), after.get(key)
+                part[key] = (current or 0) - (before or 0)
+                if key == 'actual_cost_usd' and before == current:
+                    part[key] = None
+            parts = [part]
+        for part in parts:
+            append_event(conn, session_id, part, task=task, timing='unknown' if absolute else 'point')
 
     def _record_model_usage(
         self, conn, session_id: str, *, model: Optional[str]=None, billing_provider: Optional[str]=None,
@@ -408,6 +432,8 @@ class SessionUsageMixin:
         if not session_id or not task:
             return
         usage["api_call_count"] = 1 if api_call_count is None else int(api_call_count)
+        from hermes_state_usage_history import append_event, new_part
+        event_part = new_part(usage, occurred_at=time.time() if task != 'background_review' else None)
         # FK to sessions.id. A missing row is inserted as the ``unknown`` placeholder, which
         # the creator upsert later replaces. An existing row keeps source and created_source,
         # including a NULL surface update_token_counts can still fill; the UPDATE below only
@@ -422,6 +448,7 @@ class SessionUsageMixin:
                     "UPDATE sessions SET profile_name=? WHERE id=? AND profile_name IS NULL",
                     (own_profile, session_id))
             self._record_model_usage(conn, session_id, task=task, **usage)
+            append_event(conn, session_id, event_part, task=task, auxiliary=True)
         self._execute_write(_write, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
 
     def auxiliary_usage_by_task(self, session_id: str) -> dict[str, dict[str, float]]:

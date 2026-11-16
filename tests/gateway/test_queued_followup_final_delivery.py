@@ -42,6 +42,8 @@ class _RefusingDocCaptureAdapter(_DocCaptureAdapter):
 
 def _agent_returning(text):
     class _Agent:
+        model = "test-model"
+
         def __init__(self, **kwargs):
             self.tools = []
 

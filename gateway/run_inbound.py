@@ -1248,6 +1248,16 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             _orphan_adapter = self._delivery_adapter_for(source)
             if _orphan_adapter is None or getattr(event, "internal", False) or event.get_command():
                 return event, source, is_internal
+            try:
+                _task = asyncio.current_task()
+            except RuntimeError:
+                _task = None
+            _handoff = getattr(_task, "_hermes_fifo_handoff", None)
+            if (isinstance(_handoff, tuple) and len(_handoff) == 3
+                    and _handoff[0] is _orphan_adapter and _handoff[1] == _quick_key
+                    and _handoff[2] is event
+                    and _orphan_adapter._session_tasks.get(_quick_key) is _task):
+                return event, source, is_internal
             _rescued = self._rescue_orphaned_overflow(_quick_key, _orphan_adapter)
             if _rescued is None:
                 return event, source, is_internal
@@ -1321,10 +1331,21 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         """Handle an incoming message from any platform: auth → command check → running-agent
         interrupt → get/create session → build context → run agent → return response."""
         from gateway.run import _AGENT_PENDING_SENTINEL
+        from gateway.run_inbound_fifo import take_fifo_handoff
+        _task, _handoff = take_fifo_handoff()
+        _raw_source = event.source
+        _trusted = (
+            isinstance(_handoff, tuple) and len(_handoff) == 3
+            and _handoff[2] is event
+            and self._delivery_adapter_for(_raw_source) is _handoff[0]
+            and self._session_key_for_source(_raw_source) == _handoff[1]
+            and _handoff[0]._session_tasks.get(_handoff[1]) is _task
+        )
         _admitted = await self._hm_admit_event(event)
         if _admitted is None:
             return None
         event, source, is_internal = _admitted
+        _trusted = _trusted and source is _raw_source and event.source is _raw_source
         if not is_internal:
             from hermes_cli.observability.shared_metrics_events import record_gateway_slash_command
             record_gateway_slash_command(event)
@@ -1384,7 +1405,9 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             logger.info("Rejecting new active session %s: max_concurrent_sessions reached", _quick_key)
             return _limit_message
 
-        event, source, is_internal = self._hm_rescue_orphaned_fifo(event, source, is_internal, _quick_key)
+        from gateway.run_inbound_fifo import rescue_fifo_handoff
+        event, source, is_internal = rescue_fifo_handoff(
+            self, _trusted, _task, _handoff, event, source, is_internal, _quick_key)
 
         _claim_state = self._session_state(_quick_key)
         if _active_session_lease is not None:

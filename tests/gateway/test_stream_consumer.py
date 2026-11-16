@@ -481,7 +481,7 @@ class TestSegmentBreakOnToolBoundary:
         text (e.g. post-segment-break content, #10807)."""
         adapter = MagicMock()
         adapter.send = AsyncMock(
-            return_value=SimpleNamespace(success=True, message_id="msg_new"),
+            return_value=SimpleNamespace(success=True, message_id="msg_new", full_payload_delivered=True),
         )
         adapter.edit_message = AsyncMock(
             return_value=SimpleNamespace(success=True),

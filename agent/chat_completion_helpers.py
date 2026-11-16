@@ -2023,14 +2023,9 @@ def _rescope_fallback_extra_body(agent, old_model: str, old_provider: str, old_b
 
 
 def _buffer_fallback_notice(agent, notice: str) -> None:
-    """Buffer the switch notice for terminal failure AND retain it as a durable one-shot for
-    _emit_pending_fallback_notice (a successful fallback clears retry chatter)."""
-    agent._buffer_diagnostic_status(notice)
-    pending = getattr(agent, "_pending_fallback_notice", None)
-    if isinstance(pending, list):
-        pending.append(notice)
-    else:
-        agent._pending_fallback_notice = [str(pending), notice] if pending else [notice]
+    """Keep the legacy caller name; route changes are immediate, not retry chatter."""
+    from agent.model_switch import emit_model_switch
+    emit_model_switch(agent, "main", agent.provider, agent.model, text=notice)
 
 
 def try_activate_fallback(agent, reason: FailoverReason | None = None, reset_at=None) -> bool:
@@ -3376,13 +3371,13 @@ class _StreamingCall(StreamingWaitMonitor):
         runaway = None
 
         from agent import relay_llm
-        from agent.anthropic_adapter import normalize_stream_usage, sanitize_anthropic_kwargs
+        from agent.anthropic_adapter import anthropic_sdk_kwargs, normalize_stream_usage, sanitize_anthropic_kwargs
         accumulator = relay_llm.AnthropicStreamAccumulator()
 
         def _open_anthropic_stream(next_api_kwargs: dict[str, Any]):
             final_kwargs = dict(next_api_kwargs)
             sanitize_anthropic_kwargs(final_kwargs, log_prefix=getattr(self.agent, "log_prefix", ""))
-            manager = request_client.messages.stream(**final_kwargs)
+            manager = request_client.messages.stream(**anthropic_sdk_kwargs(final_kwargs, request_client.messages.stream))
             _stream_context["manager"] = manager
             return normalize_stream_usage(manager.__enter__())
 
@@ -3548,19 +3543,17 @@ class _StreamingCall(StreamingWaitMonitor):
         """Classify a failed attempt: True = retry; False = stop with
         ``result["error"]`` set (unless our own interrupt force-closed the
         socket). Runs inside the ``except`` so ``logger.exception`` works."""
-        import httpx as _httpx
+        from agent.stream_transport_errors import http_transport_error_types
         # Our own interrupt force-close: no retry/fallback/"reconnecting" (the
         # poll loop raises InterruptedError).
         if self._request_cancelled["value"]:
             logger.debug("Streaming worker caught %s after request cancellation — exiting without retry.", type(e).__name__)
             return False
         e = self._as_lifetime_error(e)  # a cap kill: transient, and its copy names the setting
-        _is_timeout = isinstance(e, (_httpx.ReadTimeout, _httpx.ConnectTimeout, _httpx.PoolTimeout, StreamLifetimeExceeded))
-        # ReadError: abort/reset mid-body (stale-kill shutdown under a parked reader, ECONNRESET) — retry loop owns it.
-        # anthropic.APIConnectionError: the Anthropic SDK wraps connect/read drops
-        # (incl. stale-kill aborts) in its own type, not httpx's.
-        _is_conn_err = isinstance(e, (_httpx.ConnectError, _httpx.ReadError, _httpx.RemoteProtocolError, ConnectionError,
-                                      *_anthropic_connection_error_types()))
+        _timeouts, _connections = http_transport_error_types()
+        _is_timeout = isinstance(e, (*_timeouts, StreamLifetimeExceeded))
+        # SDK 2.x stream bodies expose raw httpx2 errors; earlier SDKs also wrap drops.
+        _is_conn_err = isinstance(e, (*_connections, ConnectionError, *_anthropic_connection_error_types()))
         _is_stream_parse_err = self.agent._is_provider_stream_parse_error(e)
         _is_empty_stream = isinstance(e, EmptyStreamError)
         _is_sse_conn_err = not _is_timeout and not _is_conn_err and _is_sse_connection_error(e)

@@ -266,6 +266,7 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
                     **reply_expected_metadata(event.reply_expected), **diagnostic_metadata(event)},
                 message_type=event.message_type,
                 scheduled_heartbeat=bool(getattr(event, "_heartbeat_session_id", None)),
+                waiting_lineage_proof=getattr(event, '_waiting_lineage_proof', None) if event.internal else None,
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
@@ -1003,6 +1004,8 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
             _voice_ack_guild=_voice_ack_guild, _voice_ack_loop=asyncio.get_running_loop(),
             **{name: getattr(disp, name) for name in self._DISPLAY_TO_TURN_CTX}, **turn_params,
         )
+        from gateway.waiting_reply_delivery import begin_request_capture
+        begin_request_capture(_cleanup_adapter, turn_ctx)
         turn_runner = TurnRunner(self, turn_ctx)
         turn_ctx.mute_notification_reply = diagnostic_turn_muted(
             turn_ctx.persist_user_display_metadata, source.platform, turn_ctx.user_config)
@@ -1034,72 +1037,7 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
             metadata = {"reply_to_message_id": event_message_id}
         return metadata
 
-    def _run_agent_progress_threading(
-        self, source: SessionSource, event_message_id: Optional[str], _native_slack_task_cards: bool
-    ) -> tuple[Optional[dict], Optional[str], Optional[dict]]:
-        """Resolve where progress bubbles are threaded (platform-specific).
-
-        Returns ``(progress_metadata, progress_reply_to, status_thread_metadata)``; the latter is
-        for status / approval / stream sends (Feishu topics need the triggering message id via the
-        reply API, so carry it as a fallback). Slack and Buzz honour the user's reply_in_thread
-        opt-out: never synthesise a thread for progress, or every later reply inherits it."""
-        from gateway.run import _non_conversational_metadata, _resolve_progress_thread_id
-        is_buzz = str(getattr(source.platform, "value", source.platform) or "").lower() == "buzz"
-        _progress_reply_in_thread = True
-        _adapter = self._delivery_adapter_for(source) if source.platform == Platform.SLACK or is_buzz else None
-        if _adapter is not None:
-            try:
-                if is_buzz:
-                    _progress_reply_in_thread = getattr(_adapter, "_reply_to_mode", "first") != "off"
-                else:
-                    # Relay lane: the adapter owns mode resolution; native lane: flat extra key.
-                    _mode_fn = getattr(_adapter, "_effective_reply_in_thread", None)
-                    _progress_reply_in_thread = bool(
-                        _mode_fn() if callable(_mode_fn) else _adapter.config.extra.get("reply_in_thread", True)
-                    )
-            except Exception:
-                _progress_reply_in_thread = True
-        _progress_thread_id = _resolve_progress_thread_id(
-            source.platform, source.thread_id, event_message_id, reply_in_thread=_progress_reply_in_thread,
-        )
-        # Relay Discord auto-thread lane: the connector stamps prospective_thread_id at ingest.
-        _relay_prospective_thread_id = (
-            str(getattr(source, "prospective_thread_id", None))
-            if source.platform == Platform.DISCORD
-            and getattr(source, "delivered_via_upstream_relay", False)
-            and getattr(source, "prospective_thread_id", None)
-            and not source.thread_id
-            else None
-        )
-        _progress_metadata = _non_conversational_metadata(
-            self._thread_metadata_for_progress(
-                source, event_message_id, _progress_thread_id, _relay_prospective_thread_id,
-            ),
-            platform=source.platform,
-        )
-        if _native_slack_task_cards:
-            # chat.startStream in channels requires the recipient team/user pair; harmless elsewhere.
-            _progress_metadata = dict(_progress_metadata or {})
-            if source.scope_id:
-                _progress_metadata.setdefault("recipient_team_id", source.scope_id)
-                _progress_metadata.setdefault("slack_team_id", source.scope_id)
-            if source.user_id:
-                _progress_metadata.setdefault("recipient_user_id", source.user_id)
-        # Buzz has no native thread_id: thread via reply-to unless the user opted out.
-        _progress_reply_to = (
-            event_message_id
-            if (source.platform in (Platform.FEISHU, Platform.MATTERMOST) and source.thread_id and event_message_id)
-            or (is_buzz and event_message_id and _progress_reply_in_thread)
-            or _relay_prospective_thread_id
-            else None
-        )
-        if source.platform == Platform.FEISHU and source.thread_id and event_message_id:
-            _status_thread_metadata = {"thread_id": _progress_thread_id, "reply_to_message_id": event_message_id}
-        else:
-            _status_thread_metadata = self._thread_metadata_for_progress(
-                source, event_message_id, _progress_thread_id, _relay_prospective_thread_id,
-            )
-        return _progress_metadata, _progress_reply_to, _status_thread_metadata
+    from gateway.run_turn_threading import _run_agent_progress_threading
 
     async def _run_agent_write_tool_log(self, log_queue: Any) -> None:
         """Drain log_queue and append tool-call lines to tool_calls.log (tool_progress=log).
@@ -1641,6 +1579,38 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
             display_kind=turn_ctx.persist_user_display_kind, reply_expected=turn_ctx.reply_expected)
         # Failed turns deliver their text but never their attachments (completed-turn parity).
         _deliver_media = not _delivery_result.get("failed")
+        _bg_guard = getattr(adapter, '_active_sessions', {}).get(session_key) if adapter else None
+        _queued_uncertain = False
+        _previous_receipt_uncertain = getattr(_bg_guard, '_hermes_final_receipt_uncertain', False)
+        _queued_token = None
+        _queued_known = False
+        _queued_result_uncertain = False
+        _queued_receipt = None
+        if first_response and _deliver_media:
+            from gateway.platforms.base import BasePlatformAdapter
+            _queued_result_uncertain = ('MEDIA:' in first_response.upper()
+                or bool(BasePlatformAdapter.extract_images(first_response)[0]))
+        if first_response and _bg_guard is not None:
+            from types import SimpleNamespace
+            _queued_receipt = SimpleNamespace(_hermes_final_delivery_ids=set())
+            _queued_token = object()
+            _pending = getattr(adapter, '_waiting_pending_finals', None)
+            if _pending is None:
+                _pending = adapter._waiting_pending_finals = {}
+            _pending[_queued_token] = (str(turn_ctx.source.chat_id), _queued_receipt, _sc, turn_ctx.run_generation)
+
+        def _record_queued_receipt(receipt, edited_id):
+            nonlocal _queued_known, _queued_result_uncertain
+            from gateway.commentary_delivery import message_ids
+            from gateway.platforms.post_delivery import record_final_ids
+            record_final_ids(_queued_receipt, receipt)
+            ids = message_ids(receipt)
+            if edited_id and getattr(receipt, 'success', False):
+                _queued_receipt._hermes_final_delivery_ids.add(str(edited_id))
+                ids.append(str(edited_id))
+            _queued_known = _queued_known or bool(ids)
+            _queued_result_uncertain = _queued_result_uncertain or not getattr(receipt, "success", False)
+
         if first_response:
             logger.info(
                 "Queued follow-up for session %s: final text delivery confirmed; delivering explicit media before continuing."
@@ -1649,6 +1619,9 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
                 session_key or "?",
             )
             try:
+                if _bg_guard is not None:
+                    _bg_guard._hermes_delivery_in_flight = True
+                    _bg_guard._hermes_queued_delivery_token = _queued_token
                 _text_delivered = await self._deliver_queued_first_response(
                     first_response, source=turn_ctx.source, adapter=adapter,
                     metadata=turn_ctx._status_thread_metadata, event_message_id=turn_ctx.event_message_id,
@@ -1657,9 +1630,14 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
                     # The text send records a delivery-ledger obligation under this key, keyed on
                     # the raw inbound id (the anchor above is only the reply target).
                     session_key=session_key, inbound_message_id=turn_ctx.inbound_message_id,
+                    receipt_callback=_record_queued_receipt if _bg_guard is not None else None,
                 )
             except Exception as e:
                 logger.warning("Failed to send first response before queued message: %s", e)
+            except BaseException:
+                from gateway.waiting_reply_delivery import abort_queued_delivery
+                abort_queued_delivery(adapter, _bg_guard, turn_ctx.run_generation, _queued_token)
+                raise
             else:
                 # One source of truth for "this turn's final already reached the chat": the normal
                 # completion path (`_hmwa_deliver_turn_response`) consults ``already_sent`` on the
@@ -1672,13 +1650,27 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
                     # The queued lane already uploaded this response's MEDIA: attachments; without
                     # this the completion path's already_sent rescan uploads every file twice.
                     result["media_already_delivered"] = _deliver_media
+            from gateway.waiting_reply_delivery import retire_queued_send
+            _queued_uncertain = retire_queued_send(
+                _bg_guard, turn_ctx.run_generation, _queued_token, _queued_known, _queued_result_uncertain)
+        if _queued_token is not None:
+            from gateway.waiting_reply_delivery import finish_pending_final
+            finish_pending_final(adapter, _queued_token, uncertain=not _queued_known or _queued_result_uncertain)
         # Release deferred bg-review notifications: pop (no double-fire in base.py's finally) and call.
-        _bg_cb = self._pop_post_delivery_callback(adapter, session_key, turn_ctx.run_generation)
-        if callable(_bg_cb):
-            with suppress(Exception):
-                _bg_result = _bg_cb()
-                if inspect.isawaitable(_bg_result):
-                    await _bg_result
+        try:
+            _bg_cb = self._pop_post_delivery_callback(adapter, session_key, turn_ctx.run_generation)
+            if callable(_bg_cb):
+                with suppress(Exception):
+                    _bg_result = _bg_cb()
+                    if inspect.isawaitable(_bg_result):
+                        await _bg_result
+        finally:
+            if adapter is not None and _bg_guard is not None:
+                from gateway.waiting_reply_delivery import dispose_pending_finals
+                dispose_pending_finals(adapter, _bg_guard, turn_ctx.run_generation)
+                if (_queued_uncertain and
+                        getattr(_bg_guard, '_hermes_run_generation', None) == turn_ctx.run_generation):
+                    _bg_guard._hermes_final_receipt_uncertain = _previous_receipt_uncertain
 
     async def _run_agent_queued_followup(
         self, turn_ctx: TurnContext, adapter: Any, pending: Optional[str], pending_event: Any,
@@ -1717,6 +1709,7 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
         next_source, next_message, next_session_key = source, pending, session_key
         # message_type is carried into the recursive call so queued voice turns can stream TTS.
         next_message_id = next_channel_prompt = next_message_type = None
+        next_lineage_proof = None
         # The raw inbound id keys the delivery-ledger obligation for the follow-up's own final send,
         # distinct from the reply anchor above (None in forum topics). Carry it or two chained
         # topic turns with the same text would collide on one obligation id (queued-final-ledger).
@@ -1738,6 +1731,8 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
             # paths are buffered under the key given and consumed under next_session_key.
             try:
                 next_session_key = self._session_key_for_source(next_source)
+                if pending_event.internal:
+                    next_lineage_proof = getattr(pending_event, '_waiting_lineage_proof', None)
             except Exception:
                 logger.debug(
                     "Queued follow-up session-key resolution failed; reusing %s",
@@ -1806,6 +1801,7 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
                     run_generation=run_generation, _interrupt_depth=_interrupt_depth + 1,
                     event_message_id=next_message_id, inbound_message_id=next_inbound_id,
                     channel_prompt=next_channel_prompt, message_type=next_message_type,
+                    waiting_lineage_proof=next_lineage_proof,
                     persist_user_message=next_persist_message, persist_user_display_kind=next_display_kind,
                     reply_expected=next_reply_expected, persist_user_display_metadata={
                         **display_metadata_for_event(pending_event),
@@ -1893,18 +1889,9 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
         ``response["already_sent"]`` and log ``ok``. A returned failure logs ``fail_result`` as
         ``(session, error)`` and an exception logs ``fail_exc`` as ``(session, exc)``; either way
         ``already_sent`` stays unset so the normal final send delivers the content."""
-        try:
-            _res = await _sc.adapter.edit_message(
-                chat_id=source.chat_id, message_id=_sc.message_id, content=content, finalize=True,
-            )
-        except Exception as _edit_err:
-            logger.warning(fail_exc, _sk, _edit_err)
-            return
-        if not getattr(_res, "success", True):
-            logger.warning(fail_result, _sk, getattr(_res, "error", None))
-            return
-        response["already_sent"] = True
-        logger.info(*ok)
+        from gateway.commentary_delivery import edit_streamed_final
+        await edit_streamed_final(_sc, source, response, content, _sk=_sk, ok=ok,
+                                  fail_result=fail_result, fail_exc=fail_exc)
 
     async def _run_agent_mark_streamed_delivery(self, response: Any, turn_ctx: TurnContext) -> None:
         """Set ``response["already_sent"]`` when streaming already delivered the final reply.
@@ -1951,6 +1938,9 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
                 _sk, _streamed, _previewed, _content_delivered,
             )
             response["already_sent"] = True
+            matcher = getattr(_sc, "delivered_final_matches", None)
+            response["_complete_final_body"] = bool(callable(matcher) and matcher(_final) is True
+                and getattr(_sc, "_confirmed_complete_body", False) is True)
         elif not _transformed and _stale_finalized and _sc is not None:
             # Stale finalize: edit the streamed message up to the complete response (on failure the
             # normal send delivers). Not for split delivery — message_id is only the LAST chunk.
@@ -1997,39 +1987,8 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
         """Schedule deletion of tracked temporary progress bubbles after the final response lands.
 
         Failed runs keep them as breadcrumbs. Only on adapters with ``delete_message``; failures swallowed."""
-        from gateway.run import safe_schedule_threadsafe
-        _cleanup_msg_ids, session_key = turn_ctx._cleanup_msg_ids, turn_ctx.session_key
-        if not (
-            turn_ctx._cleanup_progress
-            and _cleanup_adapter is not None
-            and _cleanup_msg_ids
-            and session_key
-            and isinstance(response, dict)
-            and not response.get("failed")
-            and hasattr(_cleanup_adapter, "register_post_delivery_callback")
-        ):
-            return
-        _ids_snapshot = list(_cleanup_msg_ids)
-        _chat_id_snapshot = turn_ctx.source.chat_id
-        _loop_snapshot = asyncio.get_running_loop()
-
-        def _cleanup_temp_bubbles() -> None:
-            async def _delete_all() -> None:
-                for _mid in _ids_snapshot:
-                    with suppress(Exception):
-                        await _cleanup_adapter.delete_message(_chat_id_snapshot, _mid)
-            with suppress(Exception):
-                safe_schedule_threadsafe(
-                    _delete_all(), _loop_snapshot, logger=logger,
-                    log_message="Temp bubble cleanup scheduling error",
-                )
-
-        try:
-            _cleanup_adapter.register_post_delivery_callback(
-                session_key, _cleanup_temp_bubbles, generation=turn_ctx.run_generation,
-            )
-        except Exception as _rpe:
-            logger.debug("Post-delivery cleanup registration failed: %s", _rpe)
+        from gateway.commentary_delivery import schedule_cleanup
+        schedule_cleanup(response, _cleanup_adapter, turn_ctx)
 
     def _run_agent_bind_turn_wiring(
         self, turn_ctx: TurnContext, turn_runner: TurnRunner, source: SessionSource,
@@ -2106,6 +2065,8 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
                 if _heartbeat_msg_id:
                     try:
                         _notify_res = await _notify_adapter.edit_message(source.chat_id, _heartbeat_msg_id, _heartbeat_text)
+                        from gateway.commentary_delivery import track_progress
+                        track_progress(turn_ctx, _notify_res)
                     except Exception as _ee:
                         logger.debug("Heartbeat edit failed: %s", _ee)
                         _notify_res = None
@@ -2120,10 +2081,10 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
                         source.chat_id, _heartbeat_text,
                         metadata=_interim_metadata(_non_conversational_metadata(_status_thread_metadata, platform=source.platform)),
                     )
+                    from gateway.commentary_delivery import track_progress
+                    track_progress(turn_ctx, _notify_res)
                     if getattr(_notify_res, "success", False) and getattr(_notify_res, "message_id", None):
                         _heartbeat_msg_id = str(_notify_res.message_id)
-                        if turn_ctx._cleanup_progress:
-                            turn_ctx._cleanup_msg_ids.append(_heartbeat_msg_id)
             except Exception as _ne:
                 logger.debug("Long-running notification error: %s", _ne)
 
@@ -2139,6 +2100,7 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
         reply_expected: Optional[bool] = None,
         scheduled_heartbeat: bool = False,
         title_user_message: Optional[str] = None,
+        waiting_lineage_proof: Any = None,
     ) -> dict[str, Any]:
         """Run the agent; returns the full run_conversation result dict.
 
@@ -2173,6 +2135,7 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
             disp, AIAgent, message=message, source=source, session_key=session_key,
             run_generation=run_generation, context_prompt=context_prompt, history=history,
             session_id=session_id, _interrupt_depth=_interrupt_depth,
+            waiting_lineage_proof=waiting_lineage_proof,
             event_message_id=event_message_id, inbound_message_id=inbound_message_id,
             channel_prompt=channel_prompt, moa_config=moa_config,
             title_user_message=title_user_message,

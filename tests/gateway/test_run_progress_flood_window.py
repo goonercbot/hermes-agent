@@ -68,6 +68,7 @@ class FourToolAgent:
 
 async def _run(monkeypatch, tmp_path, retry_after, adapter=None, agent_cls=FourToolAgent):
     monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
+    monkeypatch.setattr(agent_cls, "model", "test-model", raising=False)
     fake_run_agent = types.ModuleType("run_agent")
     fake_run_agent.AIAgent = agent_cls
     monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
@@ -80,6 +81,8 @@ async def _run(monkeypatch, tmp_path, retry_after, adapter=None, agent_cls=FourT
     runner._voice_mode, runner._prefill_messages, runner._running_agents = {}, [], {}
     runner._ephemeral_system_prompt, runner._reasoning_config, runner._fallback_model = "", None, None
     runner._provider_routing, runner._session_db = {}, None
+    runner.session_store = SimpleNamespace(_entries={}, _save=lambda: None)
+    runner._session_run_generation = {}
     runner.hooks = SimpleNamespace(loaded_hooks=False)
     runner.config = SimpleNamespace(thread_sessions_per_user=False, group_sessions_per_user=False, stt_enabled=False)
     source = SessionSource(platform=Platform.TELEGRAM, chat_id="-1001", chat_type="group")

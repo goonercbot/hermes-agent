@@ -20,9 +20,9 @@ import { clearActiveSessionTodos } from '@/store/todos'
 
 import type { GatewayEventContext } from './types'
 
-/** Lifecycle text that announces the session left its selected model for a fallback. */
+/** Persistent announcements for fallback, recovery and compression route changes. */
 export function isFallbackSwitchStatus(kind: string | undefined, text: string): boolean {
-  if (kind === 'fallback') {
+  if (kind === 'fallback' || kind === 'model_switch') {
     return Boolean(text.trim())
   }
 

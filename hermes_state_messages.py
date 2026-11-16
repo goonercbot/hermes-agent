@@ -454,6 +454,24 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin, 
         self._check_transcript_write_guards(conn, session_id, compression_lock_holder,
             turn_lease_holder=turn_lease_holder, turn_lease_ttl_seconds=turn_lease_ttl_seconds)
         from agent.transcript_repair import resolve_and_repair_transcript_batch
+        def fork_protected_row(row):
+            from hermes_state_evidence_compat import has_evidence_references
+            if not has_evidence_references(conn, row_id=int(row["id"])):
+                return row
+            if not row["active"]:
+                raise RuntimeError("cannot rewrite an archived historical evidence source")
+            ids = [int(r[0]) for r in conn.execute(
+                "SELECT id FROM messages WHERE session_id = ? AND active = 1 AND id >= ? ORDER BY id",
+                (session_id, row["id"]))]
+            watermark = conn.execute("SELECT COALESCE(MAX(id), 0) FROM messages").fetchone()[0]
+            conn.execute("UPDATE messages SET active = 0, compacted = 0 "
+                         "WHERE session_id = ? AND active = 1 AND id >= ?", (session_id, row["id"]))
+            self._clone_message_rows(conn, ids)
+            # The first clone is the changed row; later clones preserve the full active tail.
+            new_id = conn.execute("SELECT id FROM messages WHERE session_id = ? AND active = 1 AND id > ? "
+                                  "ORDER BY id LIMIT 1", (session_id, watermark)).fetchone()[0]
+            return conn.execute("SELECT * FROM messages WHERE id = ? AND session_id = ?",
+                                (new_id, session_id)).fetchone()
         inserted_rows = resolve_and_repair_transcript_batch(
             conn,
             session_id,
@@ -464,6 +482,7 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin, 
                 session_id, msg, timestamp
             ),
             decode_row_fn=self._decoded_repair_row,
+            fork_protected_row_fn=fork_protected_row,
         )
         inserted, tool_calls_total = self._insert_message_rows(conn, session_id, inserted_rows)
         self._bump_session_counters(conn, session_id, inserted, tool_calls_total, unit=False)
@@ -476,17 +495,12 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin, 
         :meth:`_insert_message_rows` caller that passes caller-owned dicts; rewind and import insert fresh copies). Each attempt, and a final failure, restores the caller's
         ``_row_id`` / digest / timestamp: a rolled-back insert's id is reused by SQLite, so a stale stamp
         would make a later flush adopt another writer's row and drop this message."""
-        _absent = object()
-        pre_state = [tuple(m.get(k, _absent) for k in self._ROW_STATE_KEYS) for m in messages]
+        pre_state = [m.copy() for m in messages]
 
         def _restore() -> None:
             for msg, state in zip(messages, pre_state):
-                msg.pop(CANONICAL_ROW, None)
-                for key, value in zip(self._ROW_STATE_KEYS, state):
-                    if value is _absent:
-                        msg.pop(key, None)
-                    else:
-                        msg[key] = value
+                msg.clear()
+                msg.update(state)
 
         def _attempt(conn):
             _restore()
@@ -760,6 +774,12 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin, 
         if expected_active_ids is not None and [
                 int(row[0]) for row in conn.execute(_ACTIVE_IDS_SQL, (session_id,))] != expected_active_ids:
             raise RuntimeError("active transcript changed before the rewrite could be persisted")
+        # Historical evidence points to physical source rows, including archived rows. A
+        # destructive replacement would either violate its FK or destroy that evidence.
+        # Use the native rewind generation only for sessions with such references.
+        from hermes_state_evidence_compat import has_evidence_references
+        if not archive_dropped and has_evidence_references(conn, session_id=session_id):
+            archive_dropped = True
         kept = kept_tool_calls = 0
         if archive_dropped:
             # Only the first len(messages)+1 live rows matter: the prefix to match plus the row whose
@@ -1695,33 +1715,7 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin, 
             include_ancestors=True, repair_alternation=False, include_row_ids=True)
         return model_history, display_history
 
-    def _resume_lineage_ids(self, session_id: str) -> list[str]:
-        """Session ids a display resume materializes: the VERIFIED compression lineage (root → tip; each
-        hop's parent ended ``compression`` and the child is a genuine continuation), or the session alone
-        for anything else — an explicit ``/branch`` copy, an API fork, a reset child, or a plain session.
-        The raw parent walker ``_session_lineage_root_to_tip`` is intentionally NOT used here: it crosses
-        fork/reset boundaries and misclassifies API forks (parent ended ``branched``, no marker) as
-        compression lineages. Shared with the resume guard so it counts exactly what a resume loads."""
-        if not session_id:
-            return [session_id]
-        session = self.get_session(session_id)
-        if not session or self._is_explicit_fork_child_row(session):
-            return [session_id]
-        # _is_compression_child_row is the per-hop gate: the child must not be an explicit
-        # branch/delegate/tool child AND its parent must have ended 'compression'.
-        chain = [session_id]
-        current = session
-        seen = {session_id}
-        while len(chain) < 100:  # defensive bound, same as _session_lineage_root_to_tip
-            if not self._is_compression_child_row(current):
-                break
-            parent = self.get_session(current["parent_session_id"])
-            if not parent or parent["id"] in seen:
-                break
-            seen.add(parent["id"])
-            chain.append(parent["id"])
-            current = parent
-        return list(reversed(chain))
+    from hermes_state_message_lineage import _resume_lineage_ids
 
     def _resume_count_scope(self, session_id: str, tip_only: bool) -> tuple[list[str], str]:
         """``tip_only``: the tip's ACTIVE rows (model restore); else the full-lineage DISPLAY set."""
@@ -1963,10 +1957,12 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin, 
         ``backup``: ``VACUUM INTO`` snapshot first (none when nothing changes)."""
         from hermes_state import _STALE_TOOL_CALL_MARKER_RE
         def _find_affected(conn) -> list[int]:
+            from hermes_state_evidence_compat import has_evidence_references
             cursor = conn.execute("SELECT id, content FROM messages "
                 "WHERE role = 'assistant' AND tool_calls IS NOT NULL AND tool_calls != ''")
             return [row["id"] for row in cursor.fetchall()
-                if isinstance(row["content"], str) and _STALE_TOOL_CALL_MARKER_RE.fullmatch(row["content"].strip())]
+                if isinstance(row["content"], str) and _STALE_TOOL_CALL_MARKER_RE.fullmatch(row["content"].strip())
+                and not has_evidence_references(conn, row_id=row["id"])]
         def _result(affected, backup_path=None):
             return {"dry_run": dry_run, "rows_affected": len(affected), "row_ids": affected, "backup_path": backup_path}
         with self._read_ctx() as conn:

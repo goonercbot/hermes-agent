@@ -10,7 +10,7 @@ import threading
 import time
 from contextlib import suppress
 from datetime import datetime
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, cast
 
 from agent.i18n import t
 from agent.interrupt_compat import _accepts_keyword
@@ -165,9 +165,8 @@ class GatewayTurnProgressMixin:
 
     def _track_progress_result(self, result) -> None:
         """Remember a delivered progress/status message id for end-of-turn cleanup."""
-        ctx = self._ctx
-        if ctx._cleanup_progress and getattr(result, "success", False) and getattr(result, "message_id", None):
-            ctx._cleanup_msg_ids.append(str(result.message_id))
+        from gateway.commentary_delivery import track_progress
+        track_progress(self._ctx, result)
 
     def _track_future_cleanup_id(self, fut) -> None:
         try:
@@ -1016,9 +1015,11 @@ class GatewayTurnProgressMixin:
     def _send_status_text(self, text: str, metadata, log_message: str) -> None:
         from gateway.bot_peer_notices import automatic_notices_allowed
         ctx = self._ctx
+        from gateway.commentary_delivery import remember_commentary
         if not automatic_notices_allowed(ctx.source):
             return
-        self._schedule(ctx._status_adapter.send(ctx._status_chat_id, text, metadata=metadata), log_message)
+        future = self._schedule(ctx._status_adapter.send(ctx._status_chat_id, text, metadata=metadata), log_message)
+        remember_commentary(ctx, future, text)
 
     def _attach_session_title_callback(self, agent, ctx) -> None:
         """Wire the platform thread-rename lane onto the agent as `_on_session_title`.
@@ -1063,19 +1064,32 @@ class GatewayTurnProgressMixin:
         except Exception:
             logger.debug("Failed to attach session title callback", exc_info=True)
 
-    def _status_callback_sync(self, event_type: str, message: str) -> None:
+    def _status_callback_sync(self, event_type: str, message: str):
         from gateway.run import _prepare_gateway_status_message, _redact_gateway_user_facing_secrets, _send_or_update_status_coro
         from gateway.run_status_filter import status_chat_type
         from gateway.warning_notifications import is_warning_status, render_notification
         ctx = self._ctx
-        if ctx.mute_notification_reply or not self._status_live():
-            return
+        if not self._status_live() or (ctx.mute_notification_reply and event_type != "model_switch"):
+            return False
         # Lifecycle diagnostics (including provider fallback notices) are UI affordances for a
         # human caller. Sending them to a known bot peer can create a new inbound turn and a loop.
         from gateway.bot_peer_notices import automatic_notices_allowed
         if not automatic_notices_allowed(ctx.source):
             logger.debug("status_callback suppressed for bot-authored message: %s", event_type)
             return
+        if event_type == "model_switch":
+            # A route change is an operator-visible event, not temporary progress or retry noise.
+            text = _redact_gateway_user_facing_secrets(str(message))
+            if local_viewer_turn(self):
+                cast(Any, self)._publish_execution("status.update", {"kind": "model_switch", "text": text})
+                return True
+            else:
+                from gateway.model_switch_notices import deliver_model_switch
+                return self._schedule(
+                    deliver_model_switch(ctx._status_adapter, ctx.source, text, ctx._status_thread_metadata,
+                                         self._status_live, chat_id=ctx._status_chat_id),
+                    "model switch notice delivery failed",
+                )
         prepared = _prepare_gateway_status_message(ctx.source.platform, event_type, message, status_chat_type(ctx.source))
         if prepared is None:
             logger.debug(

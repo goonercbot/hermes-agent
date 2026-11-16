@@ -107,6 +107,8 @@ def _make_runner(adapter):
     runner._fallback_model = None
     runner._session_db = None
     runner._running_agents = {}
+    runner._session_run_generation = {}
+    runner.session_store = SimpleNamespace(_entries={}, _save=lambda: None)
     runner.hooks = SimpleNamespace(loaded_hooks=False)
     runner.config = SimpleNamespace(
         thread_sessions_per_user=False,
@@ -123,6 +125,7 @@ def _install_fake_agent(monkeypatch, tmp_path, agent_cls):
     fake_dotenv.load_dotenv = lambda *args, **kwargs: None
     monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
 
+    monkeypatch.setattr(agent_cls, "model", "test-model", raising=False)
     fake_run_agent = types.ModuleType("run_agent")
     fake_run_agent.AIAgent = agent_cls
     monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)

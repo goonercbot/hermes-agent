@@ -68,7 +68,7 @@ class CleanupCaptureAdapter(BasePlatformAdapter):
         self.sent.append(
             {"chat_id": chat_id, "content": content, "message_id": mid, "metadata": metadata}
         )
-        return SendResult(success=True, message_id=mid)
+        return SendResult(success=True, message_id=mid, fresh_message_ids=(mid,))
 
     async def edit_message(self, chat_id, message_id, content) -> SendResult:
         self.edits.append({"chat_id": chat_id, "message_id": message_id, "content": content})
@@ -156,6 +156,8 @@ def _make_runner(adapter):
     runner._fallback_model = None
     runner._session_db = None
     runner._running_agents = {}
+    runner._session_run_generation = {}
+    runner.session_store = SimpleNamespace(_entries={}, _save=lambda: None)
     runner.hooks = SimpleNamespace(loaded_hooks=False)
     runner.config = SimpleNamespace(
         thread_sessions_per_user=False,
@@ -179,6 +181,7 @@ def _install_fakes(
     fake_dotenv.load_dotenv = lambda *a, **k: None
     monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
 
+    monkeypatch.setattr(agent_cls, "model", "test-model", raising=False)
     fake_run_agent = types.ModuleType("run_agent")
     fake_run_agent.AIAgent = agent_cls
     monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
@@ -262,6 +265,8 @@ async def test_cleanup_chains_with_existing_callback(monkeypatch, tmp_path):
 
     source = SessionSource(platform=Platform.TELEGRAM, chat_id="-1001")
     session_key = "agent:main:telegram:group:-1001"
+    # The production adapter installs a live delivery guard before invoking the runner.
+    adapter._active_sessions[session_key] = asyncio.Event()
 
     pre_existing_fired = []
 
@@ -284,6 +289,9 @@ async def test_cleanup_chains_with_existing_callback(monkeypatch, tmp_path):
     assert result["final_response"] == "done"
     cb = adapter.pop_post_delivery_callback(session_key)
     assert callable(cb)
+    # This test fires the callback manually rather than delivering a final body.
+    # Supply the complete receipt that the real adapter records after delivery.
+    adapter._confirm_final_delivery(session_key, None, True)
     await _fire_post_delivery_cb(cb)
     for _ in range(20):
         await asyncio.sleep(0.01)

@@ -428,7 +428,7 @@ def is_host_excluded_by_no_proxy(hostname: str, no_proxy_value: str | None = Non
 import dataclasses
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Dict, List, Optional, Any, Callable, Awaitable, Tuple, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Any, Callable, Awaitable, Tuple, Union, cast
 
 if (_checkout_root := str(Path(__file__).resolve().parents[2])) not in sys.path:
     sys.path.append(_checkout_root)  # append, never prepend: never shadow same-named installed packages
@@ -994,58 +994,7 @@ def _warn_unresolved_docker_media(candidate: Path, session_key: str, reason: str
                    f", session_key={session_key}" if session_key else "")
 
 
-def _translate_docker_container_media_path(
-    candidate: Path, session_key: str = "", workspace_key: str = "", *, quiet: bool = False, workspace_cwd: str = "",
-) -> Optional[Path]:
-    """Container-absolute path -> host path via longest-prefix match over ``docker_volumes``, the
-    auto-mounted cache dirs (``/root/.hermes/...``), persistent ``/workspace`` and ``/root``.
-
-    ``workspace_key`` is the 16-hex digest of one session's host cwd ``workspace_cwd`` (its cwd
-    mount). It selects that session's ``<base>:ws:<digest>`` sandbox and is empty for MEDIA delivery.
-    """
-    if not candidate.as_posix().startswith("/"):  # POSIX even on Windows gateways (not is_absolute)
-        return None
-    # In-process gateways (Desktop, `hermes serve`) may not have bridged terminal.* config into
-    # TERMINAL_* env yet; the bridge is idempotent.
-    with contextlib.suppress(Exception):
-        from tools.terminal_tool import _ensure_terminal_env_bridged
-        _ensure_terminal_env_bridged()
-    from gateway.platforms.docker_media_paths import (
-        _default_docker_workspace_host_roots, _docker_persistent_sandbox_roots,
-    )
-    mounts = [*_parse_docker_volume_mounts(), *_cache_dir_container_mounts()]
-    mounted = {c.as_posix() for _, c in mounts}
-    # Synthetic /workspace mounts: this session's workspace sandbox, then the
-    # shared profile layout, then the legacy per-session dir.
-    if "/workspace" not in mounted:
-        mounts.extend(
-            (root, Path("/workspace"))
-            for root in _default_docker_workspace_host_roots(session_key, workspace_key, workspace_cwd))
-    # Synthetic /root mounts catch stray home writes (/root/out.png; cache mounts are longer
-    # prefixes). /root/.hermes/* that missed a cache mount is the container's credential surface —
-    # translating it via the home mount would dodge the host denylist.
-    if "/root" not in mounted and not candidate.as_posix().startswith("/root/.hermes"):
-        mounts.extend(
-            (root, Path("/root"))
-            for root in _docker_persistent_sandbox_roots(session_key, "home", workspace_key))
-    if not mounts:
-        _warn_unresolved_docker_media(candidate, session_key, "no sandbox mounts resolved", quiet)
-        return None
-    # Longest container-prefix match; equal-length prefixes are tried in insertion order.
-    candidate_posix = candidate.as_posix()
-    matched = [(host_root, container_root, len(prefix)) for host_root, container_root in mounts
-               for prefix in (container_root.as_posix().rstrip("/") or "/",)
-               if candidate_posix == prefix or candidate_posix.startswith(prefix + "/")]
-    if not matched:
-        _warn_unresolved_docker_media(candidate, session_key, "no mounted prefix matches", quiet)
-        return None
-    for host_root, container_root, _score in sorted(matched, key=lambda m: -m[2]):
-        translated = _resolve_path(host_root / candidate.relative_to(container_root), strict=True)
-        if translated is not None and (
-                translated == host_root or _path_is_within(translated, host_root)):
-            return translated
-    _warn_unresolved_docker_media(candidate, session_key, "host file missing from sandbox", quiet)
-    return None
+from gateway.platforms.base_media_mount import _translate_docker_container_media_path
 
 
 def validate_media_delivery_path(path: str, session_key: str = "") -> Optional[str]:
@@ -1605,6 +1554,11 @@ class SendResult:
     # SEND_ERROR_KINDS member (failures only) via :func:`classify_send_error`, so consumers
     # branch without substring-matching ``error``.
     error_kind: Optional[str] = None
+    # Explicit proof the complete requested body reached the transport.
+    full_payload_delivered: Optional[bool] = None
+    # Positive transport evidence only; empty means no known newly created IDs.
+    # A resumed logical send may aggregate its earlier partial receipt.
+    fresh_message_ids: tuple[str, ...] = ()
 
 
 # Longest server ``retry_after`` ``_send_with_retry`` will sleep inline. Longer penalties return the
@@ -1799,7 +1753,10 @@ def _lazy_attr(obj: Any, name: str, factory: Callable[[], Any]) -> Any:
 _strip_media_directives = _strip_media_tag_directives
 
 
-class BasePlatformAdapter(ABC):
+from gateway.platforms.post_delivery import FinalDeliveryReceiptMixin, record_final_ids
+
+
+class BasePlatformAdapter(FinalDeliveryReceiptMixin, ABC):
     """Base class for platform adapters: connect/auth, receive, send, handle media."""
 
     # ``format_message`` renders ``` fences as real code blocks (tool-progress then sends a bare
@@ -3666,11 +3623,14 @@ class BasePlatformAdapter(ABC):
             self, chat_id: str, content: str, *, reply_to: Optional[str], metadata: Any) -> SendResult:
         """Last-resort send after a non-transient failure; platforms whose markup is not the
         likely culprit override it (Photon drops rich links instead of adding the banner)."""
-        return await self.send(
+        result = await self.send(
             chat_id=chat_id, content=self.warning_text(
                 t("gateway.notify.plain_fallback_prefix", content=content[:3500]), content[:3500],
                 chat_id=chat_id, metadata=metadata),
             reply_to=reply_to, metadata=metadata)
+        if len(content) > 3500:
+            result.full_payload_delivered = False
+        return result
 
     @staticmethod
     def _merge_caption(existing_text: Optional[str], new_text: str) -> str:
@@ -4301,7 +4261,7 @@ class BasePlatformAdapter(ABC):
 
     async def _send_final_text(
         self, event: MessageEvent, session_key: str, text_content: str, metadata: dict[str, Any],
-        is_ephemeral_response: bool, ephemeral_ttl: int, record_delivery: Callable) -> None:
+        is_ephemeral_response: bool, ephemeral_ttl: int, record_delivery: Callable) -> bool:
         """Normal-lane final: the ledger bracket plus the message-id owner's ephemeral delete."""
         result, delivery_adapter = await self.send_final_ledgered(
             event, session_key, text_content, metadata,
@@ -4309,6 +4269,8 @@ class BasePlatformAdapter(ABC):
         record_delivery(result)
         if ephemeral_ttl and ephemeral_ttl > 0 and result.success and result.message_id:
             delivery_adapter._schedule_ephemeral_delete(event.source.chat_id, result.message_id, ephemeral_ttl)
+        from gateway.platforms.post_delivery import complete_body
+        return complete_body(result)
 
     async def _notify_turn_error(self, event: MessageEvent, e: BaseException) -> Optional[dict]:
         """Tell the user a turn failed rather than leaving radio silence (last resort:
@@ -4419,9 +4381,14 @@ class BasePlatformAdapter(ABC):
         """Run the one-shot post-delivery callback (bounded, errors swallowed). The generation is
         read HERE — stamped on the interrupt event DURING the handler await; an earlier snapshot
         would let stale runs fire a fresher run's callbacks."""
-        await run_post_delivery_callback(self.pop_post_delivery_callback(
-            session_key, generation=getattr(interrupt_event, "_hermes_run_generation", None)),
-            _POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS)
+        generation = getattr(interrupt_event, "_hermes_run_generation", None)
+        try:
+            await run_post_delivery_callback(self.pop_post_delivery_callback(
+                session_key, generation=generation), _POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS)
+        finally:
+            from gateway.waiting_reply_delivery import dispose_pending_finals
+            dispose_pending_finals(self, interrupt_event, generation)
+            getattr(self, "_confirmed_final_deliveries", {}).pop((session_key, generation), None)
 
     def _finish_session_task(self, session_key: str, interrupt_event: asyncio.Event) -> None:
         """End-of-task guard/ownership reconciliation. A late ``_pending_messages`` arrival must not
@@ -4433,11 +4400,7 @@ class BasePlatformAdapter(ABC):
         if late_pending is not None:
             existing_task = self._session_tasks.get(session_key)
             if existing_task is not None and existing_task is not current_task:
-                # The in-band drain (or an earlier late-arrival drain) already spawned a follow-up task that
-                # owns this session. Re-queue the late-arrival event so that task picks it up — avoids
-                # spawning two concurrent _process_message_background tasks for the same key (#17758
-                # follow-up: prevents the create_task path from racing with itself across the
-                # in-band/finally boundary).
+                # Re-queue for the existing drain; spawning another races the in-band/finally boundary (#17758).
                 self._pending_messages[session_key] = late_pending
             else:
                 logger.debug(
@@ -4451,13 +4414,24 @@ class BasePlatformAdapter(ABC):
         """Background task that actually processes the message."""
         delivery_attempted = delivery_succeeded = False  # feeds the processing-complete hook
 
-        def _record_delivery(result):
+        def _record_delivery(result, *, final_text=False):
             nonlocal delivery_attempted, delivery_succeeded
             if result is not None:
+                if not final_text:
+                    interrupt_event._hermes_nontext_delivery_attempted = True
                 delivery_attempted = True
                 delivery_succeeded = delivery_succeeded or bool(getattr(result, "success", False))
+                record_final_ids(interrupt_event, result)
+                from gateway.commentary_delivery import message_ids
+                if not message_ids(result):
+                    interrupt_event._hermes_final_receipt_uncertain = True
         # Reuse the interrupt event handle_message() installed; new Event only if removed externally.
         interrupt_event = self._active_sessions.get(session_key) or asyncio.Event()
+        interrupt_event._hermes_final_delivery_ids = set()
+        interrupt_event._hermes_final_fresh_message_ids = set()
+        interrupt_event._hermes_nontext_delivery_attempted = False
+        interrupt_event._hermes_final_receipt_uncertain = False
+        interrupt_event._hermes_delivery_in_flight = False
         self._active_sessions[session_key] = interrupt_event
         _thread_metadata = _thread_metadata_for_event(event)
         _typing_metadata = typing_metadata_for_turn(  # fixed now: a later inbound must not move it
@@ -4496,9 +4470,11 @@ class BasePlatformAdapter(ABC):
                 _tts_caption_delivered = False
                 for _tts_index, _tts_path in enumerate(_tts_paths):
                     try:
+                        interrupt_event._hermes_delivery_in_flight = True
                         _tts_caption_delivered |= await self._play_tts_file(
                             event, text_content, _tts_path, _tts_index == 0, _final_thread_metadata,
                             _record_delivery)
+                        interrupt_event._hermes_delivery_in_flight = False
                     finally:
                         with contextlib.suppress(OSError):
                             os.remove(_tts_path)
@@ -4518,13 +4494,20 @@ class BasePlatformAdapter(ABC):
                         or _tts_paths or _tts_caption_delivered:
                     self.pause_typing_for_chat(event.source.chat_id)
                 if text_content and not _tts_caption_delivered:
-                    await self._send_final_text(
+                    interrupt_event._hermes_delivery_in_flight = True
+                    complete = await self._send_final_text(
                         event, session_key, text_content, _final_thread_metadata,
-                        is_ephemeral_response, _ephemeral_ttl, _record_delivery)
+                        is_ephemeral_response, _ephemeral_ttl,
+                        lambda result: _record_delivery(result, final_text=True))
+                    interrupt_event._hermes_delivery_in_flight = False
+                    self._confirm_final_delivery(session_key,
+                        getattr(interrupt_event, "_hermes_run_generation", None), complete)
+                interrupt_event._hermes_delivery_in_flight = True
                 await self._deliver_attachments(
                     event, extracted, _final_thread_metadata,
                     anything_sent=delivery_attempted or _tts_caption_delivered,
                     record_delivery=_record_delivery)
+                interrupt_event._hermes_delivery_in_flight = False
             await self._release_turn_marker(event)
             processing_ok = delivery_succeeded if delivery_attempted else not bool(response)
             # Clean up the per-turn streaming-TTS flag.
@@ -4632,7 +4615,14 @@ class BasePlatformAdapter(ABC):
             if pending_event is None:  # consumed elsewhere during the back-off
                 self._cleanup_finished_session_task(session_key, guard)
                 return
-        await self._process_message_background(pending_event, session_key)
+        task = asyncio.current_task()
+        if self._session_tasks.get(session_key) is task:
+            cast(Any, task)._hermes_fifo_handoff = (self, session_key, pending_event)
+        try:
+            await self._process_message_background(pending_event, session_key)
+        finally:
+            if hasattr(task, "_hermes_fifo_handoff"):
+                delattr(task, "_hermes_fifo_handoff")
 
     def _clear_session_guard(self, session_key: str) -> None:
         """Clear (not delete) the session's interrupt Event so the guard stays live for inbound."""

@@ -38,7 +38,7 @@ def _restore_after_fallback(primary_model):
     with patch("agent.auxiliary_client.resolve_provider_client", return_value=(fb_client, None)):
         assert agent._try_activate_fallback() is True
     emitted = []
-    agent._emit_status = emitted.append
+    agent.status_callback = lambda kind, message: emitted.append(message)
     with patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()):
         restored = agent._restore_primary_runtime()
     return agent, restored, emitted
@@ -60,4 +60,4 @@ def test_restore_still_returns_a_chat_primary():
     _agent, restored, emitted = _restore_after_fallback("qwen3.7-plus")
 
     assert restored is True
-    assert any("Primary model restored" in notice for notice in emitted)
+    assert any("Main agent model switched" in notice for notice in emitted)

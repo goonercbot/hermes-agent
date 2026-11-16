@@ -93,6 +93,10 @@ def installation_command(repo_root: Path, args=(), *, module: str = "hermes_cli.
     the managed Python pin changes.
     """
     root = Path(repo_root)
+    from hermes_cli.external_service_binding import external_service_python
+    external_python = external_service_python(root, require_if_store=True)
+    if external_python is not None:
+        return runtime_command(root, args, module=module, python=external_python, home=home)
     if resolve_store_python(root) is None:
         return runtime_command(root, args, module=module, python=python, home=home)
     prefix = [] if module == "hermes_cli.main" else ["--run-module", module]

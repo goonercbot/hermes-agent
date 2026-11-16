@@ -305,6 +305,9 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
         self._aux_tasks: dict[str, dict[str, Any]] = {}
         self._approval_transports: dict[str, Any] = {}
         self._slack_action_handlers: list[tuple] = []
+        self._telegram_callback_handlers: list[tuple] = []
+        self._telegram_callback_lock = threading.Lock()
+        self._telegram_callback_dispatch_factory = None
         self._platform_handler_factories: dict[str, list[tuple]] = {}
         # Process-owned discovery listeners (``on_plugin_loaded``); never cleared by unload().
         self._plugin_loaded_listeners: list[Callable] = []
@@ -634,6 +637,10 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
     def get_slack_action_handlers(self) -> list[tuple]:
         """``(action_id, callback, plugin_name)`` tuples for the Slack adapter to wire at connect."""
         return list(self._slack_action_handlers)
+
+    def get_telegram_callback_handlers(self) -> list[tuple]:
+        """Return registered literal-prefix callbacks in registration order."""
+        return list(self._telegram_callback_handlers)
 
     def get_platform_handler_factories(self, platform: str) -> list[tuple]:
         """``(factory, plugin_name)`` tuples for one platform; adapters call ``factory(native,

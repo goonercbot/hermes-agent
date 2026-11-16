@@ -32,6 +32,27 @@ _MAX_DELEGATE_PROVENANCE_HOPS = 16
 class GatewayNotificationOwnershipMixin:
     """Ownership proof and route resolution for pinned async and process completions."""
 
+    async def _completion_route_ownership(self, pinned_id, pinned_row, current_id):
+        """Only the route itself or a verified native compression chain owns it."""
+        session_db = cast(Any, self)._session_db
+        try:
+            route = await session_db.get_session(current_id)
+            if route is None:
+                return "retry"
+            pinned_tip = await session_db.get_compression_tip(pinned_id)
+            route_tip = await session_db.get_compression_tip(current_id)
+            if not pinned_tip or not route_tip:
+                return "retry"
+            if pinned_tip and pinned_tip == route_tip:
+                return "deliver"
+            if ((pinned_row.get("end_reason") == "compression" and pinned_tip == pinned_id)
+                    or (route.get("end_reason") == "compression" and route_tip == current_id)):
+                return "retry"
+        except Exception:
+            logger.debug("Completion route lineage unavailable", exc_info=True)
+            return "retry"
+        return "terminal"
+
     async def _resolve_compression_lineage_target(
         self, session_db: Any, session_entry: Optional[SessionEntry], pinned_session_id: str,
     ) -> tuple[str, Optional[str]]:
@@ -140,6 +161,8 @@ class GatewayNotificationOwnershipMixin:
                 return "terminal", session_id, None
             if "_delegate_from" not in config:
                 verdict = "terminal" if row.get("source") == "subagent" else "deliver"
+                if verdict == "deliver" and current_session_id:
+                    verdict = await self._completion_route_ownership(session_id, row, current_session_id)
                 return verdict, session_id, row
             parent = config["_delegate_from"]
             if not isinstance(parent, str) or not parent.strip() or hops == _MAX_DELEGATE_PROVENANCE_HOPS:

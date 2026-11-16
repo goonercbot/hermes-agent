@@ -735,12 +735,13 @@ class GatewaySessionCommandsMixin:
         if request.preview:
             return _compress_preview_reply(history, request.partial, request.keep_last, request.focus_topic, _agg_note)
         try:
-            return await self._run_manual_compression(source, session_entry, history, request)
+            return await self._run_manual_compression(source, session_entry, history, request,
+                notice_metadata=self._event_thread_metadata(event, source))
         except Exception as e:
             logger.warning("Manual compress failed: %s", e)
             return t("gateway.compress.failed", error=e)
 
-    async def _run_manual_compression(self, source, session_entry, history: list, request) -> str:
+    async def _run_manual_compression(self, source, session_entry, history: list, request, *, notice_metadata=None) -> str:
         """Build a temporary agent, run the shared compress core, persist, and describe the outcome."""
         from agent.conversation_compression import finalize_context_engine_compression_notification
         from agent.conversation_compression_manual import compress_now, render_compress_result
@@ -771,6 +772,8 @@ class GatewaySessionCommandsMixin:
 
         tmp_agent = await self._build_manual_compression_agent(session_entry.session_id, model, runtime_kwargs)
         try:
+            from gateway.model_switch_notices import bind_compression_notice_sink
+            bind_compression_notice_sink(self, tmp_agent, source, session_entry, notice_metadata)
             # Not a bare run_in_executor: the profile secret scope is a contextvar the default
             # executor hop would drop, failing aux-client credential resolution closed.
             result = await self._run_in_executor_with_context(

@@ -103,6 +103,7 @@ class SmallLimitProgressAdapter(ProgressCaptureAdapter):
         self._next_id = 0
         self.oversized_edits = []
         self.oversized_sends = []
+        self.initial_send_seen = threading.Event()
 
     def _mint_id(self):
         self._next_id += 1
@@ -119,7 +120,9 @@ class SmallLimitProgressAdapter(ProgressCaptureAdapter):
                 "metadata": metadata,
             }
         )
-        return SendResult(success=True, message_id=self._mint_id())
+        result = SendResult(success=True, message_id=self._mint_id())
+        asyncio.get_running_loop().call_soon(self.initial_send_seen.set)
+        return result
 
     async def edit_message(self, chat_id, message_id, content) -> SendResult:
         if len(content) > self.MAX_MESSAGE_LENGTH:
@@ -410,17 +413,10 @@ class ManyProgressLinesAgent:
         cb = self.tool_progress_callback
         assert cb is not None
         cb("tool.started", "terminal", "first-short", {})
-        # Let the progress task create the first editable bubble, then enqueue
-        # the rest quickly.  The cancellation drain must roll them into fresh
-        # editable bubbles instead of trying to edit the first one past limit.
-        # Wait for the bubble itself, not a fixed interval: on a loaded CI runner
-        # 0.35s is not always enough and every line then lands before the first
-        # send, so nothing is ever edited.
-        adapter = _ACTIVE_ADAPTER.get("adapter")
-        deadline = time.monotonic() + 5.0
-        while adapter is not None and not adapter.sent and time.monotonic() < deadline:
-            time.sleep(0.02)
-        time.sleep(0.05)
+        # Continue only after the send coroutine returned and the progress lane
+        # recorded its editable identity, not merely after the fake appended text.
+        adapter = _ACTIVE_ADAPTER["adapter"]
+        assert adapter.initial_send_seen.wait(10), "first editable progress send did not complete"
         for idx in range(1, 8):
             cb("tool.started", "terminal", f"overflow-line-{idx}-" + "x" * 45, {})
         time.sleep(0.1)

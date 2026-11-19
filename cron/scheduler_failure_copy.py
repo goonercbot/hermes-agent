@@ -109,6 +109,34 @@ def provider_failure_notice(
     )
 
 
+class ScriptFailure(str):
+    """Diagnostic string retaining the runner's separately redacted stdout for this fire.
+
+    String/JSON compatibility preserves existing private run and incident records; presentation
+    must not recover stdout by parsing diagnostic text, which stderr can itself imitate.
+    """
+
+    stdout: str
+
+    def __new__(cls, diagnostic: str, stdout: str):
+        instance = super().__new__(cls, diagnostic)
+        instance.stdout = stdout
+        return instance
+
+
+def script_failure_report(error: object) -> Optional[str]:
+    """Explicit single-line application report from runner-owned stdout, never stderr.
+
+    Unmarked/multiline output or a plain diagnostic string keeps the existing fallback.
+    """
+    if not isinstance(error, ScriptFailure) or len(error.stdout) > 2000:
+        return None
+    report = error.stdout.strip()
+    if report.startswith(("🚨 ", "⚠️ ")) and len(report.splitlines()) == 1:
+        return report
+    return None
+
+
 def generic_failure_notice(job_name: str, job_id: str, cleaned_error: str) -> str:
     """Unclassified failure: the cleaned error text plus where to look and what to do."""
     return (

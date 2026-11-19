@@ -2956,16 +2956,16 @@ def _compose_run_delivery(
         incident_acked, failure_incident_id = _upsert_incident_for_failure(
             job, error or "", output_file=output_file
         )
+        # Only single-line, explicitly marked script reports have a public-message contract.
+        from cron.scheduler_failure_copy import script_failure_report
+        script_report = script_failure_report(error) if job.get("no_agent") else None
         if incident_acked:
             deliver_content = ""
         elif agent_declared:
-            # The agent already diagnosed the failure in prose; the summarizer's substring
-            # heuristics would re-diagnose it ("timed out" -> blame the model service, "401" ->
-            # "sign in again") and attach the wrong remediation. Deliver the evidence as-is.
-            from cron.scheduler_failure_copy import generic_failure_notice
-            deliver_content = generic_failure_notice(
-                job.get("name") or job["id"], job["id"], err.strip().rstrip("."),
-            ) + _failure_streak_nudge(job)
+            # Keep the agent's diagnosis; the run/incident ledger retains the same failure.
+            deliver_content = err.strip() + _failure_streak_nudge(job)
+        elif script_report is not None:
+            deliver_content = script_report + _failure_streak_nudge(job)
         else:
             from cron.quota_hold import hold_notice
             deliver_content = (

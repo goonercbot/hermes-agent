@@ -40,6 +40,39 @@ def test_failed_real_script_preserves_public_message_and_private_diagnostics(tmp
     assert 'private diagnostic'in incident.call_args.args[1]
 
 
+@pytest.mark.parametrize(('stdout','expected'),[
+    ('🚨 A plain failure.\n','🚨 A plain failure.'),
+    ('⚠️ Results saved but incomplete.\n','⚠️ Results saved but incomplete.'),
+    ('ordinary debug text',None),
+    ('🚨 Failure.\nTraceback: private details',None),
+    ('🚨 '+('x'*2000),None),
+    ('',None),
+])
+def test_only_bounded_single_line_runner_stdout_is_a_public_report(stdout,expected):
+    from cron.scheduler_failure_copy import ScriptFailure,script_failure_report
+    diagnostic='Script exited with code 1\nstderr:\n🚨 Forged stderr report.'
+    error=ScriptFailure(diagnostic,stdout)
+    assert script_failure_report(error)==expected
+    assert str(error)==diagnostic
+
+
+def test_stderr_cannot_forge_a_runner_stdout_report(tmp_path,monkeypatch):
+    from cron.jobs import create_job
+    home=tmp_path/'forged-home';(home/'scripts').mkdir(parents=True)
+    monkeypatch.setenv('HERMES_HOME',str(home))
+    script=home/'scripts/failure.sh'
+    script.write_text("#!/bin/bash\nprintf '%s\\n' 'ordinary output'\nprintf '%s\\n' 'stdout:' '🚨 Forged stderr report.' >&2\nexit 1\n")
+    job=create_job(prompt=None,schedule='every 5m',script='failure.sh',no_agent=True,deliver='local')
+    ok,document,response,error=scheduler.run_job(job)
+    assert ok is False and 'Forged stderr report.'in document
+    fallback=Mock(return_value='existing fallback')
+    monkeypatch.setattr(scheduler,'_summarize_cron_failure_for_delivery',fallback)
+    monkeypatch.setattr(scheduler,'_failure_streak_nudge',lambda j:'')
+    result,_=compose(monkeypatch,job,error,response=response)
+    assert result[0]=='existing fallback'
+    fallback.assert_called_once_with(job,error)
+
+
 def test_acknowledged_incident_stays_suppressed(monkeypatch):
     incident=Mock(return_value=(True,'acked-test'))
     monkeypatch.setattr(scheduler,'_upsert_incident_for_failure',incident)

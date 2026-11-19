@@ -150,10 +150,13 @@ def _waiting_completion(authority, evt, event):
 
 
 _FOLD_HEADER = ('[IMPORTANT: {count} background process results arrived while this session was busy. '
-                'Treat them as one batch and give one consolidated response; preserve failures and '
-                'actionable results.]')
+                'Compare this batch with what you already told the user. Send one brief update only '
+                'for a changed outcome, a new result the user was waiting for, or an unresolved failure '
+                'the user has not been told about. Do not recap earlier attempts superseded by the '
+                'reported outcome. If there is no such update, return only [SILENT].]')
+# The header is one line and can contain a bracketed silence marker inside its outer brackets.
 _FOLD_HEADER_RE = re.compile(r'\[IMPORTANT: \d+ background process results arrived while this session was busy\.'
-                             r'[^\]]*\]\n\n')
+                             r'[^\r\n]*\]\n\n')
 
 
 def _fold_completion(event, waiting, identity):

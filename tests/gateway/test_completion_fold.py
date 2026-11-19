@@ -34,11 +34,11 @@ async def _discord_session(tmp_path, monkeypatch):
     sid = runner.session_store.peek_session_id(route)
     owner = authority.logical_owner(sid)
 
-    async def complete(name):
+    async def complete(name, *, exit_code=0):
         evt = {'type': 'completion', 'session_id': name, 'started_at': 1.0, 'session_key': route, 'parent_session_id': sid,
                'platform': 'discord', 'chat_type': 'dm', 'chat_id': '42', 'user_id': '42',
-               'exit_code': 0, 'output': f'{name} output'}
-        assert await runner._inject_watch_notification(f'[IMPORTANT: {name} finished]', evt) is True
+               'exit_code': exit_code, 'output': f'{name} output (exit code {exit_code})'}
+        assert await runner._inject_watch_notification(f'[IMPORTANT: {evt["output"]}]', evt) is True
 
     async def tick(name):
         evt = {'type': 'heartbeat', 'session_id': name, 'event_id': f'{name}-tick', 'started_at': 1.0,
@@ -59,16 +59,20 @@ async def _discord_session(tmp_path, monkeypatch):
 async def test_completions_queued_behind_a_turn_fold_into_one_turn(tmp_path, monkeypatch):
     authority, _human, complete, queued = await _discord_session(tmp_path, monkeypatch)
     try:
-        await complete('proc_a')
+        await complete('proc_a', exit_code=1)
         await complete.tick('proc_b')  # the finishing process's own tick never blocks the fold
-        await complete('proc_b')
+        await complete('proc_b', exit_code=1)
         await complete('proc_c')
         rows = queued()
         assert [row['principal_id'].split(':')[0] for row in rows] == ['messaging', 'automation']
         text = rows[-1]['payload']['text']
         assert text.startswith('[IMPORTANT: 3 background process results arrived')
         assert text.count('background process results arrived') == 1  # re-folding replaces the header
-        assert all(f'{name} finished' in text for name in ('proc_a', 'proc_b', 'proc_c'))
+        assert all(f'{name} output (exit code {code})' in text
+                   for name, code in (('proc_a', 1), ('proc_b', 1), ('proc_c', 0)))
+        assert 'give one consolidated response' not in text
+        assert text.count('[SILENT]') == 1
+        assert 'unresolved failure' in text
         assert text.count('INTERNAL NOTIFICATION') == 1
         assert len(rows[-1]['payload']['native_text_v1']['automation']['identities']) == 3
         # Each replaced row keeps only its own identity (the batch carries text and identities):
@@ -96,6 +100,7 @@ async def test_a_prompt_queued_between_completions_keeps_them_apart(tmp_path, mo
         await complete('proc_b')
         rows = queued()
         assert [row['payload']['text'].split('\n')[0] for row in rows] == [
-            'running turn', '[IMPORTANT: proc_a finished]', 'queued follow-up', '[IMPORTANT: proc_b finished]']
+            'running turn', '[IMPORTANT: proc_a output (exit code 0)]', 'queued follow-up',
+            '[IMPORTANT: proc_b output (exit code 0)]']
     finally:
         authority.db.close()

@@ -73,6 +73,45 @@ def test_stderr_cannot_forge_a_runner_stdout_report(tmp_path,monkeypatch):
     fallback.assert_called_once_with(job,error)
 
 
+@pytest.mark.parametrize('mode',['agent','script'])
+def test_recurring_application_failure_reaches_delivery_without_command_footer(tmp_path,monkeypatch,mode):
+    from cron import incidents
+    from cron.scheduler_failure_copy import ScriptFailure
+    home=tmp_path/'consumer-home';home.mkdir()
+    monkeypatch.setenv('HERMES_HOME',str(home));monkeypatch.setenv('HOME',str(home))
+    monkeypatch.setattr(scheduler,'load_config',dict)
+    message='🚨 Application failed. Saved progress is retained.'
+    job=dict(id='recurring-'+mode,name='Recurring test',no_agent=mode=='script',schedule={'kind':'interval'},failure_streak=2,deliver='local')
+    if mode=='agent':
+        success,error,declared=scheduler._apply_agent_failure_marker(job,True,None,'[CRON_FAILURE]\n'+message)
+    else:
+        success,error,declared=False,ScriptFailure('Script exited with code 1\nprivate detail',message),False
+    transport=Mock();monkeypatch.setattr(scheduler,'_deliver_result',transport)
+    delivery=scheduler._RunDelivery(job,success,error,agent_declared=declared)
+    scheduler._save_compose_deliver(delivery,scheduler._FireOwnership(job),'',str(error),adapters=None,loop=None,verbose=False,execution_token=None)
+    assert transport.call_count==1 and transport.call_args.args[1]==message
+    assert delivery.failure_incident_id is not None
+    incident=incidents.get_incident(delivery.failure_incident_id)
+    assert incident is not None and delivery.success is False and incident['error']==str(error)
+    assert Path(incident['output_file']).read_text()==str(error)
+
+
+@pytest.mark.parametrize('padding',[' '*2100,'\n'*2100])
+def test_actual_runner_does_not_strip_away_the_raw_stdout_limit(tmp_path,monkeypatch,padding):
+    import shlex
+    from cron.jobs import create_job
+    from cron.scheduler_failure_copy import ScriptFailure,script_failure_report
+    home=tmp_path/'raw-home';(home/'scripts').mkdir(parents=True)
+    monkeypatch.setenv('HERMES_HOME',str(home))
+    raw='🚨 Application failed.'+padding+'\n'
+    (home/'scripts/failure.sh').write_text("#!/bin/bash\nprintf '%s' "+shlex.quote(raw)+"\nprintf '%s' 'private safe diagnostic' >&2\nexit 1\n")
+    job=create_job(prompt=None,schedule='every 5m',script='failure.sh',no_agent=True,deliver='local')
+    success,document,_response,error=scheduler.run_job(job)
+    assert success is False and isinstance(error,ScriptFailure)
+    assert 'private safe diagnostic'in str(error)and 'private safe diagnostic'in document
+    assert script_failure_report(error)is None
+
+
 def test_acknowledged_incident_stays_suppressed(monkeypatch):
     incident=Mock(return_value=(True,'acked-test'))
     monkeypatch.setattr(scheduler,'_upsert_incident_for_failure',incident)

@@ -114,13 +114,16 @@ class ScriptFailure(str):
 
     String/JSON compatibility preserves existing private run and incident records; presentation
     must not recover stdout by parsing diagnostic text, which stderr can itself imitate.
+    Only the raw character count survives normalization, never unredacted raw text.
     """
 
     stdout: str
+    raw_stdout_length: int
 
-    def __new__(cls, diagnostic: str, stdout: str):
+    def __new__(cls, diagnostic: str, stdout: str, *, raw_stdout_length: Optional[int] = None):
         instance = super().__new__(cls, diagnostic)
         instance.stdout = stdout
+        instance.raw_stdout_length = len(stdout) if raw_stdout_length is None else raw_stdout_length
         return instance
 
 
@@ -129,7 +132,7 @@ def script_failure_report(error: object) -> Optional[str]:
 
     Unmarked/multiline output or a plain diagnostic string keeps the existing fallback.
     """
-    if not isinstance(error, ScriptFailure) or len(error.stdout) > 2000:
+    if not isinstance(error, ScriptFailure) or error.raw_stdout_length > 2000 or len(error.stdout) > 2000:
         return None
     report = error.stdout.strip()
     if report.startswith(("🚨 ", "⚠️ ")) and len(report.splitlines()) == 1:

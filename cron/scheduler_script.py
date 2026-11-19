@@ -533,7 +533,7 @@ def _run_job_script(
             if stdout:
                 parts.append(f"stdout:\n{stdout}")
             from cron.scheduler_failure_copy import ScriptFailure
-            return False, ScriptFailure("\n".join(parts), stdout)
+            return False, ScriptFailure("\n".join(parts), stdout, raw_stdout_length=len(stdout_raw or ""))
         return True, stdout
     except Exception as exc:
         return False, f"Script execution failed: {exc}"

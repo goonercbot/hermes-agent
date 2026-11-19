@@ -2963,9 +2963,9 @@ def _compose_run_delivery(
             deliver_content = ""
         elif agent_declared:
             # Keep the agent's diagnosis; the run/incident ledger retains the same failure.
-            deliver_content = err.strip() + _failure_streak_nudge(job)
+            deliver_content = err.strip()
         elif script_report is not None:
-            deliver_content = script_report + _failure_streak_nudge(job)
+            deliver_content = script_report
         else:
             from cron.quota_hold import hold_notice
             deliver_content = (

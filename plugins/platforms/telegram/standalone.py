@@ -50,6 +50,17 @@ def _success(chat_id, warnings=None, **fields) -> dict:
             **({"warnings": warnings} if warnings else {})}
 
 
+def _media_acknowledged(message, chat_id) -> bool:
+    """Require a posted Bot API message with an attachment in the intended chat."""
+    message_id = getattr(message, "message_id", None)
+    if type(message_id) is not int or message_id <= 0 or not getattr(message, "effective_attachment", None):
+        return False
+    chat = getattr(message, "chat", None)
+    if isinstance(chat_id, str) and chat_id.startswith("@"):
+        return (getattr(chat, "username", None) or "").casefold() == chat_id[1:].casefold()
+    return getattr(chat, "id", None) == chat_id
+
+
 def _media_caption_split(text, media_files):
     """``(caption, "")`` when the text rides on the media bubble as its caption: exactly one
     captionable file (not a voice/audio note) and text within Telegram's caption limit, else
@@ -350,6 +361,8 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
         # See #13206.
         int_chat_id = normalize_telegram_chat_id(chat_id)
         media_files = media_files or []
+        requested_media_count = len(media_files)
+        acknowledged_media_count = 0
         thread_kwargs = {**_telegram_thread_kwargs(thread_id),
                          **notification_kwargs(resolve_notifications_mode(), notify)}
         # disable_web_page_preview is only valid for send_message, not media sends.
@@ -379,6 +392,8 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
         for chunk in chunks:
             last_msg = await _telegram_send_text_chunk(bot, int_chat_id, chunk, send_parse_mode, _has_html, text_kwargs)
         if album := _telegram_album_paths(media_files, force_document, _tg_caption):
+            # The album helper does not expose per-message receipts. Only count
+            # the individual uploads below, including retries of refused photos.
             result = await send_album_standalone(bot, extra or {}, chat_id, album, thread_id=thread_id, notify=notify)
             detail = result.raw_response or {}
             warnings += [_sanitize_error_text(f"Failed to send Telegram photo {path}: {err}")
@@ -405,16 +420,24 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                                        _sanitize_error_text(_cap_err))
                 continue
             try:
-                last_msg = await _telegram_send_one_media(
+                media_msg = await _telegram_send_one_media(
                     bot, int_chat_id, media_path, is_voice, caption=_tg_caption, parse_mode=send_parse_mode,
                     has_html=_has_html, thread_kwargs=thread_kwargs, force_document=force_document)
+                if media_msg is not None:
+                    last_msg = media_msg
+                if _media_acknowledged(media_msg, int_chat_id):
+                    acknowledged_media_count += 1
+                else:
+                    warnings.append("Telegram did not confirm a posted attachment in the intended chat")
             except Exception as e:
                 warnings.append(_sanitize_error_text(f"Failed to send media {media_path}: {e}"))
                 logger.error(warnings[-1])
         if last_msg is None:
             return {"error": _NO_DELIVERABLE, **({"warnings": warnings} if warnings else {})}
-        return _success(chat_id, warnings, **({"message_id": str(last_msg.message_id)}
-                                                          if last_msg.message_id is not None else {}))
+        fields: dict[str, str | bool] = {"message_id": str(last_msg.message_id)} if last_msg.message_id is not None else {}
+        if requested_media_count and acknowledged_media_count == requested_media_count:
+            fields["media_delivered"] = True
+        return _success(chat_id, warnings, **fields)
     except ImportError:
         return {"error": "python-telegram-bot not installed. Run: "
                 f"{install_hint('telegram')}"}

@@ -374,7 +374,9 @@ class TestSendMessageTool:
         with patch("gateway.config.load_gateway_config", return_value=config), \
              patch("tools.interrupt.is_interrupted", return_value=False), \
              patch("model_tools._run_async", side_effect=_run_async_immediately), \
-             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={
+                 "success": True, "media_delivered": True, "message_id": "42",
+             })) as send_mock, \
              patch("gateway.mirror.mirror_to_session", return_value=True):
             raw = send_message_tool({
                 "action": "send",
@@ -385,6 +387,8 @@ class TestSendMessageTool:
         result = json.loads(raw)
         assert result["success"] is False
         assert result["partial_success"] is True
+        assert result["message_id"] == "42"
+        assert "media_delivered" not in result
         assert result["media_dropped"] == [{"path": str(missing), "reason": "not found on this host"}]
         assert result["error"]
         send_mock.assert_awaited_once_with(

@@ -291,6 +291,8 @@ def _handle_send(args):
                 result["error"] = (f"Delivery incomplete: {len(media_dropped)} requested MEDIA attachment(s) "
                                    "dropped before delivery (see media_dropped)")
         if isinstance(result, dict) and media_dropped:
+            # A sender can confirm the surviving files, not the dropped part of the request.
+            result.pop("media_delivered", None)
             result["media_dropped"] = media_dropped
         if isinstance(result, dict) and "error" in result:
             result["error"] = _sanitize_error_text(result["error"])
